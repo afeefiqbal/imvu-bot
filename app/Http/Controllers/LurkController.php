@@ -76,9 +76,20 @@ class LurkController extends Controller
         if ($botName || $botUsername) {
             $bot = \App\Models\ImvuBot::where('name', $botName)
                 ->orWhere('username', $botUsername)
-                ->orWhere('name', $botUsername)
-                ->orWhere('username', $botName)
                 ->first();
+                
+            if (!$bot && $botName && $botUsername) {
+                // Auto-register missing bot to Dashboard
+                $bot = \App\Models\ImvuBot::forceCreate([
+                    'name' => $botName,
+                    'username' => $botUsername,
+                    'password' => 'Unset',
+                    'last_seen_at' => now(),
+                    'is_active' => true,
+                ]);
+            } elseif ($bot) {
+                $bot->update(['last_seen_at' => now(), 'is_active' => true]);
+            }
                 
             if ($bot && !empty($bot->room_ids)) {
                 $rawRooms = array_map('trim', explode(',', $bot->room_ids));
@@ -109,6 +120,26 @@ class LurkController extends Controller
                     'visitors' => $roomData['visitors'] ?? [],
                 ]
             );
+
+            if (!empty($roomData['visitors']) && is_array($roomData['visitors'])) {
+                foreach ($roomData['visitors'] as $visitor) {
+                    // Skip empty, whitespace-only, or invisible-character usernames
+                    $cleanVisitor = trim($visitor);
+                    if (empty($cleanVisitor) || !preg_match('/\S/u', $cleanVisitor)) {
+                        continue;
+                    }
+                    $record = \App\Models\RoomVisitor::firstOrNew([
+                        'room_id' => (string)$roomId,
+                        'username' => $cleanVisitor
+                    ]);
+                    if (!$record->exists) {
+                        $record->first_seen_at = now();
+                    }
+                    $record->last_seen_at = now();
+                    $record->save();
+                }
+            }
+
         }
         
         // Sync active IDs for dashboard
