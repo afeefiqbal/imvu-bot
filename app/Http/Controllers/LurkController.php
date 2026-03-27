@@ -18,7 +18,7 @@ class LurkController extends Controller
         // 1. Welcome Logic (Matches "Username joined the chat" or "Username is in the chat")
         if (str_contains($lowerMsg, 'joined the chat') || str_contains($lowerMsg, 'is in the chat')) {
             $username = trim(str_ireplace(['joined the chat', 'is in the chat'], '', $message));
-            
+
             // Avoid welcoming Alexa herself or other bot instances
             $selfNames = ['alexa', 's1va', 'bot'];
             foreach ($selfNames as $name) {
@@ -27,17 +27,17 @@ class LurkController extends Controller
                 }
             }
             Log::info("Welcome message: $username");
-            return response()->json([ 
+            return response()->json([
                 'reply' => "Welcome to the room @$username! Hope you have a great time here! 👋"
             ]);
         }
 
         // 2. Trigger Check: Only respond if "!alexa" or "!a" is present
-        $isTriggered = str_contains($lowerMsg, '!alexa') || 
-                       str_contains($lowerMsg, '!a ') || 
-                       $lowerMsg === '!a' || 
+        $isTriggered = str_contains($lowerMsg, '!alexa') ||
+                       str_contains($lowerMsg, '!a ') ||
+                       $lowerMsg === '!a' ||
                        str_ends_with($lowerMsg, ' !a');
-        
+
         if (!$isTriggered) {
              return response()->json(['reply' => null]);
         }
@@ -46,7 +46,7 @@ class LurkController extends Controller
         try {
             // Clean the trigger from the prompt
             $query = trim(str_ireplace(['!alexa', '!a'], '', $message));
-            
+
             $response = Http::withToken(env('GROQ_API_KEY'))
                 ->post('https://api.groq.com/openai/v1/chat/completions', [
                     'model' => 'llama-3.1-8b-instant',
@@ -71,13 +71,14 @@ class LurkController extends Controller
         $rooms = $request->input('rooms', []);
         $botName = $request->input('bot_name');
         $botUsername = $request->input('bot_username');
-        
+
         $targetRooms = [];
+
         if ($botName || $botUsername) {
             $bot = \App\Models\ImvuBot::where('name', $botName)
                 ->orWhere('username', $botUsername)
                 ->first();
-                
+
             if (!$bot && $botName && $botUsername) {
                 // Auto-register missing bot to Dashboard
                 $bot = \App\Models\ImvuBot::forceCreate([
@@ -90,7 +91,7 @@ class LurkController extends Controller
             } elseif ($bot) {
                 $bot->update(['last_seen_at' => now(), 'is_active' => true]);
             }
-                
+
             if ($bot && !empty($bot->room_ids)) {
                 $rawRooms = array_map('trim', explode(',', $bot->room_ids));
                 foreach ($rawRooms as $raw) {
@@ -103,24 +104,23 @@ class LurkController extends Controller
                 $targetRooms = array_values(array_unique($targetRooms));
             }
         }
-        
+
         $activeIds = [];
-        
+
         foreach ($rooms as $roomData) {
             if (empty($roomData['id'])) continue;
             $roomId = $roomData['id'];
             $activeIds[] = $roomId;
-            
+
             Room::updateOrCreate(
                 ['room_id' => $roomId],
                 [
                     'name' => $roomData['name'] ?? 'Unknown',
-                    'image_url' => $roomData['image_url'] ?? '',
+                    'image_url' => $roomData['image_url'] ?? '', 
                     'population' => (int)($roomData['population'] ?? 0),
                     'visitors' => $roomData['visitors'] ?? [],
                 ]
             );
-            Log::info("Room synced: " . json_encode($roomData));
 
             if (!empty($roomData['visitors']) && is_array($roomData['visitors'])) {
                 foreach ($roomData['visitors'] as $visitor) {
@@ -142,23 +142,25 @@ class LurkController extends Controller
             }
 
         }
-        
-        // Sync active IDs for dashboard
+
+
+
+        // Sync active IDs for dashboard - ONLY if the bot reported ANY rooms
+        // This prevents wiping the dashboard during startup syncs (which are empty)
         if (!empty($activeIds)) {
             Room::whereNotIn('room_id', $activeIds)->delete();
-        } else {
-            Room::query()->delete();
         }
-        
+
+
         $spamTargets = Room::where('is_spamming', true)->pluck('room_id')->toArray();
         $mutedRooms = Room::where('is_ai_active', false)->pluck('room_id')->toArray();
-        
+
         $pendingMessages = Room::whereNotNull('pending_message')
             ->get(['room_id', 'pending_message']);
 
         // Clear pending messages after fetching
         Room::whereNotNull('pending_message')->update(['pending_message' => null]);
-        
+
         return response()->json([
             'status' => 'success',
             'target_rooms' => $targetRooms ?? [],
