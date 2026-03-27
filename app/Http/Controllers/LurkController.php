@@ -120,6 +120,7 @@ class LurkController extends Controller
                     'visitors' => $roomData['visitors'] ?? [],
                 ]
             );
+            Log::info("Room synced: " . json_encode($roomData));
 
             if (!empty($roomData['visitors']) && is_array($roomData['visitors'])) {
                 foreach ($roomData['visitors'] as $visitor) {

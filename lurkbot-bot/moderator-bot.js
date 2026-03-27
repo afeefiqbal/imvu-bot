@@ -8,7 +8,7 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const BACKEND_URL = process.env.BACKEND_URL || 'http://127.0.0.1:8000';
+const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:8000';
 const BOT_NAME = "ModeratorBot";
 const BOT_PROXY = process.env.BOT_PROXY || '';
 const BOTS_FILE = path.join(__dirname, 'bots.json');
@@ -36,7 +36,7 @@ const botUsername = botMatch.username.toLowerCase();
         if (BOT_PROXY) launchArgs.push(`--proxy-server=${BOT_PROXY}`);
 
         const browser = await puppeteer.launch({
-            headless: false, // User requested for manual observation
+            headless: true, // User requested for manual observation
             executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
             userDataDir: USER_DATA_DIR,
             args: launchArgs,
@@ -51,6 +51,7 @@ const botUsername = botMatch.username.toLowerCase();
         const roomStates = new Map(); // roomId -> Set of canonical usernames
         const targetRooms = new Set();
         const joiningRooms = new Set();
+        const departedGuests = new Set(); // Tracks users who explicitly left, so the scraper doesn't revive them from chat history
         let isSyncing = false;
         let isFirstSync = true;
         let activeRoomId = '';
@@ -101,19 +102,19 @@ const botUsername = botMatch.username.toLowerCase();
 
                     const data = await p.evaluate(() => {
                         const visitorIds = new Set();
-                        const html = document.body.innerHTML;
-                        const matches = html.matchAll(/(?:user-|nt-|userId["']?:|avatar_)(\d{5,12})/g);
-                        for (const m of matches) if (m[1]) visitorIds.add(m[1]);
-
-                        document.querySelectorAll('[id*="nt-"], [src*="user-"], [data-user-id], [data-id]').forEach(el => {
+                        
+                        document.querySelectorAll('[id*="nt-"], [src*="user-"], [data-user-id], [data-id], .uikit-avatar').forEach(el => {
                             const id = el.getAttribute('data-user-id') || el.getAttribute('data-id') ||
-                                       el.id?.match(/nt-(\d+)/)?.[1] || el.src?.match(/user-(\d+)/)?.[1];
-                            if (id && /^\d{5,12}$/.test(id)) visitorIds.add(id);
+                                el.id?.match(/nt-(\d+)/)?.[1] || el.src?.match(/user-(\d+)/)?.[1];
+                            if (id && /^\d{5,12}$/.test(id)) {
+                                visitorIds.add(id);
+                                console.log(`[DEBUG SCAPER] Found ID: ${id}`);
+                            }
                         });
 
                         const hostEl = document.querySelector('.uikit-inline-item.host-name, .room-host, [class*="host-name"]');
                         const hostNameEl = hostEl?.querySelector('.text, [title]');
-                        let hostName = hostNameEl ? (hostNameEl.innerText || hostNameEl.getAttribute('title') || '').toLowerCase().replace('hosted by', '').trim() : '';
+                        let hostName = hostNameEl ? (hostNameEl.textContent || hostNameEl.getAttribute('title') || '').toLowerCase().replace('hosted by', '').trim() : '';
                         const roomHostId = window.location.href.match(/room-([\d\-]+)/)?.[1]?.split('-')[0] || '';
                         return { visitors: Array.from(visitorIds), foundHost: hostName, hostId: roomHostId };
                     }).catch(() => null);
@@ -122,20 +123,35 @@ const botUsername = botMatch.username.toLowerCase();
                         const uniqueGuests = new Map();
                         for (const userId of data.visitors) {
                             if (!userId) continue;
+                            
                             if (userIdToUsername.has(userId)) {
-                                const canonical = userIdToUsername.get(userId);
+                                let canonical = userIdToUsername.get(userId);
+                                // Strip 'guest_' prefix if present
+                                if (canonical.toLowerCase().startsWith('guest_') && canonical.length > 6) {
+                                    canonical = canonical.substring(6);
+                                }
+                                
                                 const lowerCanonical = canonical.toLowerCase();
-                                const isBotOrHost = lowerCanonical === 'you' || lowerCanonical === botUsername || lowerCanonical === `guest_${botUsername}` || userId === data.hostId || lowerCanonical === 'siva';
-                                if (isBotOrHost) continue;
+                                const isBotSelf = lowerCanonical === 'you' || lowerCanonical === botUsername || lowerCanonical === `siva` || lowerCanonical === `guest_${botUsername}`;
+                                
+                                // If they were marked as departed but they are now in the physical Occupancy list, they have returned!
+                                if (departedGuests.has(lowerCanonical)) {
+                                    console.log(`[${BOT_NAME}] 🔄 Detected re-entry via Scraper: ${canonical}`);
+                                    departedGuests.delete(lowerCanonical);
+                                }
+
+                                if (isBotSelf) continue;
                                 uniqueGuests.set(lowerCanonical, canonical);
                             } else {
                                 if (!pendingResolutions.has(userId)) {
                                     console.log(`[${BOT_NAME}] 🔍 Unknown ID ${userId} found. Resolving username...`);
                                     pendingResolutions.add(userId);
                                 }
+                                // Include unresolved users temporarily by their ID so they are counted
+                                uniqueGuests.set(userId, `user_${userId}`);
                                 p.evaluate((id) => {
-                                    fetch(`https://api.imvu.com/user/user-${id}`).catch(() => {});
-                                }, userId).catch(() => {});
+                                    fetch(`https://api.imvu.com/user/user-${id}`).catch(() => { });
+                                }, userId).catch(() => { });
                             }
                         }
 
@@ -146,20 +162,19 @@ const botUsername = botMatch.username.toLowerCase();
                         const oldVisitors = roomStates.get(roomId);
                         const currentVisitors = new Set(finalVisitors);
 
-                        if (!isFirstSync && data.foundHost) {
-                            for (const user of finalVisitors) {
-                                if (!oldVisitors.has(user)) {
-                                    hasStateChange = true;
-                                    console.log(`[${BOT_NAME}] ✨ Welcoming ${user}`);
-                                    await sendChatMessage(p, `Welcome @${user}`);
-                                }
+                        // If you want everyone in the room to be welcomed when bot joins, we don't block it with isFirstSync
+                        for (const user of finalVisitors) {
+                            if (!oldVisitors.has(user) && user.length >= 3 && !user.startsWith('user_')) {
+                                hasStateChange = true;
+                                console.log(`[${BOT_NAME}] ✨ Welcoming ${user}`);
+                                await sendChatMessage(p, `Welcome @${user}`);
                             }
-                            for (const user of oldVisitors) {
-                                if (!currentVisitors.has(user)) {
-                                    hasStateChange = true;
-                                    console.log(`[${BOT_NAME}] 👋 Saying goodbye to ${user}`);
-                                    await sendChatMessage(p, `Bye @${user}`);
-                                }
+                        }
+                        for (const user of oldVisitors) {
+                            if (!currentVisitors.has(user) && user.length >= 3 && !user.startsWith('user_')) {
+                                hasStateChange = true;
+                                console.log(`[${BOT_NAME}] 👋 Saying goodbye to ${user}`);
+                                await sendChatMessage(p, `Bye @${user}`);
                             }
                         }
                         roomStates.set(roomId, currentVisitors);
@@ -183,11 +198,24 @@ const botUsername = botMatch.username.toLowerCase();
                     const isAlreadyOpen = imvuPages.some(p => p.url().includes(`room-${rid}`));
                     if (!isAlreadyOpen && !joiningRooms.has(rid)) {
                         joiningRooms.add(rid);
-                        const newPage = await browser.newPage();
-                        setupConsoleListener(newPage);
-                        setupNetworkListener(newPage);
-                        await newPage.goto(`https://www.imvu.com/next/chat/room-${rid}/`, { waitUntil: 'domcontentloaded' });
-                        await setupChatObserver(newPage);
+                        (async () => {
+                            try {
+                                const newPage = await browser.newPage();
+                                setupConsoleListener(newPage);
+                                setupNetworkListener(newPage);
+                                await newPage.goto(`https://www.imvu.com/next/chat/room-${rid}/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                                await setupChatObserver(newPage);
+                                await newPage.waitForFunction(() => {
+                                    const joinBtn = Array.from(document.querySelectorAll('button, .uikit-button, [role="button"], div, span'))
+                                        .find(b => /^(JOIN|GO TO ROOM|ENTER)$/i.test((b.innerText || '').trim()));
+                                    if (joinBtn) { joinBtn.click(); return true; }
+                                    return false;
+                                }, { timeout: 15000 }).catch(() => {});
+                                joiningRooms.delete(rid);
+                            } catch (e) {
+                                joiningRooms.delete(rid);
+                            }
+                        })();
                     }
                 }
             } catch (e) {
@@ -213,17 +241,17 @@ const botUsername = botMatch.username.toLowerCase();
                                 const userId = idMatch[1];
                                 const username = val.data.username;
                                 if (username.toLowerCase() !== botUsername) {
+                                    userIdToUsername.set(userId, username);
                                     if (pendingResolutions.has(userId)) {
                                         console.log(`[${BOT_NAME}] ✅ Resolved ${userId} -> ${username}`);
                                         pendingResolutions.delete(userId);
-                                        runSyncCycle().catch(() => {});
+                                        runSyncCycle().catch(() => { });
                                     }
-                                    userIdToUsername.set(userId, username);
                                 }
                             }
                         }
                     }
-                } catch (e) {}
+                } catch (e) { }
             });
         };
 
@@ -235,30 +263,71 @@ const botUsername = botMatch.username.toLowerCase();
         };
 
         const setupChatObserver = async (targetPage) => {
-            await targetPage.exposeFunction('onNewChatEvent', async (text) => {
+            await targetPage.exposeFunction('onNewChatEvent', async (text, htmlStr, nodeName) => {
                 const lowerText = text.toLowerCase();
                 const roomId = targetPage.url().match(/room-([\d\-]+)/)?.[1] || activeRoomId;
                 
+                let rawUsername = '';
+
+                // If name is attached via nodeName or prepended text
                 if (lowerText.includes('is in the chat')) {
-                    const username = text.split(/ is in the chat/i)[0].trim();
-                    if (username && username.toLowerCase() !== botUsername) {
+                    rawUsername = text.split(/ is in the chat/i)[0].trim();
+                } else if (lowerText.includes('joined the chat')) {
+                    rawUsername = text.split(/ joined the chat/i)[0].trim();
+                } else if (lowerText.includes('left the chat')) {
+                    rawUsername = text.split(/ left the chat/i)[0].trim();
+                }
+
+
+                const processUsernameStr = (rawName) => {
+                    if (!rawName) return '';
+                    // Strictly keep only alphanumeric, underscores, and hyphens (strips invisible characters)
+                    let name = rawName.replace(/[^a-zA-Z0-9_\-\s]/g, '').trim();
+                    if (name.toLowerCase().startsWith('guest_') && name.length > 6) {
+                        return name.substring(6);
+                    }
+                    return name;
+                };
+
+                let username = '';
+                // 1. ALWAYS PRIORITIZE ID-to-Username mapping from HTML meta
+                if (htmlStr) {
+                    const idMatch = htmlStr.match(/user-(\d+)/) || htmlStr.match(/nt-(\d+)/) || htmlStr.match(/data-user-id="(\d+)"/);
+                    if (idMatch && idMatch[1]) {
+                        const resolved = userIdToUsername.get(idMatch[1]);
+                        if (resolved) username = processUsernameStr(resolved);
+                        else rawUsername = `user_${idMatch[1]}`;
+                    }
+                }
+
+                // 2. Fallback to Display Name from text only if username still missing
+                if (!username && rawUsername) username = processUsernameStr(rawUsername) || processUsernameStr(nodeName);
+                if (!username || username.length < 3 || /^(chat|join|leave|you|youre|room)$/i.test(username)) return;
+
+                if (lowerText.includes('is in the chat') || lowerText.includes('joined the chat')) {
+                    if (username.toLowerCase() !== botUsername) {
                         const state = roomStates.get(roomId) || new Set();
-                        if (!state.has(username)) {
-                            console.log(`[${BOT_NAME}] ⚡ DOM Join: ${username}`);
+                        const isPresent = Array.from(state).some(u => u.toLowerCase() === username.toLowerCase());
+                        
+                        if (!isPresent) {
+                            console.log(`[${BOT_NAME}] ⚡ DOM Join: ${username} (raw: ${rawUsername.trim()})`);
+                            departedGuests.delete(username.toLowerCase());
                             state.add(username);
                             roomStates.set(roomId, state);
                             await sendChatMessage(targetPage, `Welcome @${username}`);
-                            runSyncCycle().catch(() => {});
+                            runSyncCycle().catch(() => { });
                         }
                     }
                 } else if (lowerText.includes('left the chat')) {
-                    const username = text.split(/ left the chat/i)[0].trim();
                     const state = roomStates.get(roomId);
-                    if (username && state?.has(username)) {
+                    const existingUser = state ? Array.from(state).find(u => u.toLowerCase() === username.toLowerCase()) : null;
+
+                    if (existingUser) {
                         console.log(`[${BOT_NAME}] 👋 DOM Leave: ${username}`);
-                        state.delete(username);
+                        departedGuests.add(username.toLowerCase());
+                        state.delete(existingUser);
                         await sendChatMessage(targetPage, `Bye @${username}`);
-                        runSyncCycle().catch(() => {});
+                        runSyncCycle().catch(() => { });
                     }
                 }
             });
@@ -267,25 +336,45 @@ const botUsername = botMatch.username.toLowerCase();
                 if (sender.toLowerCase() !== botUsername) console.log(`[CHAT][${sender}] ${content}`);
             });
 
+            try {
+                // Natively click the chat bubble so it opens before attaching the observer
+                const bubbleSelectors = 'button.chat-bubble, .chat-bubble, .chat-button, [aria-label*="chat" i], [title*="chat" i], .uikit-chat-bubble';
+                await targetPage.waitForSelector(bubbleSelectors, { timeout: 15000 });
+                await targetPage.evaluate((sel) => {
+                    const btn = document.querySelector(sel);
+                    if (btn) btn.click();
+                }, bubbleSelectors);
+                
+                await targetPage.waitForSelector('.message-list-wrapper, .cs2-chat-list, .chat-list', { timeout: 15000 });
+            } catch (e) {
+                console.log(`[${BOT_NAME}] ⚠️ Could not natively open chat bubble, trying fallback...`);
+            }
+
             await targetPage.evaluate(() => {
                 const setup = () => {
-                    const list = document.querySelector('.message-list-wrapper') || document.querySelector('.cs2-chat-list');
-                    if (!list) {
-                        const bubbleBtn = document.querySelector('button.chat-bubble');
-                        if (bubbleBtn) bubbleBtn.click();
-                        setTimeout(setup, 3000);
-                        return;
-                    }
+                    const list = document.querySelector('.message-list-wrapper') || document.querySelector('.cs2-chat-list') || document.querySelector('.chat-list') || document.body;
                     console.log('--- CHAT OBSERVER ACTIVE (DOM) ---');
                     const observer = new MutationObserver((mutations) => {
                         for (const mutation of mutations) {
                             for (const node of mutation.addedNodes) {
+                                const text = (node.textContent || '').trim();
+                                if (text) console.log(`[MUTATION] ${text.substring(0, 100)}`);
+                                
                                 if (node.nodeType === 1) {
-                                    const text = node.innerText || '';
-                                    if (text.includes('chat')) window.onNewChatEvent(text);
-                                    const nameEl = node.querySelector('.name, .username, [class*="name"]');
-                                    const msgEl = node.querySelector('.text, .message, [class*="message-body"]');
-                                    if (nameEl && msgEl) window.onNewChatMessage(nameEl.innerText.trim(), msgEl.innerText.trim());
+                                    const htmlStr = node.innerHTML || '';
+                                    const nameEl = node.querySelector('.name, .username, .cs2-chat-message-author, .message-author, [class*="author"]');
+                                    const nodeName = nameEl ? nameEl.textContent.trim() : '';
+                                    const lowerText = text.toLowerCase();
+
+                                    if (lowerText.includes('chat') || lowerText.includes('join') || lowerText.includes('leave') || lowerText.includes('room')) {
+                                        console.log(`[SYSTEM DOM] html: "${htmlStr.substring(0, 300)}..."`);
+                                        window.onNewChatEvent(text, htmlStr, nodeName);
+                                    }
+
+                                    const msgEl = node.querySelector('.text, .message, .message-body, [class*="message-body"]');
+                                    if (nameEl && msgEl) {
+                                        window.onNewChatMessage(nodeName, msgEl.textContent.trim());
+                                    }
                                 }
                             }
                         }
@@ -301,55 +390,63 @@ const botUsername = botMatch.username.toLowerCase();
         try {
             const res = await axios.post(`${BACKEND_URL}/api/rooms/sync`, { rooms: [], bot_name: BOT_NAME, bot_username: botMatch.username }, { timeout: 5000 });
             if (res.data && res.data.target_rooms) initialRooms = res.data.target_rooms;
-        } catch (e) {}
+        } catch (e) { }
 
         const firstRoom = initialRooms.length > 0 ? initialRooms[0] : '163042598-3671';
         console.log(`[${BOT_NAME}] Navigating to room: ${firstRoom}...`);
-        
+
         setupConsoleListener(page);
         setupNetworkListener(page);
         await page.goto(`https://www.imvu.com/next/chat/room-${firstRoom}/`, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => null);
-        await new Promise(r => setTimeout(r, 5000));
 
         // Quick login if session expired
         const needsLogin = await page.evaluate(() => !!(document.querySelector('form[action*="/login"]') || document.title.toLowerCase().includes('log in'))).catch(() => false);
         if (needsLogin) {
-            console.log(`[${BOT_NAME}] Session expired. Logging in via API...`);
+            console.log(`[${BOT_NAME}] Session expired. Logging in...`);
             try {
                 const loginRes = await axios.post('https://api.imvu.com/login', {
                     username: botMatch.username, password: botMatch.password, gdpr_cookie_acceptance: false
                 }, { headers: { 'Content-Type': 'application/json; charset=UTF-8', 'X-IMVU-Application': 'welcome/1' }, timeout: 8000 });
-                const cookies = loginRes.headers['set-cookie'];
-                if (cookies) {
-                    for (const cStr of cookies) {
+                if (loginRes.headers['set-cookie']) {
+                    for (const cStr of loginRes.headers['set-cookie']) {
                         const pair = cStr.split(';')[0];
                         const eqIdx = pair.indexOf('=');
                         if (eqIdx !== -1) await page.setCookie({ name: pair.substring(0, eqIdx), value: pair.substring(eqIdx + 1), domain: '.imvu.com' });
                     }
                     await page.reload({ waitUntil: 'domcontentloaded' });
-                    await new Promise(r => setTimeout(r, 5000));
                 }
-            } catch (e) {
-                console.error(`[${BOT_NAME}] Login failed!`);
-            }
+            } catch (e) { }
         }
 
-        await setupChatObserver(page);
-        console.log(`[${BOT_NAME}] Forcing refresh to capture usernames...`);
-        await page.reload({ waitUntil: 'networkidle2', timeout: 60000 }).catch(() => null);
-        await new Promise(r => setTimeout(r, 8000));
+        // --- ENTERING THE ROOM ---
+        console.log(`[${BOT_NAME}] 🚪 Joining room...`);
+        // Use waitForFunction to find and click join as soon as it appears
+        await page.waitForFunction(() => {
+            const btns = Array.from(document.querySelectorAll('button, .uikit-button, [role="button"], div, span'));
+            const joinBtn = btns.find(b => {
+                const text = (b.innerText || '').trim().toUpperCase();
+                return text === 'JOIN' || text === 'GO TO ROOM' || text === 'ENTER';
+            });
+            if (joinBtn) {
+                joinBtn.click();
+                return true;
+            }
+            return false;
+        }, { timeout: 30000 }).catch(() => { });
 
+        // Extra insurance: click by class if it's visible
         await page.evaluate(() => {
-            const btn = Array.from(document.querySelectorAll('button')).find(b => /join|go to room|enter/i.test(b.innerText));
-            if (btn) btn.click();
-        }).catch(() => null);
-        await new Promise(r => setTimeout(r, 10000));
+            const btn = document.querySelector('.uikit-button-primary');
+            if (btn && (btn.innerText || '').toUpperCase().includes('JOIN')) btn.click();
+        }).catch(() => {});
 
-        await sendChatMessage(page, "Moderator active.");
+        // Now that we are joining/joined, setup the observer
+        await setupChatObserver(page);
+
         console.log(`[${BOT_NAME}] ✅ Ready. Broadcasting in room ${firstRoom}.`);
 
-        setInterval(runSyncCycle, 30000);
-
+        setInterval(runSyncCycle, 8000);
+                                                                                                                                                                                                                                                                                                                                        
     } catch (e) {
         console.error("Critical error:", e.message);
     }
