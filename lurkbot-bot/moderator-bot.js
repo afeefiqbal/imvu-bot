@@ -28,14 +28,24 @@ const userIdToUsername = new Map();
 const pendingResolutions = new Set();
 const roomStates = new Map(); // roomId -> Set of userIds
 const lastSeen = new Map(); // userId -> timestamp
-const departedGuests = new Set();
 const welcomeCooldowns = new Map(); // userId -> timestamp
+const welcomedUsersGlobal = new Set();
+const userLastConfirmed = new Map(); // userId -> timestamp
 const roomClosingTimers = new Map(); // roomId -> timestamp
 const activeTabRoomIds = new Set(); 
 const targetRooms = new Set();
 const joiningRooms = new Set();
+const roomPages = new Map(); // roomId -> Page instance
 let hasStateChange = false;
+const pendingJoins = new Map(); // "userId:roomId" -> timeoutRef
+const replyCooldown = new Map(); // userId -> timestamp
 
+// --- GLOBAL HELPERS ---
+const isBotUser = (userId, username) => {
+    if (botMatch.id && userId?.toString() === botMatch.id.toString()) return true;
+    if (username && username.toLowerCase() === botUsername) return true;
+    return false;
+};
 
 let browser = null;
 let mainPage = null;
@@ -43,6 +53,8 @@ let isSyncing = false;
 let isInitialStart = true;
 let isRestarting = false;
 let syncInterval = null;
+let runSyncCycle = async () => { }; 
+let sendChatMessage = async () => { }; 
 
 const cleanupProfileLock = () => {
     try {
@@ -54,220 +66,658 @@ const cleanupProfileLock = () => {
     } catch (e) { }
 };
 
+const performLogin = async (page) => {
+    try {
+        if (!page || page.isClosed()) return false;
+        const originalUrl = page.url();
+        const needsLogin = await page.evaluate(() => {
+            const loginLink = document.querySelector('.login-link, .nav-login, [href*="login"]');
+            const loggedInUser = document.querySelector('.user-menu, .avatar-name, .username');
+            return !!loginLink && !loggedInUser;
+        });
+        if (!needsLogin) return true;
+
+        console.log(`[${BOT_NAME}] 🔐 Checking login for page: ${originalUrl}`);
+
+        const findForm = async (pOrF) => {
+            return await pOrF.evaluate(() => {
+                const userInp = document.querySelector('input[name="username"], input[name="email"], #login_username, [placeholder*="Username" i]');
+                const passInp = document.querySelector('input[type="password"], #login_password');
+                return !!(userInp && passInp);
+            });
+        };
+
+        let hasForm = await findForm(page);
+        if (!hasForm) {
+            await page.evaluate(() => {
+                const btns = Array.from(document.querySelectorAll('button, a, span, .login-link, [href*="login"]'));
+                const loginBtn = btns.find(b => {
+                    const t = (b.innerText || b.textContent || '').toUpperCase().trim();
+                    return t.includes('LOG IN') || t.includes('SIGN IN') || t === 'LOGIN';
+                });
+                if (loginBtn) loginBtn.click();
+            });
+            await new Promise(r => setTimeout(r, 6000));
+            hasForm = await findForm(page);
+        }
+
+        if (!hasForm && !page.url().includes('/login')) {
+            console.log(`[${BOT_NAME}] ⚠️ No form visible. Forcing direct login navigation...`);
+            await page.goto('https://www.imvu.com/login/', { waitUntil: 'domcontentloaded' }).catch(() => {});
+            await new Promise(r => setTimeout(r, 6000));
+            hasForm = await findForm(page);
+        }
+
+        const targets = [page, ...page.frames()];
+        for (const t of targets) {
+            const filled = await t.evaluate((u, p) => {
+                const userInp = document.querySelector('input[name="username"], input[name="email"], #login_username, [placeholder*="Username" i]');
+                const passInp = document.querySelector('input[type="password"], #login_password');
+                if (userInp && passInp) {
+                    userInp.focus();
+                    userInp.value = u;
+                    userInp.dispatchEvent(new Event('input', { bubbles: true }));
+                    passInp.focus();
+                    passInp.value = p;
+                    passInp.dispatchEvent(new Event('input', { bubbles: true }));
+                    return true;
+                }
+                return false;
+            }, botMatch.username, botMatch.password).catch(() => false);
+
+            if (filled) {
+                await page.keyboard.press('Enter');
+                await new Promise(r => setTimeout(r, 12000));
+                
+                // --- SELF-ID DISCOVERY ---
+                const selfId = await page.evaluate(() => {
+                    const nextData = window.next?.props?.pageProps?.initialState?.user?.profile?.id || 
+                                     localStorage.getItem('av_id') || 
+                                     document.querySelector('[data-user-id]')?.getAttribute('data-user-id');
+                    return nextData;
+                }).catch(() => null);
+                
+                if (selfId && !botMatch.id) {
+                    botMatch.id = selfId.toString();
+                    console.log(`[${BOT_NAME}] 🆔 Discovered self-ID: ${botMatch.id}`);
+                }
+
+                if (!page.url().includes(originalUrl) && originalUrl.includes('room-')) {
+                    console.log(`[${BOT_NAME}] ✅ Login success. Returning to room...`);
+                    await page.goto(originalUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
+                    await new Promise(r => setTimeout(r, 8000));
+                } else {
+                    console.log(`[${BOT_NAME}] ✅ Login completed`);
+                }
+                
+                // 🔥 EXTRACT SESSION FOR WS BOT
+                await extractSession(page);
+                return true;
+            }
+        }
+    } catch (e) {
+        console.error(`[${BOT_NAME}] ❌ Login Error:`, e.message);
+    }
+    return false;
+};
+
+const clickJoinButton = async (page) => {
+    try {
+        if (!page || page.isClosed()) return false;
+        console.log(`[${BOT_NAME}] 🚪 Attempting to join room...`);
+        
+        for (let i = 0; i < 3; i++) {
+            // Interact with the page to ensure focus
+            
+            // 🔥 DISMISS POPUPS (Daily Spin, Welcome, etc.)
+            await page.evaluate(() => {
+                const selectors = ['.modal-close', '.common-modal-close', '[class*="close"]', '[class*="dismiss"]', '.modal-x'];
+                selectors.forEach(sel => {
+                    document.querySelectorAll(sel).forEach(el => {
+                        if (el.offsetWidth > 0 || el.offsetHeight > 0) el.click();
+                    });
+                });
+            }).catch(() => {});
+
+            await page.mouse.click(640, 400).catch(() => {});
+            
+            const success = await page.waitForFunction(() => {
+                const btns = Array.from(document.querySelectorAll(
+                    'button, .uikit-button, .join-cta, .btn-join, [class*="join"], [role="button"], a, div[class*="Button"]'
+                ));
+
+                const joinBtn = btns.find(b => {
+                    const text = (b.textContent || b.innerText || b.getAttribute('aria-label') || b.title || '').trim().toUpperCase();
+                    return (
+                        text.includes('JOIN') ||
+                        text.includes('GO TO') ||
+                        text.includes('ENTER') ||
+                        text.includes('CHAT') ||
+                        text.includes('START') ||
+                        text.includes('NOW') ||
+                        text.includes('GO')
+                    );
+                });
+
+                if (joinBtn && joinBtn.offsetWidth > 0) {
+                    window._targetBtn = joinBtn;
+                    return true;
+                }
+                return false;
+            }, { timeout: 15000 }).then(() => true).catch(() => false);
+            
+            if (success) {
+                const box = await page.evaluate(() => {
+                    const b = window._targetBtn;
+                    if (!b) return null;
+                    const r = b.getBoundingClientRect();
+                    return { x: r.left, y: r.top, w: r.width, h: r.height };
+                });
+
+                if (box) {
+                    console.log(`[JOIN] 🎯 Precision clicking button at ${Math.round(box.x)},${Math.round(box.y)}`);
+                    await page.mouse.click(box.x + box.w / 2, box.y + box.h / 2);
+                } else {
+                    await page.evaluate(() => window._targetBtn?.click());
+                }
+                
+                await new Promise(r => setTimeout(r, 4000));
+                // Check if button is gone
+                const gone = await page.evaluate(() => {
+                    return !Array.from(document.querySelectorAll('button')).find(b => (b.innerText || '').toUpperCase().includes('JOIN'));
+                });
+                if (gone) {
+                    console.log(`[${BOT_NAME}] ✅ Joined room`);
+                    return true;
+                }
+            }
+            await new Promise(r => setTimeout(r, 3000));
+        }
+        return false;
+    } catch (e) { return false; }
+};
+
+const handleWSJoin = async (userId, roomId = null) => {
+    const rooms = roomId ? [roomId] : Array.from(roomStates.keys());
+    for (const rid of rooms) {
+        if (!targetRooms.has(rid) && !roomPages.has(rid)) {
+            console.log(`[WS] ⚠️ Ignoring external room ${rid}`);
+            continue;
+        }
+
+        activeTabRoomIds.add(rid);
+        const state = roomStates.get(rid) || new Set();
+        roomStates.set(rid, state);
+        if (state.has(userId)) continue;
+
+        console.log(`[WS] ✅ JOIN: ${userId} in ${rid}`);
+        
+        const trackingKey = `${userId}:${rid}`;
+        
+        // --- ELITE RECONNECT GUARD ---
+        if (state.has(userId) && lastSeen.get(trackingKey) && Date.now() - lastSeen.get(trackingKey) < 2000) {
+             console.log(`[WS] ⚡ Reconnect detected for ${userId} in ${rid}. Skipping welcome.`);
+             return;
+        }
+
+        state.add(userId);
+        const now = Date.now();
+        lastSeen.set(trackingKey, now);
+        userLastConfirmed.set(trackingKey, now);
+
+        let username = userIdToUsername.get(userId);
+        for (let i = 0; i < 3 && !username; i++) {
+            await new Promise(r => setTimeout(r, 1000));
+            username = userIdToUsername.get(userId);
+        }
+        username = username || `user_${userId}`;
+        if (username.startsWith('user_')) {
+            await new Promise(r => setTimeout(r, 500));
+            username = userIdToUsername.get(userId) || username;
+        }
+
+        const welcomeKey = `${userId}:${rid}`;
+        const lastWelcome = welcomeCooldowns.get(welcomeKey) || 0;
+        
+        const isBot = isBotUser(userId, username);
+
+        if (now - lastWelcome > 30000 && 
+            !welcomedUsersGlobal.has(welcomeKey) && 
+            !isBot) {
+            
+            console.log(`[${BOT_NAME}] 🎉 Triggering Welcome for ${username} in ${rid}`);
+            let page = roomPages.get(rid);
+            if (!page || page.isClosed()) {
+                await new Promise(r => setTimeout(r, 2000));
+                page = roomPages.get(rid);
+            }
+
+            if (page && !page.isClosed()) {
+                await sendChatMessage(page, `Welcome @${username}! 👋`).catch(() => {});
+            }
+            welcomeCooldowns.set(welcomeKey, now);
+            welcomedUsersGlobal.add(welcomeKey);
+            
+            // --- AUTO CLEANUP ---
+            setTimeout(() => welcomeCooldowns.delete(welcomeKey), 10 * 60 * 1000);
+            setTimeout(() => welcomedUsersGlobal.delete(welcomeKey), 10 * 60 * 1000);
+        }
+
+        hasStateChange = true;
+        if (!isSyncing) runSyncCycle(true).catch(() => {});
+    }
+};
+
+const handleWSLeave = async (userId, roomId = null) => {
+    const rooms = roomId ? [roomId] : Array.from(roomStates.keys());
+    for (const rid of rooms) {
+        const state = roomStates.get(rid);
+        if (!state || !state.has(userId)) continue;
+
+        console.log(`[WS] ❌ LEAVE: ${userId} from ${rid}`);
+        state.delete(userId);
+        const trackingKey = `${userId}:${rid}`;
+        lastSeen.delete(trackingKey);
+        userLastConfirmed.delete(trackingKey);
+        hasStateChange = true;
+        if (!isSyncing) runSyncCycle(true).catch(() => {});
+    }
+};
+
+const processIMVUMessage = (raw) => {
+    try {
+        if (typeof raw !== 'string') return;
+        const data = JSON.parse(raw);
+        if (!data.message) return;
+
+        // --- HANDLE PRESENCE (PARTICIPANTS) ---
+        if (data.record === 'msg_g2c_send_message' && data.mount?.includes('participants')) {
+            let decoded;
+            try {
+                decoded = JSON.parse(Buffer.from(data.message, 'base64').toString('utf-8'));
+            } catch (err) { return; }
+            
+            const action = decoded.action; 
+            const objects = decoded.objects || [];
+
+            for (const obj of objects) {
+                const userMatch = obj.match(/user-(\d+)/);
+                const roomMatch = obj.match(/chat-([\d\-]+)/);
+                if (!userMatch || !roomMatch) continue;
+
+                const userId = userMatch[1];
+                const roomId = roomMatch[1];
+                const joinKey = `${userId}:${roomId}`;
+
+                if (action === 'created') {
+                    if (pendingJoins.has(joinKey)) clearTimeout(pendingJoins.get(joinKey));
+                    const timeout = setTimeout(() => {
+                        handleWSJoin(userId, roomId);
+                        pendingJoins.delete(joinKey);
+                    }, 1000);
+                    pendingJoins.set(joinKey, timeout);
+                    
+                    // --- AUTO CLEANUP ---
+                    setTimeout(() => pendingJoins.delete(joinKey), 10000);
+                    
+                } else if (action === 'deleted') {
+                    if (pendingJoins.has(joinKey)) {
+                        clearTimeout(pendingJoins.get(joinKey));
+                        pendingJoins.delete(joinKey);
+                    } else {
+                        handleWSLeave(userId, roomId);
+                    }
+                }
+            }
+        }
+
+        // --- HANDLE CHAT MESSAGES ---
+        if (data.mount === 'messages' || data.record === 'msg_g2c_send_message' && data.mount?.includes('messages')) {
+            try {
+                const decoded = JSON.parse(Buffer.from(data.message, 'base64').toString('utf-8'));
+                const userId = decoded.userId?.toString();
+                const msgText = decoded.message;
+
+                if (!userId || !msgText || msgText.startsWith('*')) return;
+                
+                handleIncomingChat(userId, msgText, data.queue);
+            } catch (e) { }
+        }
+    } catch (e) { }
+};
+
+const generateReply = (msg, username) => {
+    const text = msg.toLowerCase();
+    
+    if (text.includes('hi') || text.includes('hello') || text.includes('hey')) {
+        const variants = [`Hey @${username}! 👋`, `Hi there ${username} 😊`, `Hello ${username}, how’s it going?` ];
+        return variants[Math.floor(Math.random() * variants.length)];
+    }
+    
+    if (text.includes('how are you') || text.includes('hru')) {
+         const variants = [`I'm doing great, ${username}! Thanks for asking. 😄`, `I'm good, ${username}, enjoying the chat!`, `Doing well! How about you?` ];
+         return variants[Math.floor(Math.random() * variants.length)];
+    }
+    
+    if (text.includes('bye')) return `See you later, ${username}! 👋`;
+    if (text.includes('bot') || text.includes('moderator')) return `I'm just here to keep the room safe! 🛡️`;
+    return null;
+};
+
+const handleIncomingChat = async (userId, message, queue) => {
+    if (!botMatch.id || userId === botMatch.id.toString() || userIdToUsername.get(userId)?.toLowerCase() === botUsername) return;
+
+    const roomMatch = queue?.match(/chat-([\d\-]+)/);
+    const rid = roomMatch ? roomMatch[1] : null;
+    if (!rid) return;
+
+    const username = userIdToUsername.get(userId) || `user_${userId}`;
+    console.log(`[CHAT][${rid}] ${username}: ${message}`);
+
+    const now = Date.now();
+    const lastReply = replyCooldown.get(userId) || 0;
+    if (now - lastReply < 5000) return; // 5s spam guard
+
+    const reply = generateReply(message, username);
+    if (!reply) return;
+
+    replyCooldown.set(userId, now);
+
+    const page = roomPages.get(rid);
+    if (page && !page.isClosed()) {
+        // --- NATURAL TYPING DELAY ---
+        await new Promise(r => setTimeout(r, 1000 + Math.random() * 2000));
+        
+        // 🔥 MINIMIZE PUPPETEER CHAT (30% chance)
+        if (Math.random() < 0.3) {
+            await sendChatMessage(page, reply).catch(() => {});
+        }
+    }
+};
+
+const activateAvatar = async (page) => {
+    try {
+        // Wait for WebGL canvas
+        await page.waitForFunction(() => {
+            const canvas = document.querySelector('canvas');
+            return canvas && canvas.width > 0;
+        }, { timeout: 20000 });
+
+        // Real interaction trigger
+        await page.evaluate(() => {
+            const canvas = document.querySelector('canvas');
+            if (canvas) {
+                canvas.click();
+                canvas.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+            }
+        });
+
+        // Small movement (engine trigger)
+        await page.keyboard.press('ArrowUp');
+        await page.keyboard.press('ArrowDown');
+
+        console.log(`[BOT] ✅ Avatar activated`);
+    } catch (e) {
+        console.log(`[BOT] ⚠️ Avatar activation failed`);
+    }
+};
+
+const setupPageFocus = async (page) => {
+    try {
+        await page.evaluate(() => {
+            window.blur();
+        }).catch(() => {});
+    } catch (e) {}
+};
+
+const extractSession = async (page) => {
+    try {
+        if (!page || page.isClosed()) return;
+        const cookies = await page.cookies();
+        const cookieString = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+        const userAgent = await page.evaluate(() => navigator.userAgent);
+
+        const manifest = {
+            cookies: cookieString,
+            userAgent: userAgent,
+            wsUrl: "wss://wss-imq.imvu.com/streaming/imvu_pre",
+            timestamp: new Date().toISOString()
+        };
+
+        const manifestPath = path.join(__dirname, 'ws_manifest.json');
+        fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+        console.log(`[${BOT_NAME}] 🔐 Session manifest updated for WS bot`);
+    } catch (e) {
+        console.error(`[${BOT_NAME}] ❌ Session extraction failed:`, e.message);
+    }
+};
+
+const setupNetworkSniffing = async (page) => {
+    try {
+        if (!page || page.isClosed()) return;
+        await page.exposeFunction('handleIMVUEvent', async (event) => {
+            const { type, data } = event;
+            if (type === 'ws_message') processIMVUMessage(data);
+            if (type === 'fetch_response') processIMVUMessage(data.body);
+        }).catch(() => { });
+    } catch (e) { }
+
+    await page.evaluateOnNewDocument(() => {
+        (function () {
+            const sendToNode = (type, data) => {
+                window.dispatchEvent(new CustomEvent('IMVU_EVENT', { detail: { type, data } }));
+            };
+            const OriginalWebSocket = window.WebSocket;
+            window.WebSocket = function (...args) {
+                const ws = new OriginalWebSocket(...args);
+                ws.addEventListener('message', (e) => sendToNode('ws_message', e.data));
+                return ws;
+            };
+            const originalFetch = window.fetch;
+            window.fetch = async (...args) => {
+                const res = await originalFetch(...args);
+                try {
+                    const clone = res.clone();
+                    clone.text().then(t => sendToNode('fetch_response', { url: args[0], body: t }));
+                } catch (e) { }
+                return res;
+            };
+        })();
+    });
+};
+
 const initBot = async () => {
     if (isRestarting) return;
     isRestarting = true;
     
     try {
         if (browser) {
-            console.log(`[${BOT_NAME}] 🔄 Restarting browser session...`);
+            console.log(`[${BOT_NAME}] 🔄 Browser restarting...`);
             if (syncInterval) clearInterval(syncInterval);
             await browser.close().catch(() => {});
-            browser = null;
+            browser = null; 
         }
 
         cleanupProfileLock();
 
-        const launchArgs = [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-web-security',
-            '--disable-features=IsolateOrigins,site-per-process',
-        ];
-        if (BOT_PROXY) launchArgs.push(`--proxy-server=${BOT_PROXY}`);
-
         browser = await puppeteer.launch({
-            headless: true,
-            executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+            headless: false,
             userDataDir: USER_DATA_DIR,
-            args: launchArgs,
+            args: [
+                '--no-sandbox', 
+                '--disable-setuid-sandbox', 
+                '--disable-web-security', 
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--disable-blink-features=AutomationControlled',
+                '--enable-webgl',
+                '--use-gl=angle',
+                '--ignore-gpu-blocklist',
+                '--window-position=-10000,-10000',
+                '--window-size=1280,800',
+                '--disable-infobars',
+                '--disable-notifications',
+                '--mute-audio',
+                '--disable-dev-shm-usage',
+                '--disable-gpu-sandbox',
+                '--no-zygote'
+            ]
+        });
+
+        browser.on('disconnected', () => {
+            console.log(`[${BOT_NAME}] 🚨 Browser process lost! Recovering in 5s...`);
+            setTimeout(() => {
+                isRestarting = false; // Reset lock for recovery
+                initBot();
+            }, 5000);
         });
 
         mainPage = (await browser.pages())[0];
         await mainPage.setViewport({ width: 1280, height: 800 });
 
-        // --- CORE FUNCTIONS ---
-        const sendChatMessage = async (targetPage, message) => {
+        sendChatMessage = async (targetPage, message) => {
             try {
-                const inputSelectors = [
-                    'textarea[placeholder*="Say something"]',
-                    '.uikit-chat-input-textarea',
-                    'textarea.chat-input',
-                    '[role="textbox"]',
-                    'textarea'
-                ];
-                
-                let input;
-                for (const selector of inputSelectors) {
-                    input = await targetPage.$(selector).catch(() => null);
-                    if (input) {
-                        const visible = await input.boundingBox().catch(() => null);
-                        if (visible) break;
+                if (targetPage.isClosed()) return false;
+                const findInput = async () => {
+                    const sel = ['textarea[placeholder*="Say something"]', '.uikit-chat-input-textarea', 'textarea.chat-input', '[role="textbox"]', 'textarea'];
+                    for (const s of sel) {
+                        const el = await targetPage.$(s).catch(() => null);
+                        if (el && await el.boundingBox()) return el;
+                    }
+                    return null;
+                };
+
+                let input = await findInput();
+                if (!input) {
+                    const bSel = 'button.chat-bubble, .uikit-chat-bubble';
+                    const b = await targetPage.$(bSel).catch(() => null);
+                    if (b) {
+                        await b.click().catch(() => {});
+                        await new Promise(r => setTimeout(r, 2000));
+                        input = await findInput();
                     }
                 }
 
                 if (input) {
                     await input.click({ clickCount: 3 }).catch(() => {});
-                    await targetPage.keyboard.type(message, { delay: 20 });
-                    await targetPage.keyboard.press('Enter');
                     
-                    // Fallback: Click Send Button
-                    await targetPage.evaluate(() => {
-                        const btns = Array.from(document.querySelectorAll('button, [role="button"], .uikit-button'));
-                        const sendBtn = btns.find(b => {
-                            const t = (b.innerText || b.getAttribute('title') || '').toUpperCase().trim();
-                            return t === 'SEND' || b.querySelector('svg') || b.querySelector('i.icon-send');
-                        });
-                        if (sendBtn) sendBtn.click();
-                    }).catch(() => {});
-                    
-                    return true;
+                    let sent = false;
+                    for (let i = 0; i < 2 && !sent; i++) {
+                        try {
+                            await targetPage.keyboard.type(message, { delay: 20 });
+                            await targetPage.keyboard.press('Enter');
+                            
+                            // Fallback Click
+                            await targetPage.evaluate(() => {
+                                 const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+                                 const send = btns.find(b => (b.innerText || '').toUpperCase().trim() === 'SEND' || b.querySelector('svg'));
+                                 if (send) send.click();
+                            }).catch(() => {});
+                            sent = true;
+                        } catch (e) { }
+                    }
+                    return sent;
                 }
-            } catch (err) {
-                console.error(`[${BOT_NAME}] Chat sending error:`, err.message);
-            }
+            } catch (err) { }
             return false;
         };
 
-        const runSyncCycle = async (force = false) => {
-            if (!browser || !browser.isConnected()) {
-                console.error(`[${BOT_NAME}] Browser disconnected. Triggering restart...`);
-                initBot();
-                return;
-            }
-
+        runSyncCycle = async (force = false) => {
+            if (!browser || !browser.isConnected()) return initBot();
             if (force) hasStateChange = true;
             if (isSyncing) return;
             isSyncing = true;
 
             try {
-                const imvuPages = (await browser.pages()).filter(p => p.url().includes('room-'));
-                activeTabRoomIds.clear();
-
                 do {
-                    const currentSyncState = hasStateChange;
-                    hasStateChange = false; // Reset to catch NEW changes during this iteration
-                    
-                    console.log(`[${BOT_NAME}] 🔄 Starting sync cycle (triggered by: ${isInitialStart ? 'Startup' : (currentSyncState ? 'Event' : 'Interval')})...`);
-
+                    hasStateChange = false;
                     const roomsToSync = [];
-                    imvuPages.map(p => p.url().match(/room-([\d\-]+)/)?.[1]).filter(Boolean).forEach(id => activeTabRoomIds.add(id));
+                    
+                    for (const [rid, p] of roomPages.entries()) {
+                        if (p.isClosed()) { 
+                            console.log(`[${BOT_NAME}] ⚠️ Page crashed for ${rid}, rejoining...`);
+                            roomPages.delete(rid); 
+                            roomStates.delete(rid);
+                            targetRooms.add(rid); // Force Rejoin
+                            continue; 
+                        }
+                        
+                        const currentUrl = p.url().split('?')[0];
+                        console.log(`[${BOT_NAME}] 🔄 Syncing room ${rid} (Page: ${currentUrl})`);
+                        
+                        // 🔥 RESCUE REDIRECT: Ensure we are actually in the target room
+                        if (!currentUrl.includes(`room-${rid}`)) {
+                             console.log(`[RESCUE] 🚨 Not in room! Redirecting back to ${rid}...`);
+                             await p.goto(`https://www.imvu.com/next/chat/room-${rid}/`, { waitUntil: 'domcontentloaded' }).catch(() => {});
+                             await new Promise(r => setTimeout(r, 8000));
+                             continue;
+                        }
 
+                        // 🔥 OPEN PARTICIPANTS PANEL: IMVU doesn't render users until panel is open
+                        await p.evaluate(() => {
+                            const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+                            const peopleBtn = btns.find(b => {
+                                const t = (b.innerText || b.textContent || '').toLowerCase();
+                                return t.includes('people') || t.includes('participants') || t.includes('visitors');
+                            });
+                            if (peopleBtn && peopleBtn.offsetWidth > 0) peopleBtn.click();
+                        }).catch(() => {});
 
-
-
-                    // 1. Process Open Rooms
-                    for (const p of imvuPages) {
-                        const match = p.url().match(/room-([\d\-]+)/);
-                        if (!match) continue;
-                        const roomId = match[1];
+                        // Wait for at least one user to render
+                        await p.waitForFunction(() => {
+                            return document.querySelectorAll('.participant-avatar, [data-user-id], [href*="/av/"]').length > 0;
+                        }, { timeout: 15000 }).catch(() => {});
 
                         const data = await p.evaluate((rid) => {
-                            const ids = new Set();
-                            const participantElements = document.querySelectorAll('.participant-avatar, .avatar-image, [data-user-id], [href*="/av/"], [href*="/avatar/"], .chat-room-participant, [src*="user-"]');
-                            participantElements.forEach(el => {
-                                const dataId = el.getAttribute('data-user-id') || el.getAttribute('data-id');
-                                if (dataId && /^\d{5,12}$/.test(dataId)) ids.add(dataId);
-                                const source = el.href || el.getAttribute('href') || el.src || el.getAttribute('src') || '';
-                                const idMatch = source.match(/user-([0-9]{5,})/i) || source.match(/av\/([0-9]{5,})/i) || source.match(/avatar\/([0-9]{5,})/i) || source.match(/userdata\/(\d+)/i);
-                                if (idMatch) ids.add(idMatch[1]);
-                            });
-                            const bodyHtml = document.body.innerHTML;
-                            const globalMatches = bodyHtml.matchAll(/(?:user-|nt-|av\/)([0-9]{7,15})/g);
-                            for (const m of globalMatches) ids.add(m[1]);
-                            
-                            const metaTitle = document.querySelector('meta[property="og:title"]')?.content;
-                            const nameEl = document.querySelector('.chat-header-room-name, .room-name, .room-title-text, h1, h2');
-                            let roomName = metaTitle || (nameEl ? nameEl.innerText.trim() : 'Unknown');
-                            
-                            // Clean up common prefixes if any
-                            roomName = roomName.replace(/^IMVU\s*:\s*/i, '').replace(/\s*-\s*IMVU$/i, '');
-
-                            const metaImg = document.querySelector('meta[property="og:image"]');
-                            const roomImage = metaImg ? metaImg.content : `https://userimages-akm.imvu.com/room_thumbnail/room-${rid}`;
-
-                            return { visitors: Array.from(ids), roomName, roomImage };
-
-                        }, roomId).catch(() => null);
-
+                             const ids = new Set();
+                             document.querySelectorAll('.participant-avatar, [data-user-id], [href*="/av/"], [src*="user-"]').forEach(el => {
+                                 if (el.offsetWidth === 0) return;
+                                 const id = el.getAttribute('data-user-id') || (el.href || el.src || '').match(/(?:user-|av\/)(\d+)/)?.[1];
+                                 if (id) ids.add(id);
+                             });
+                             const nameEl = document.querySelector('.chat-header-room-name, h1');
+                             const roomName = (nameEl ? nameEl.innerText.trim() : 'Unknown').replace(/^IMVU\s*:\s*/i, '');
+                             return { visitors: Array.from(ids), roomName };
+                        }, rid).catch(() => null);
 
                         if (data) {
-                            // Filter out the RoomID itself from visitors
-                            data.visitors = data.visitors.filter(id => id !== roomId && !roomId.startsWith(id));
-                            
-                            const now = Date.now();
-                            if (!roomStates.has(roomId)) roomStates.set(roomId, new Set());
-                            const state = roomStates.get(roomId);
+                            if (!roomStates.has(rid)) roomStates.set(rid, new Set());
+                            const state = roomStates.get(rid);
 
-                            for (const userId of data.visitors) {
-                                if (userId) lastSeen.set(userId, now);
-                                if (userIdToUsername.has(userId)) {
-                                    let user = userIdToUsername.get(userId);
-                                    if (user.toLowerCase().startsWith('guest_') && user.length > 6) user = user.substring(6);
-                                    const isBotSelf = user.toLowerCase() === botUsername || user.toLowerCase() === 'you' || user.toLowerCase() === 'siva';
-                                    if (isBotSelf) continue;
+                            // 🔥 Initial Population Bridge (No Welcome for existing users)
+                            for (const id of data.visitors) {
+                                if (!state.has(id)) {
+                                    console.log(`[INIT] 👤 Found existing user ${id} in ${rid}`);
+                                    state.add(id);
 
-                                    if (!state.has(userId) && user.length >= 3 && !user.startsWith('user_')) {
-                                        hasStateChange = true;
-                                        console.log(`[${BOT_NAME}] ✨ Welcoming ${user} (ID: ${userId})`);
-                                        await sendChatMessage(p, `Welcome @${user}`);
-                                        state.add(userId);
-                                    }
-                                } else if (!state.has(userId)) {
-                                    state.add(userId);
-                                    hasStateChange = true;
-                                    if (!pendingResolutions.has(userId)) {
-                                        console.log(`[${BOT_NAME}] 🔍 Unknown ID ${userId} found. Resolving username...`);
-                                        pendingResolutions.add(userId);
-                                        p.evaluate((id) => { fetch(`https://api.imvu.com/user/user-${id}`).catch(() => { }); }, userId).catch(() => { });
-                                    }
+                                    const trackingKey = `${id}:${rid}`;
+                                    const now = Date.now();
+                                    lastSeen.set(trackingKey, now);
+                                    userLastConfirmed.set(trackingKey, now);
+                                    
+                                    // 🚫 PREVENT WELCOME for people already there
+                                    const welcomeKey = `${id}:${rid}`;
+                                    welcomedUsersGlobal.add(welcomeKey);
+                                    welcomeCooldowns.set(welcomeKey, now);
                                 }
                             }
-                            
-                            for (const userId of Array.from(state)) {
-                                // Only timeout numeric IDs that the scraper is supposed to see
-                                if (/^\d+$/.test(userId)) {
-                                    if (!data.visitors.includes(userId)) {
-                                        if (now - (lastSeen.get(userId) || 0) > 30000) {
-                                            console.log(`[${BOT_NAME}] 🏃 User Left (Scraper Timeout): user_${userId} (ID: ${userId})`);
-                                            state.delete(userId);
-                                            lastSeen.delete(userId);
-                                            hasStateChange = true;
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            const finalVisitors = Array.from(state).map(key => {
-                                // key could be an ID or a raw username
-                                if (/^\d+$/.test(key)) return userIdToUsername.get(key) || `user_${key}`;
-                                return key;
-                            }).slice(0, 50);
-                            roomsToSync.push({ 
-                                id: roomId, 
-                                visitors: finalVisitors, 
-                                population: state.size,
-                                name: data.roomName,
-                                image_url: data.roomImage
-                            });
 
+                            const finalVisitors = Array.from(state).map(id => userIdToUsername.get(id) || `user_${id}`);
+                            roomsToSync.push({ id: rid, visitors: finalVisitors, population: state.size, name: data.roomName });
                         }
                     }
 
-                    // 2. Identify and Sync Closed Rooms (Zero population)
-                    for (const [rid, state] of roomStates.entries()) {
-                        if (!activeTabRoomIds.has(rid)) {
-                            console.log(`[${BOT_NAME}] 🧹 Room ${rid} closed. Syncing 0 population...`);
+                    for (const rid of Array.from(roomStates.keys())) {
+                        if (!targetRooms.has(rid) && !roomPages.has(rid)) {
+                            console.log(`[${BOT_NAME}] 🧹 Removing untargeted room: ${rid}`);
                             roomsToSync.push({ id: rid, visitors: [], population: 0 });
-                            hasStateChange = true;
                             roomStates.delete(rid);
                         }
                     }
 
                     if (roomsToSync.length > 0) {
-                        const res = await axios.post(`${BACKEND_URL}/api/rooms/sync`, { rooms: roomsToSync, bot_name: BOT_NAME, bot_username: botMatch.username }, { timeout: 10000 });
+                        const res = await axios.post(`${BACKEND_URL}/api/rooms/sync`, { rooms: roomsToSync, bot_name: BOT_NAME, bot_username: botMatch.username }).catch(() => ({ data: {} }));
                         for (const r of roomsToSync) {
-                            console.log(`[DATA][Room:${r.id}] 👥 Guests (${r.population}): ${r.visitors.join(', ')}`);
+                             console.log(`[DATA][Room:${r.id}] 👥 Guests (${r.population}): ${r.visitors.join(', ')}`);
                         }
                         if (res.data?.target_rooms) {
                             targetRooms.clear();
@@ -275,80 +725,79 @@ const initBot = async () => {
                         }
                     }
                     isInitialStart = false;
-                } while (hasStateChange || isInitialStart);
+                } while (hasStateChange);
 
-
-                // --- ROOM JOINING ---
                 for (const rid of targetRooms) {
-                    const isAlreadyOpen = imvuPages.some(p => p.url().includes(`room-${rid}`));
-                    if (!isAlreadyOpen && !joiningRooms.has(rid)) {
+                    if (!roomPages.has(rid) && !joiningRooms.has(rid)) {
                         joiningRooms.add(rid);
                         (async () => {
                             try {
                                 const newPage = await browser.newPage();
+                                roomPages.set(rid, newPage);
                                 setupConsoleListener(newPage);
                                 setupNetworkListener(newPage);
+                                await setupPageFocus(newPage);
+                                await setupNetworkSniffing(newPage);
                                 await newPage.goto(`https://www.imvu.com/next/chat/room-${rid}/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
                                 
-                                const needsLoginOnNewPage = await newPage.evaluate(() => {
-                                    const loginLink = document.querySelector('.login-link, .nav-login, [href*="login"]');
-                                    const loggedInUser = document.querySelector('.user-menu, .avatar-name, .username');
-                                    return !!loginLink && !loggedInUser;
-                                });
-                                if (needsLoginOnNewPage) {
-                                    await newPage.click('.login-link, [href*="login"]').catch(() => {});
-                                    await new Promise(r => setTimeout(r, 4000));
-                                    const userInp = await newPage.$('input[type="text"], #login_username');
-                                    const passInp = await newPage.$('input[type="password"], #login_password');
-                                    if (userInp && passInp) {
-                                        await userInp.type(botMatch.username);
-                                        await passInp.type(botMatch.password);
-                                        await newPage.keyboard.press('Enter');
-                                        await new Promise(r => setTimeout(r, 8000));
-                                    }
-                                }
+                                await newPage.waitForSelector('body', { timeout: 15000 }).catch(() => {});
+                                await performLogin(newPage);
+                                
+                                // --- AVATAR ACTIVATION PROTOCOL ---
+                                await clickJoinButton(newPage);
+                                await new Promise(r => setTimeout(r, 4000));
+                                
+                                if (newPage.url().includes('room-')) {
+                                    await activateAvatar(newPage);
+                                    
+                                    console.log(`[${BOT_NAME}] ⏳ Waiting for room to fully load users...`);
+                                    await new Promise(r => setTimeout(r, 8000));
 
+                                    // --- KEEP PUPPETEER ALIVE ---
+                                    setInterval(async () => {
+                                        try {
+                                            if (!newPage.isClosed()) {
+                                                await newPage.mouse.move(
+                                                    400 + Math.random() * 200,
+                                                    300 + Math.random() * 200
+                                                );
+                                            }
+                                        } catch {}
+                                    }, 15000);
+                                }
+                                
                                 await setupChatObserver(newPage);
-                                await newPage.waitForFunction(() => {
-                                    const btns = Array.from(document.querySelectorAll('button, .uikit-button, .join-cta, .btn-join, [class*="join"], [role="button"]'));
-                                    const joinBtn = btns.find(b => {
-                                        const text = (b.textContent || b.innerText || '').trim().toUpperCase();
-                                        return text.includes('JOIN') || text.includes('GO TO ROOM') || text.includes('ENTER') || text.includes('CHAT NOW');
-                                    });
-                                    if (joinBtn && joinBtn.offsetWidth > 0) {
-                                        joinBtn.click();
-                                        return true;
-                                    }
-                                    return false;
-                                }, { timeout: 30000 }).catch(() => {});
-                            } catch (e) {
-                                console.error(`Failed to join room ${rid}:`, e.message);
-                            } finally {
-                                joiningRooms.delete(rid);
+                                await newPage.evaluate(() => {
+                                    window.addEventListener('IMVU_EVENT', (e) => window.handleIMVUEvent(e.detail));
+                                }).catch(() => {});
+                                
+                            } catch (e) { 
+                                console.error(`[${BOT_NAME}] Join error ${rid}:`, e.message);
+                                roomPages.delete(rid); 
+                            } finally { 
+                                joiningRooms.delete(rid); 
                             }
                         })();
                     }
                 }
 
-                // --- ROOM EXIT / TAB CLEANUP ---
                 const now = Date.now();
-                for (const p of imvuPages) {
-                    const rmMatch = p.url().match(/room-([\d\-]+)/);
-                    if (rmMatch) {
-                        const rid = rmMatch[1];
-                        if (!targetRooms.has(rid)) {
-                            if (!roomClosingTimers.has(rid)) {
-                                console.log(`[${BOT_NAME}] ⏳ Room ${rid} scheduled for removal in 30s...`);
-                                roomClosingTimers.set(rid, now + 30000);
-                            } else if (now > roomClosingTimers.get(rid)) {
-                                console.log(`[${BOT_NAME}] 🚪 Grace period expired. Closing untargeted room: ${rid}.`);
-                                await p.close().catch(() => null);
-                                roomClosingTimers.delete(rid);
-                                roomStates.delete(rid);
+                for (const [rid, p] of roomPages.entries()) {
+                    if (!targetRooms.has(rid)) {
+                        if (!roomClosingTimers.has(rid)) {
+                            console.log(`[${BOT_NAME}] ⏳ Scheduling exit for ${rid}`);
+                            roomClosingTimers.set(rid, now + 20000);
+                        } else if (now > roomClosingTimers.get(rid)) {
+                            console.log(`[${BOT_NAME}] 🚪 Closing untargeted tab: ${rid}`);
+                            if (p && !p.isClosed()) {
+                                await p.close().catch(() => {});
                             }
-                        } else {
                             roomClosingTimers.delete(rid);
+                            roomPages.delete(rid);
+                            roomStates.delete(rid);
                         }
+                    } else {
+                        roomClosingTimers.delete(rid);
                     }
                 }
             } catch (e) {
@@ -359,289 +808,96 @@ const initBot = async () => {
             }
         };
 
-        const setupNetworkListener = (p) => {
-            p.on('response', async (response) => {
-                const url = response.url();
-                if (!url.includes('api.imvu.com')) return;
-                const ct = response.headers()['content-type'] || '';
-                if (!ct.includes('application/json')) return;
-                try {
-                    const json = await response.json();
-                    if (json.denormalized) {
-                        for (const [key, val] of Object.entries(json.denormalized)) {
-                            const idMatch = key.match(/\/user\/user-(\d+)/);
-                            if (idMatch && val?.data?.username) {
-                                 const userId = idMatch[1];
-                                 let username = val.data.username;
-                                 if (username.toLowerCase().startsWith('guest_')) username = username.substring(6);
-                                 if (username.toLowerCase() !== botUsername) {
-                                     userIdToUsername.set(userId, username);
-                                    if (pendingResolutions.has(userId)) {
-                                        console.log(`[${BOT_NAME}] ✅ Resolved ${userId} -> ${username}`);
-                                        pendingResolutions.delete(userId);
-                                        runSyncCycle().catch(() => { });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } catch (e) { }
-            });
-        };
-
-        const setupConsoleListener = (p) => {
-            p.on('console', msg => {
-                const txt = msg.text();
-                if (txt.includes('DEBUG') || txt.includes('CHAT')) console.log(`[BROWSER] ${txt}`);
-            });
-        };
-
-        const setupChatObserver = async (targetPage) => {
-            await targetPage.exposeFunction('onNewChatEvent', async (text, htmlStr, nodeName) => {
-                const lowerText = text.toLowerCase();
-                const roomId = targetPage.url().match(/room-([\d\-]+)/)?.[1];
-                if (!roomId) return; // Ensure we have a room ID
-
-                const processUsernameStr = (rawName) => {
-                    if (!rawName) return '';
-                    let name = rawName.trim().replace(/[\r\n"]/g, '');
-                    if (name.toLowerCase().startsWith('guest_')) return name.substring(6);
-                    return name;
-                };
-
-                let username = '';
-                const userId = htmlStr?.match(/user-(\d+)/)?.[1] || htmlStr?.match(/data-user-id="(\d+)"/)?.[1];
-                
-                // --- RESOLVE USERNAME FROM ID ---
-                if (userId) {
-                    // Wait briefly if not in map (network listener catch)
-                    if (!userIdToUsername.has(userId)) {
-                        await new Promise(r => setTimeout(r, 800));
-                    }
-                    if (userIdToUsername.has(userId)) {
-                        username = processUsernameStr(userIdToUsername.get(userId));
-                    } else {
-                        username = `user_${userId}`;
-                    }
-                }
-
-                if (!username && nodeName) username = processUsernameStr(nodeName);
-                if (!username) username = userId ? `user_${userId}` : 'Guest';
-
-                const isSystemMessage = lowerText.includes('chat') || lowerText.includes('join') || lowerText.includes('leave') || lowerText.includes('room');
-                
-                if (isSystemMessage && (lowerText.includes('is in the chat') || lowerText.includes('joined the chat'))) {
-                    const joinMatch = text.match(/^(.+?)\s+(?:joined the chat|is in the chat)/i);
-                    // We no longer use extractedName for the welcome, only for logging
-                    const detectedName = joinMatch ? processUsernameStr(joinMatch[1]) : 'Unknown';
-
-                    let accountUsername = '';
-                    
-                    if (userId) {
-                        // Priority 1: Check existing map
-                        if (userIdToUsername.has(userId)) {
-                            accountUsername = processUsernameStr(userIdToUsername.get(userId));
-                        }
-                        
-                        // Priority 2: Wait briefly and check again (network resolution)
-                        if (!accountUsername || accountUsername === `user_${userId}`) {
-                            await new Promise(r => setTimeout(r, 2000)); // Longer wait for real username
-                            if (userIdToUsername.has(userId)) {
-                                accountUsername = processUsernameStr(userIdToUsername.get(userId));
-                            }
-                        }
-                    }
-
-                    // If we STILL don't have a real account username, we skip the welcome entirely
-                    // (User strictly requested NO fancy names and NO "Guest" names)
-                    if (!accountUsername || accountUsername === `user_${userId}` || accountUsername.toLowerCase() === 'guest') {
-                        console.log(`[${BOT_NAME}] ⚠️ Join Event: Could not resolve official username for ${detectedName} (ID: ${userId || 'none'}). Skipping welcome.`);
-                        return;
-                    }
-
-                    const finalUsername = accountUsername;
-                    console.log(`[${BOT_NAME}] 🔍 Join Event Verified: ID ${userId} -> Username: "${finalUsername}"`);
-
-
-
-                    
-                    const state = roomStates.get(roomId) || new Set();
-                    roomStates.set(roomId, state);
-                    
-                    const now = Date.now();
-                    const trackerKey = userId || finalUsername;
-                    const lastWelcome = welcomeCooldowns.get(trackerKey) || 0;
-                    const isCooldownActive = (now - lastWelcome) < 30000; // 30 seconds for faster testing
-
-                    if (userId) lastSeen.set(userId, now);
-
-                    // WELCOME LOGIC: Trigger if not in state OR if cooldown has expired (for re-joins)
-                    if (!state.has(trackerKey) || !isCooldownActive) {
-                        if (!isCooldownActive && finalUsername.toLowerCase() !== botUsername) {
-                            console.log(`[${BOT_NAME}] ⚡ Welcoming ${finalUsername} (ID: ${userId || 'unknown'})`);
-                            await sendChatMessage(targetPage, `Welcome @${finalUsername}`);
-                            welcomeCooldowns.set(trackerKey, now);
-                        } else if (isCooldownActive) {
-                            console.log(`[${BOT_NAME}] ⚡ ${finalUsername} rejoined, but welcome is on cooldown (30s).`);
-                        }
-                        
-                        departedGuests.delete(trackerKey);
-                        state.add(trackerKey);
-                        runSyncCycle(true).catch(() => { });
-                    } else {
-                        console.log(`[${BOT_NAME}] ⚡ DOM Join (Persistent Presence): ${finalUsername}`);
-                        runSyncCycle(true).catch(() => { });
-                    }
-
-
-                } else if (isSystemMessage && lowerText.includes('left the chat')) {
-
-                    const state = roomStates.get(roomId);
-                    if (!state || !userId) return;
-                    
-                    if (state.has(userId)) {
-                        console.log(`[${BOT_NAME}] 🏃 User Left (DOM): ${username} (ID: ${userId})`);
-                        departedGuests.add(userId);
-                        state.delete(userId);
-                        lastSeen.delete(userId);
-                        runSyncCycle(true).catch(() => { });
-                    }
-                }
-            });
-
-            await targetPage.exposeFunction('onNewChatMessage', (sender, content) => {
-                if (sender.toLowerCase() !== botUsername) console.log(`[CHAT][${sender}] ${content}`);
-            });
-
-            try {
-                const bubbleSelectors = 'button.chat-bubble, .chat-bubble, .chat-button, [aria-label*="chat" i], [title*="chat" i], .uikit-chat-bubble';
-                await targetPage.waitForSelector(bubbleSelectors, { timeout: 15000 });
-                await targetPage.evaluate((sel) => {
-                    const btn = document.querySelector(sel);
-                    if (btn) btn.click();
-                }, bubbleSelectors);
-                await targetPage.waitForSelector('.message-list-wrapper, .cs2-chat-list, .chat-list', { timeout: 15000 });
-            } catch (e) {
-                console.log(`[${BOT_NAME}] ⚠️ Could not natively open chat bubble, trying fallback...`);
-            }
-
-            await targetPage.evaluate(() => {
-                const setup = () => {
-                    const list = document.querySelector('.message-list-wrapper') || document.querySelector('.cs2-chat-list') || document.querySelector('.chat-list') || document.body;
-                    console.log('--- CHAT OBSERVER ACTIVE (DOM) ---');
-                    const observer = new MutationObserver((mutations) => {
-                        for (const mutation of mutations) {
-                            for (const node of mutation.addedNodes) {
-                                if (node.nodeType === 1) {
-                                    const text = (node.textContent || '').trim();
-                                    const htmlStr = node.innerHTML || '';
-                                    
-                                    // IMPROVED: Extract ID specifically from this node or its immediate siblings (for fancy fonts)
-                                    const avatarNode = node.previousElementSibling?.querySelector('img[src*="userpics"], img[src*="avatar"]') 
-                                                    || node.querySelector('img[src*="userpics"]');
-                                    const avatarId = avatarNode?.src?.match(/\/(\d+)\//)?.[1];
-                                    
-                                    const linkId = node.querySelector('a[href*="av/"], a[href*="user-"]')?.href?.match(/(?:user-|av\/)(\d+)/)?.[1];
-                                    const explicitId = node.querySelector('[data-user-id]')?.getAttribute('data-user-id');
-                                    
-                                    const bestId = explicitId || linkId || avatarId;
-                                    const finalHtml = bestId ? `${htmlStr} data-user-id="${bestId}"` : htmlStr;
-
-                                    const nameEl = node.querySelector('.name, .username, .cs2-chat-message-author, .message-author, [class*="author"]');
-                                    const nodeName = nameEl ? nameEl.textContent.trim() : '';
-                                    const lowerText = text.toLowerCase();
-                                    if (lowerText.includes('chat') || lowerText.includes('join') || lowerText.includes('leave') || lowerText.includes('room')) {
-                                        window.onNewChatEvent(text, finalHtml, nodeName);
-                                    }
-                                    const msgEl = node.querySelector('.text, .message, .message-body, [class*="message-body"]');
-                                    if (nameEl && msgEl) window.onNewChatMessage(nodeName, msgEl.textContent.trim());
-                                }
-                            }
-                        }
-                    });
-                    observer.observe(list, { childList: true, subtree: true });
-                };
-                setup();
-            });
-        };
-
-        // --- STARTUP FLOW ---
-        let initialRooms = [];
-        try {
-            const res = await axios.post(`${BACKEND_URL}/api/rooms/sync`, { rooms: [], bot_name: BOT_NAME, bot_username: botMatch.username }, { timeout: 5000 });
-            if (res.data && res.data.target_rooms) {
-                initialRooms = res.data.target_rooms;
-                targetRooms.clear();
-                initialRooms.forEach(id => targetRooms.add(id));
-            }
-        } catch (e) { }
-
-
-        const firstRoom = initialRooms.length > 0 ? initialRooms[0] : '242955291-481';
-        console.log(`[${BOT_NAME}] Navigating to room: ${firstRoom}...`);
-
+        const firstRes = await axios.post(`${BACKEND_URL}/api/rooms/sync`, { rooms: [], bot_name: BOT_NAME, bot_username: botMatch.username }).catch(() => ({ data: {} }));
+        if (firstRes.data?.target_rooms) firstRes.data.target_rooms.forEach(id => targetRooms.add(id));
+        const first = Array.from(targetRooms)[0] || '242955291-481';
+        
+        roomPages.set(first, mainPage);
         setupConsoleListener(mainPage);
         setupNetworkListener(mainPage);
-        await mainPage.goto(`https://www.imvu.com/next/chat/room-${firstRoom}/`, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => null);
+        await setupPageFocus(mainPage);
+        await setupNetworkSniffing(mainPage);
+        await mainPage.goto(`https://www.imvu.com/next/chat/room-${first}/`, { waitUntil: 'domcontentloaded' });
+        
+        await mainPage.waitForSelector('body', { timeout: 15000 }).catch(() => {});
+        await performLogin(mainPage);
 
-        const needsLogin = await mainPage.evaluate(() => {
-            const loginLink = document.querySelector('.login-link, .nav-login, [href*="login"]');
-            const loggedInUser = document.querySelector('.user-menu, .avatar-name, .username');
-            return !!loginLink && !loggedInUser;
-        });
+        // --- AVATAR ACTIVATION PROTOCOL ---
+        await clickJoinButton(mainPage);
+        await new Promise(r => setTimeout(r, 4000));
+        
+        if (mainPage.url().includes('room-')) {
+            await activateAvatar(mainPage);
+            
+            console.log(`[${BOT_NAME}] ⏳ Waiting for room to fully load users...`);
+            await new Promise(r => setTimeout(r, 8000));
 
-        if (needsLogin) {
-            console.log(`[${BOT_NAME}] 🔐 Not logged in. Starting login flow...`);
-            await mainPage.click('.login-link, [href*="login"]').catch(() => {});
-            await new Promise(r => setTimeout(r, 4000));
-            await mainPage.waitForSelector('input[type="password"]', { timeout: 15000 }).catch(() => null);
-            try {
-                const usernameInput = await mainPage.$('input[type="text"], input[type="email"], #login_username');
-                const passwordInput = await mainPage.$('input[type="password"], #login_password');
-                if (usernameInput && passwordInput) {
-                    await usernameInput.click({ clickCount: 3 });
-                    await usernameInput.type(botMatch.username, { delay: 60 });
-                    await passwordInput.click({ clickCount: 3 });
-                    await passwordInput.type(botMatch.password, { delay: 60 });
-                    await mainPage.keyboard.press('Enter');
-                    await new Promise(r => setTimeout(r, 10000));
-                    await mainPage.reload({ waitUntil: 'domcontentloaded' });
-                }
-            } catch (err) { console.error(`Login failed: ${err.message}`); }
-        } else {
-            console.log(`[${BOT_NAME}] ✅ Already logged in as ${botMatch.username}`);
+            // --- KEEP PUPPETEER ALIVE ---
+            setInterval(async () => {
+                try {
+                    if (!mainPage.isClosed()) {
+                        await mainPage.mouse.move(
+                            400 + Math.random() * 200,
+                            300 + Math.random() * 200
+                        );
+                    }
+                } catch {}
+            }, 15000);
         }
 
-        console.log(`[${BOT_NAME}] 🚪 Joining room...`);
-        await mainPage.waitForFunction(() => {
-            const btns = Array.from(document.querySelectorAll('button, .uikit-button, .join-cta, .btn-join, [class*="join"], [role="button"]'));
-            const joinBtn = btns.find(b => {
-                const text = (b.textContent || b.innerText || '').trim().toUpperCase();
-                return text.includes('JOIN') || text.includes('GO TO ROOM') || text.includes('ENTER') || text.includes('CHAT NOW');
-            });
-            if (joinBtn && joinBtn.offsetWidth > 0) {
-                joinBtn.click();
-                return true;
-            }
-            return false;
-        }, { timeout: 30000 }).catch(() => { });
-
-        await new Promise(r => setTimeout(r, 5000));
         await setupChatObserver(mainPage);
-        console.log(`[${BOT_NAME}] ✅ Ready. Broadcasting in room ${firstRoom}.`);
+        await mainPage.evaluate(() => window.addEventListener('IMVU_EVENT', e => window.handleIMVUEvent(e.detail)));
         
         isRestarting = false;
-        isInitialStart = false;
-        syncInterval = setInterval(runSyncCycle, 8000);
+        syncInterval = setInterval(() => {
+            runSyncCycle().catch(() => {});
+        }, 12000);
+
+        // 🔥 AUTO-REFRESH SESSION EVERY 10 MIN
+        setInterval(async () => {
+            if (mainPage && !mainPage.isClosed()) {
+                console.log(`[${BOT_NAME}] 🔄 Refreshing session manifest...`);
+                await extractSession(mainPage);
+            }
+        }, 10 * 60 * 1000);
+        console.log(`[${BOT_NAME}] 🚀 Bot online and tracking rooms.`);
         
     } catch (e) {
-        console.error(`[${BOT_NAME}] Critical error:`, e.message);
+        console.error(`Init Error:`, e.message);
         isRestarting = false;
-        if (e.message.includes('Connection closed') || e.message.includes('disconnected')) {
-            console.log(`[${BOT_NAME}] 🛠 Triggering auto-recovery in 10s...`);
-            setTimeout(initBot, 10000);
-        }
+        setTimeout(initBot, 10000);
     }
+};
+
+const setupNetworkListener = (p) => {
+    p.on('response', async (res) => {
+        try {
+            if (!res.url().includes('api.imvu.com') || !res.headers()['content-type']?.includes('json')) return;
+            const json = await res.json();
+            if (json.denormalized) {
+                for (const [k, v] of Object.entries(json.denormalized)) {
+                    const m = k.match(/user-(\d+)/);
+                    if (m && v?.data?.username) {
+                        let username = v.data.username;
+                        if (username.toLowerCase().startsWith('guest_')) username = username.substring(6);
+                        userIdToUsername.set(m[1], username);
+                    }
+                }
+            }
+        } catch (e) { }
+    });
+};
+
+const setupConsoleListener = (p) => p.on('console', m => { 
+    if (m.text().includes('DEBUG')) console.log(`[BROWSER] ${m.text()}`); 
+});
+
+const setupChatObserver = async (p) => {
+    try {
+        const bSel = 'button.chat-bubble, .uikit-chat-bubble';
+        await p.waitForSelector(bSel, { timeout: 10000 }).catch(() => {});
+        await p.evaluate(s => document.querySelector(s)?.click(), bSel).catch(() => {});
+    } catch (e) { }
 };
 
 initBot();
