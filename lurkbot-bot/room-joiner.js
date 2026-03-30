@@ -225,7 +225,7 @@ const startJoiner = async (roomId = '') => {
     cleanupProfileLock();
     
     // Fetch settings from backend if not provided via CLI or if we want to sync with backend
-    const profileName = process.env.BOT_PROFILE || 'ModeratorBot';
+    const profileName = process.env.BOT_PROFILE || 'Bot-Alpha';
     console.log(`[${BOT_NAME}] 📡 Fetching settings for profile: ${profileName}...`);
     const backendBot = await fetchBotSettings(profileName);
 
@@ -237,7 +237,7 @@ const startJoiner = async (roomId = '') => {
         try {
             localBots = JSON.parse(fs.readFileSync(BOTS_FILE, 'utf8'));
         } catch (e) {}
-        const localMatch = localBots.find(b => b.name === profileName || b.profile === profileName) || localBots[0];
+        const localMatch = localBots.find(b => b.username === profileName || b.profile === profileName) || localBots[0];
 
         // Use backend credentials, but fallback if they are default or "Unset"
         botMatch.username = (backendBot.username && backendBot.username !== 'admin_bot') ? backendBot.username : (localMatch?.username || 's1va');
@@ -246,7 +246,12 @@ const startJoiner = async (roomId = '') => {
         // Use assigned room ID if none provided
         if (!roomId && backendBot.room_ids) {
             // Take the first room ID from the list (comma separated or single)
-            const roomList = backendBot.room_ids.split(',').map(id => id.trim());
+            const roomList = backendBot.room_ids.split(',').map(id => {
+                const trimmed = id.trim();
+                // Extract room ID from full URLs like https://www.imvu.com/next/chat/room-203390141-3573/
+                const urlMatch = trimmed.match(/room-([\d-]+)/);
+                return urlMatch ? urlMatch[1] : trimmed;
+            });
             roomId = roomList[0];
         }
         

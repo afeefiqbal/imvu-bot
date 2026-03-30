@@ -43,7 +43,7 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
         // --- LOAD CREDENTIALS ---
         const botsPath = path.resolve(__dirname, 'bots.json');
         const bots = JSON.parse(fs.readFileSync(botsPath, 'utf8'));
-        const botMatch = bots.find(b => b.name === BOT_NAME) || bots[0];
+        const botMatch = bots.find(b => b.username === BOT_NAME) || bots[0];
         console.log(`[${BOT_NAME}] Using account: ${botMatch.username}`);
 
         console.log(`[${BOT_NAME}] Fetching target rooms for bot...`);

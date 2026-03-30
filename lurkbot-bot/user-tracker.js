@@ -65,9 +65,12 @@ export async function startUserTracking(page, roomId, options = {}) {
         '';
     const BOT_USERNAME = process.env.BOT_USERNAME || 'S1VA';
     const BOT_DISPLAY_NAME = (process.env.BOT_DISPLAY_NAME || BOT_USERNAME || '').trim();
-    const welcomedAvatarIds = new Set();
-    /** Same user can appear on join-queue vs profile-mount with mismatched ids — one welcome per handle per visit */
-    const welcomedHandlesLower = new Set();
+    const processedJoins = new Set();
+    /** Track active join sessions to prevent duplicate welcomes before leave */
+    const activeJoinSessions = new Set();
+    /** Cooldown timestamps to avoid rapid re‑welcome on same join */
+    const welcomeTimestamps = new Map();
+    const WELCOME_COOLDOWN_MS = 15000; // 15 s
     /** One backend /api/room-users join per avatar from join_queue resolve (even if chat welcome is deferred) */
     const joinQueueBackendAnnounced = new Set();
     const mentionReplyDedupe = new Set();
@@ -501,13 +504,18 @@ export async function startUserTracking(page, roomId, options = {}) {
         for (const aid of lastUserMap.keys()) {
             if (aid != null && aid !== undefined) {
                 skipWelcomeAvatarIds.add(String(aid));
+                // 🛡️ Also block backend onJoin for bootstrap users
+                joinQueueBackendAnnounced.add(String(aid));
             }
         }
+        // ✅ Mark roster as synced (covers fallback timer path)
+        participantsRosterSynced = true;
         welcomeArrivalsEnabled = true;
         if (welcomeArrivalsEnableTimer) {
             clearTimeout(welcomeArrivalsEnableTimer);
             welcomeArrivalsEnableTimer = null;
         }
+        console.log(`[SYNC] 🔓 Welcome gate OPEN — ${skipWelcomeAvatarIds.size} existing users blocked`);
     };
 
     const isSelfId = (id) =>
@@ -517,9 +525,17 @@ export async function startUserTracking(page, roomId, options = {}) {
 
     const announceJoinQueuePresence = (avatarId, label) => {
         if (!avatarId || isSelfId(avatarId)) return;
+
+        // 🚫 BLOCK if still in initial sync phase
+        if (!participantsRosterSynced || !welcomeArrivalsEnabled) {
+            return;
+        }
+
         const n = String(label ?? '').trim();
         if (!n) return;
+
         if (joinQueueBackendAnnounced.has(avatarId)) return;
+
         joinQueueBackendAnnounced.add(avatarId);
         void onJoin(normalizeImvuUsername(n) || n);
     };
@@ -547,23 +563,43 @@ export async function startUserTracking(page, roomId, options = {}) {
         }
         const handleKey = welcomeHandleKey(displayName);
         if (!handleKey) return false;
-        if (
-            welcomedAvatarIds.has(avatarId) ||
-            welcomedHandlesLower.has(handleKey)
-        ) {
+        // 🚨 Allow rejoin if user is no longer in room
+        if (!lastUserMap.has(avatarId)) {
+            welcomeTimestamps.delete(avatarId);
+        }
+
+        // 🚨 HARD LOCK IMMEDIATELY
+        if (activeJoinSessions.has(avatarId)) {
             return false;
         }
-        welcomedAvatarIds.add(avatarId);
-        welcomedHandlesLower.add(handleKey);
-        if (welcomedAvatarIds.size > 100) {
-            welcomedAvatarIds.clear();
-            welcomedHandlesLower.clear();
+        activeJoinSessions.add(avatarId);
+
+        // cooldown check AFTER lock
+        const lastWelcome = welcomeTimestamps.get(avatarId);
+        if (lastWelcome && (Date.now() - lastWelcome) < WELCOME_COOLDOWN_MS) {
+            activeJoinSessions.delete(avatarId); // release lock
+            return false;
+        }
+
+        welcomeTimestamps.set(avatarId, Date.now());
+        if (activeJoinSessions.size > 200) {
+            activeJoinSessions.clear();
+        }
+        if (welcomeTimestamps.size > 400) {
+            welcomeTimestamps.clear();
         }
         setTimeout(async () => {
-            if (ROOM_NAME === 'this room') {
-                await refreshRoomName();
+            try {
+                if (ROOM_NAME === 'this room') {
+                    await refreshRoomName();
+                }
+
+                await sendMessage(getWelcomeMessage(displayName, ROOM_NAME), convMeta);
+
+            } finally {
+                // 🔓 ALWAYS release lock after welcome
+                activeJoinSessions.delete(avatarId);
             }
-            sendMessage(getWelcomeMessage(displayName, ROOM_NAME), convMeta);
         }, 1500);
         return true;
     };
@@ -740,7 +776,42 @@ export async function startUserTracking(page, roomId, options = {}) {
         return promise;
     };
 
+    const handleFinalJoin = (avatarId) => {
+        if (!avatarId) return;
+
+        // 🚨 HARD BLOCK — already processed
+        if (processedJoins.has(avatarId)) {
+            return;
+        }
+        processedJoins.add(avatarId);
+
+        const name = lastUserMap.get(avatarId);
+        if (!name || String(name).trim() === '') {
+            processedJoins.delete(avatarId);
+            return;
+        }
+
+        const label = isSelfId(avatarId)
+            ? BOT_USERNAME
+            : normalizeImvuUsername(String(name));
+
+        announceJoinQueuePresence(avatarId, label);
+
+        const scheduled = scheduleWelcomeForAvatar(avatarId, label, {
+            participantUsername: label,
+            participantAvatarId: String(avatarId),
+        });
+
+        // 🔓 allow future joins ONLY after leave
+        if (!scheduled) {
+            processedJoins.delete(avatarId);
+        }
+    };
+
     async function handleIncomingMessage(msg) {
+        if (process.env.WS_DEBUG === '1' || process.env.WS_DEBUG === 'true') {
+            console.log('[WS_DEBUG]', JSON.stringify(msg, null, 2));
+        }
         const actions = Array.isArray(msg) ? msg : [msg];
 
         for (const action of actions) {
@@ -812,6 +883,12 @@ export async function startUserTracking(page, roomId, options = {}) {
 
                         lastUserMap.set(avatarId, username);
                         if (!existing || existing === null) {
+                            // ❌ Ignore initial room population
+                            if (!participantsRosterSynced) {
+                                return;
+                            }
+
+                            // ✅ Only real joins after bot is ready
                             if (avatarId) joinQueueBackendAnnounced.add(avatarId);
                             onJoin(username);
                         }
@@ -826,8 +903,13 @@ export async function startUserTracking(page, roomId, options = {}) {
                         if (aid) skipWelcomeAvatarIds.add(aid);
                     });
                     participantsRosterSynced = true;
-                    if (botJoinedChat) {
-                        enableWelcomeForNewArrivals();
+                    if (botJoinedChat && !welcomeArrivalsEnabled) {
+                        // Always delay to let initial joined_queue events settle
+                        if (welcomeArrivalsEnableTimer) clearTimeout(welcomeArrivalsEnableTimer);
+                        welcomeArrivalsEnableTimer = setTimeout(() => {
+                            welcomeArrivalsEnableTimer = null;
+                            enableWelcomeForNewArrivals();
+                        }, 5000);
                     }
                 }
 
@@ -835,7 +917,43 @@ export async function startUserTracking(page, roomId, options = {}) {
             }
 
             // 2. User Joined (Joined Queue)
-            else if (record === 'msg_g2c_joined_queue' && queue.startsWith('/chat/')) {
+            else if (
+                record === 'msg_g2c_joined_queue' &&
+                typeof queue === 'string' &&
+                queue.startsWith('/chat/')
+            ) {
+                // 🚫 HARD FILTER — ignore all non-chat queues
+                if (!queue || !queue.startsWith('/chat/')) {
+                    return;
+                }
+
+                // 🛡️ Block ALL events until welcome gate is open
+                if (!welcomeArrivalsEnabled) {
+                    // Still track the bot's own join to set botJoinedChat
+                    const avatarId = decodeId(action.user_id);
+                    if (avatarId && isSelfId(avatarId) && !botJoinedChat) {
+                        if (!lastUserMap.has(avatarId)) lastUserMap.set(avatarId, null);
+                        const beforeJoinCount = lastUserMap.size > 0 ? lastUserMap.size - 1 : 0;
+                        console.log(`[COUNT][BEFORE_JOIN] 👥 Total Occupants: ${beforeJoinCount}`);
+                        console.log(`[COUNT][AFTER_JOIN] 👥 Total Occupants: ${lastUserMap.size}`);
+                        botJoinedChat = true;
+                        // Always use delay — let initial joined_queue events settle first
+                        if (welcomeArrivalsEnableTimer) clearTimeout(welcomeArrivalsEnableTimer);
+                        welcomeArrivalsEnableTimer = setTimeout(() => {
+                            welcomeArrivalsEnableTimer = null;
+                            enableWelcomeForNewArrivals();
+                        }, 5000);
+                        void refreshRoomName();
+                        triggerCountUpdate();
+                    } else if (avatarId && !lastUserMap.has(avatarId)) {
+                        // Track existing users silently during bootstrap
+                        lastUserMap.set(avatarId, null);
+                        console.log(`[JOIN][QUEUE][BOOTSTRAP] silently tracking ${avatarId}`);
+                        triggerCountUpdate();
+                    }
+                    continue;
+                }
+
                 const avatarId = decodeId(action.user_id);
                 const hadUser = avatarId ? lastUserMap.has(avatarId) : false;
 
@@ -856,24 +974,7 @@ export async function startUserTracking(page, roomId, options = {}) {
                                     cur !== undefined &&
                                     String(cur).trim() !== ''
                                 ) {
-                                    const labelEarly = isSelfId(avatarId)
-                                        ? BOT_USERNAME
-                                        : normalizeImvuUsername(
-                                              String(cur)
-                                          );
-                                    announceJoinQueuePresence(
-                                        avatarId,
-                                        labelEarly
-                                    );
-                                    void scheduleWelcomeForAvatar(
-                                        avatarId,
-                                        labelEarly,
-                                        {
-                                            participantUsername: labelEarly,
-                                            participantAvatarId:
-                                                String(avatarId),
-                                        }
-                                    );
+                                    handleFinalJoin(avatarId);
                                     triggerCountUpdate();
                                     return;
                                 }
@@ -887,12 +988,7 @@ export async function startUserTracking(page, roomId, options = {}) {
                                     `[JOIN][QUEUE] ${label} · profile API`
                                 );
 
-                                announceJoinQueuePresence(avatarId, label);
-                                void scheduleWelcomeForAvatar(avatarId, label, {
-                                    participantUsername: label,
-                                    participantAvatarId: String(avatarId),
-                                });
-
+                                handleFinalJoin(avatarId);
                                 triggerCountUpdate();
                             }
                         );
@@ -903,7 +999,8 @@ export async function startUserTracking(page, roomId, options = {}) {
                     welcomeArrivalsEnabled &&
                     botJoinedChat &&
                     !isSelfId(avatarId) &&
-                    !skipWelcomeAvatarIds.has(avatarId)
+                    !skipWelcomeAvatarIds.has(avatarId) &&
+                    !joinQueueBackendAnnounced.has(avatarId) // 🚨 Block already-announced users
                 ) {
                     const cur = lastUserMap.get(avatarId);
                     const hasResolved =
@@ -911,14 +1008,7 @@ export async function startUserTracking(page, roomId, options = {}) {
                         cur !== undefined &&
                         String(cur).trim() !== '';
                     if (hasResolved) {
-                        const label = normalizeImvuUsername(String(cur));
-                        if (label && String(label).trim()) {
-                            announceJoinQueuePresence(avatarId, label);
-                            void scheduleWelcomeForAvatar(avatarId, label, {
-                                participantUsername: label,
-                                participantAvatarId: String(avatarId),
-                            });
-                        }
+                        handleFinalJoin(avatarId);
                         triggerCountUpdate();
                     } else if (/^\d+$/.test(String(avatarId))) {
                         console.log(
@@ -935,18 +1025,7 @@ export async function startUserTracking(page, roomId, options = {}) {
                                     inner !== undefined &&
                                     String(inner).trim() !== ''
                                 ) {
-                                    const label = normalizeImvuUsername(
-                                        String(inner)
-                                    );
-                                    void scheduleWelcomeForAvatar(
-                                        avatarId,
-                                        label,
-                                        {
-                                            participantUsername: label,
-                                            participantAvatarId:
-                                                String(avatarId),
-                                        }
-                                    );
+                                    handleFinalJoin(avatarId);
                                     triggerCountUpdate();
                                     return;
                                 }
@@ -955,11 +1034,7 @@ export async function startUserTracking(page, roomId, options = {}) {
                                 console.log(
                                     `[JOIN][QUEUE] ${label} · profile API`
                                 );
-                                announceJoinQueuePresence(avatarId, label);
-                                void scheduleWelcomeForAvatar(avatarId, label, {
-                                    participantUsername: label,
-                                    participantAvatarId: String(avatarId),
-                                });
+                                handleFinalJoin(avatarId);
                                 triggerCountUpdate();
                             }
                         );
@@ -972,16 +1047,13 @@ export async function startUserTracking(page, roomId, options = {}) {
                     console.log(`[COUNT][BEFORE_JOIN] 👥 Total Occupants: ${beforeJoinCount}`);
                     console.log(`[COUNT][AFTER_JOIN] 👥 Total Occupants: ${afterJoinCount}`);
                     botJoinedChat = true;
-                    if (participantsRosterSynced) {
-                        enableWelcomeForNewArrivals();
-                    } else {
-                        if (welcomeArrivalsEnableTimer) {
-                            clearTimeout(welcomeArrivalsEnableTimer);
-                        }
+                    // Always delay — never immediate, let joined_queue events settle
+                    if (!welcomeArrivalsEnabled) {
+                        if (welcomeArrivalsEnableTimer) clearTimeout(welcomeArrivalsEnableTimer);
                         welcomeArrivalsEnableTimer = setTimeout(() => {
                             welcomeArrivalsEnableTimer = null;
                             enableWelcomeForNewArrivals();
-                        }, 12000);
+                        }, 5000);
                     }
                     void refreshRoomName();
                 }
@@ -997,24 +1069,21 @@ export async function startUserTracking(page, roomId, options = {}) {
                     if (isSelfId(avatarId)) {
                         lastUserMap.delete(avatarId);
                         skipWelcomeAvatarIds.delete(avatarId);
-                        welcomedAvatarIds.delete(avatarId);
                         joinQueueBackendAnnounced.delete(avatarId);
-                        {
-                            const k = welcomeHandleKey(BOT_USERNAME);
-                            if (k) welcomedHandlesLower.delete(k);
-                        }
+                        // Clean session state for bot self
+                        activeJoinSessions.delete(avatarId);
+                        welcomeTimestamps.delete(avatarId);
+                        processedJoins.delete(avatarId);
                         triggerCountUpdate();
                         continue;
                     }
                     const username = lastUserMap.get(avatarId);
                     lastUserMap.delete(avatarId);
                     skipWelcomeAvatarIds.delete(avatarId);
-                    welcomedAvatarIds.delete(avatarId);
                     joinQueueBackendAnnounced.delete(avatarId);
-                    const hk = username
-                        ? welcomeHandleKey(username)
-                        : null;
-                    if (hk) welcomedHandlesLower.delete(hk);
+                    // State-based unlock: allow welcome again on rejoin
+                    activeJoinSessions.delete(avatarId);
+                    processedJoins.delete(avatarId);
                     if (username) {
                         onLeave(username);
                     }
@@ -1209,6 +1278,12 @@ export async function startUserTracking(page, roomId, options = {}) {
                     lastUserMap.set(userId, displayName);
 
                     if (!existing || existing === null) {
+                        // ❌ Ignore initial room population
+                        if (!participantsRosterSynced) {
+                            return;
+                        }
+
+                        // ✅ Only real joins after bot is ready
                         onJoin(displayName);
                     } else {
                         console.log(`[UPDATE] ${existing} → ${displayName}`);
