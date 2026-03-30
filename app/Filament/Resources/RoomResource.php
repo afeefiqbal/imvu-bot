@@ -3,15 +3,12 @@
 namespace App\Filament\Resources;
 
 use App\Filament\Resources\RoomResource\Pages;
-use App\Filament\Resources\RoomResource\RelationManagers;
 use App\Models\Room;
 use Filament\Forms;
 use Filament\Forms\Form;
 use Filament\Resources\Resource;
 use Filament\Tables;
 use Filament\Tables\Table;
-use Illuminate\Database\Eloquent\Builder;
-use Illuminate\Database\Eloquent\SoftDeletingScope;
 
 class RoomResource extends Resource
 {
@@ -25,7 +22,7 @@ class RoomResource extends Resource
             ->schema([
                 Forms\Components\TextInput::make('room_id')
                     ->required()
-                    ->numeric(),
+                    ->maxLength(64),
                 Forms\Components\TextInput::make('name')
                     ->maxLength(255),
                 Forms\Components\TextInput::make('image_url')
@@ -74,7 +71,7 @@ class RoomResource extends Resource
                     ->searchable()
                     ->weight('bold'),
                 Tables\Columns\TextColumn::make('room_id')
-                    ->numeric()
+                    ->searchable()
                     ->sortable()
                     ->color('gray'),
                 Tables\Columns\TextColumn::make('population')

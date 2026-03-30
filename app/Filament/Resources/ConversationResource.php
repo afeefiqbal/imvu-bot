@@ -3,15 +3,12 @@
 namespace App\Filament\Resources;
 
 use App\Filament\Resources\ConversationResource\Pages;
-use App\Filament\Resources\ConversationResource\RelationManagers;
 use App\Models\Conversation;
 use Filament\Forms;
 use Filament\Forms\Form;
 use Filament\Resources\Resource;
 use Filament\Tables;
 use Filament\Tables\Table;
-use Illuminate\Database\Eloquent\Builder;
-use Illuminate\Database\Eloquent\SoftDeletingScope;
 
 class ConversationResource extends Resource
 {
@@ -23,14 +20,23 @@ class ConversationResource extends Resource
     {
         return $form
             ->schema([
+                Forms\Components\TextInput::make('room_id')
+                    ->maxLength(64),
+                Forms\Components\TextInput::make('username'),
+                Forms\Components\TextInput::make('imvu_avatar_id')
+                    ->label('IMVU avatar id'),
                 Forms\Components\TextInput::make('user_id')
-                    ->required()
-                    ->numeric(),
+                    ->numeric()
+                    ->default(0),
                 Forms\Components\TextInput::make('server_id')
-                    ->required()
-                    ->numeric(),
-                Forms\Components\TextInput::make('messages')
-                    ->required(),
+                    ->numeric()
+                    ->default(0),
+                Forms\Components\Textarea::make('messages')
+                    ->label('Messages (read-only JSON)')
+                    ->formatStateUsing(fn ($state) => is_array($state) ? json_encode($state, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE) : (string) $state)
+                    ->rows(12)
+                    ->disabled()
+                    ->dehydrated(false),
             ]);
     }
 
@@ -38,12 +44,24 @@ class ConversationResource extends Resource
     {
         return $table
             ->columns([
+                Tables\Columns\TextColumn::make('room_id')
+                    ->searchable()
+                    ->sortable(),
+                Tables\Columns\TextColumn::make('username')
+                    ->searchable(),
+                Tables\Columns\TextColumn::make('imvu_avatar_id')
+                    ->label('Avatar id'),
+                Tables\Columns\TextColumn::make('messages')
+                    ->formatStateUsing(fn ($state) => is_array($state) ? count($state).' messages' : '—')
+                    ->badge(),
                 Tables\Columns\TextColumn::make('user_id')
                     ->numeric()
-                    ->sortable(),
+                    ->sortable()
+                    ->toggleable(isToggledHiddenByDefault: true),
                 Tables\Columns\TextColumn::make('server_id')
                     ->numeric()
-                    ->sortable(),
+                    ->sortable()
+                    ->toggleable(isToggledHiddenByDefault: true),
                 Tables\Columns\TextColumn::make('created_at')
                     ->dateTime()
                     ->sortable()

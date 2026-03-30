@@ -185,7 +185,7 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
 
                     if (data) {
                         roomsToSync.push({
-                            id: parseInt(roomId, 10),
+                            id: String(roomId).trim(),
                             name: data.roomName,
                             image_url: data.roomUrl,
                             visitors: data.visitors,
@@ -316,7 +316,8 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
                 const match = u.match(/room-([\d\-]+)/);
                 const roomId = match ? match[1] : null;
 
-                if (roomId && activeFilamentSpamRooms.includes(parseInt(roomId, 10))) {
+                const spamOn = activeFilamentSpamRooms.some((r) => String(r).trim() === String(roomId).trim());
+                if (roomId && spamOn) {
                     // SLOWER SPAM: Wait a random long time
                     await new Promise(r => setTimeout(r, Math.random() * 20000));
                     
@@ -597,7 +598,15 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
   
                          // --- 2. Regular AI Logic ---
                         try {
-                            const res = await axios.post(`${BACKEND_URL}/api/lurk`, { message: chat.message, username: chat.username });
+                            const res = await axios.post(`${BACKEND_URL}/api/lurk`, {
+                                message: chat.message,
+                                username: chat.username,
+                                room_id: String(roomId).trim(),
+                                bot_username: botMatch.username,
+                                bot_display_name:
+                                    (botMatch.profile && String(botMatch.profile).trim()) ||
+                                    BOT_NAME,
+                            });
                             const reply = res.data.reply;
                             if (reply) {
                                 console.log(`[Response] Sending AI reply in Room ${roomId}: ${reply}`);
