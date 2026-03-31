@@ -237,10 +237,10 @@ const startJoiner = async (roomId = '') => {
         try {
             localBots = JSON.parse(fs.readFileSync(BOTS_FILE, 'utf8'));
         } catch (e) {}
-        const localMatch = localBots.find(b => b.username === profileName || b.profile === profileName) || localBots[0];
+        const localMatch = localBots.find(b => b.username === backendBot.username) || localBots[0];
 
-        // Use backend credentials, but fallback if they are default or "Unset"
-        botMatch.username = (backendBot.username && backendBot.username !== 'admin_bot') ? backendBot.username : (localMatch?.username || 's1va');
+        // Use backend credentials, fallback to local bots.json if backend returns placeholder values
+        botMatch.username = (backendBot.username && backendBot.username !== 'Unset') ? backendBot.username : (localMatch?.username || 's1va');
         botMatch.password = (backendBot.password && backendBot.password !== 'Unset' && backendBot.password !== 'secret') ? backendBot.password : (localMatch?.password || 'password');
         
         // Use assigned room ID if none provided

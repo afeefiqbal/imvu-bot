@@ -1,9 +1,18 @@
 import axios from 'axios';
 import { getWelcomeMessage } from './welcomeMessages.js';
+import { createConversationLogger, createSendMessage } from './user-tracker-chat.js';
 import {
-    messageInvokesSivaCharacterAi,
-    stripSivaCharacterAiTriggers,
-} from './sivaCharacterAi.js';
+    createDomFallback,
+    createImvuHandleResolver,
+    createIncomingMessageHandler,
+} from './user-tracker-events.js';
+import {
+    collectBotMentionAliases,
+    getVisitorListForSync,
+    normalizeImvuUsername,
+    normalizeRoomApiSlug,
+    welcomeHandleKey,
+} from './user-tracker-utils.js';
 
 /**
  * IMVU User Tracker Module - CDP WEBSOCKET MODE 🎯
@@ -52,7 +61,6 @@ export async function startUserTracking(page, roomId, options = {}) {
     console.log(`[TRACKER] 🎯 CDP WEBSOCKET MODE enabled for room: ${roomId}`);
 
     const lastUserMap = new Map(); // avatarId -> username
-    const EXCLUDED_HANDLES = ['you', 'unknown', 'guest', 'loading'];
     const API_BASE_URL = process.env.APP_URL || 'http://localhost:8000';
     const syncBotName =
         (options.botName && String(options.botName).trim()) ||
@@ -124,17 +132,6 @@ export async function startUserTracking(page, roomId, options = {}) {
         }
     };
 
-    /** IMVU room API slug: `room-276040627-198` */
-    const normalizeRoomApiSlug = (rid) => {
-        const s = String(rid ?? '')
-            .trim()
-            .replace(/^\/+|\/+$/g, '');
-        if (!s) return null;
-        if (/^room-[\d-]+$/i.test(s)) return s;
-        if (/^\d+-\d+$/.test(s)) return `room-${s}`;
-        return null;
-    };
-
     let roomDetailsFromApiCache = null;
 
     /**
@@ -200,11 +197,6 @@ export async function startUserTracking(page, roomId, options = {}) {
         return null;
     };
 
-    const fetchRoomNameFromApi = async () => {
-        const d = await fetchRoomDetailsFromApi();
-        return d?.name || null;
-    };
-
     const fetchRoomPosterFromDom = async () => {
         try {
             if (!page || page.isClosed()) return '';
@@ -220,28 +212,6 @@ export async function startUserTracking(page, roomId, options = {}) {
         } catch {
             return '';
         }
-    };
-
-    /** IMVU guest accounts often use usernames like Guest_Tronox76 — strip prefix for display/storage */
-    const normalizeImvuUsername = (name) => {
-        if (name == null || typeof name !== 'string') return name;
-        const t = name.trim();
-        if (!t) return t;
-        const stripped = t.replace(/^guest_/i, '');
-        return stripped || t;
-    };
-
-    const getVisitorListForSync = () => {
-        const out = new Set();
-        for (const v of lastUserMap.values()) {
-            if (v == null || v === '') continue;
-            const s = String(normalizeImvuUsername(String(v)))
-                .trim()
-                .toLowerCase();
-            if (!s || EXCLUDED_HANDLES.includes(s)) continue;
-            out.add(s);
-        }
-        return [...out].slice(0, 50);
     };
 
     let dashboardSyncTimer = null;
@@ -272,7 +242,7 @@ export async function startUserTracking(page, roomId, options = {}) {
             imageUrl = await fetchRoomPosterFromDom();
         }
 
-        const visitors = getVisitorListForSync();
+        const visitors = getVisitorListForSync(lastUserMap);
         const population = lastUserMap.size;
 
         const body = {
@@ -317,158 +287,9 @@ export async function startUserTracking(page, roomId, options = {}) {
         scheduleDashboardSync();
     };
 
-    const collectBotMentionAliases = () => {
-        const aliases = new Set();
-        const add = (raw) => {
-            if (raw == null || typeof raw !== 'string') return;
-            const t = raw.trim();
-            if (!t) return;
-            aliases.add(t.toLowerCase());
-            const norm = normalizeImvuUsername(t);
-            if (norm && typeof norm === 'string') {
-                aliases.add(norm.toLowerCase());
-            }
-        };
-        add(BOT_USERNAME);
-        add(BOT_DISPLAY_NAME);
-        return [...aliases].filter((a) => a.length > 0);
-    };
-
-    const messageMentionsBot = (chatText) => {
-        const text = typeof chatText === 'string' ? chatText : '';
-        if (!text.trim()) return false;
-        const lower = text.toLowerCase();
-        for (const alias of collectBotMentionAliases()) {
-            if (lower.includes(`@${alias}`)) return true;
-            if (alias.includes(' ')) {
-                if (lower.includes(alias)) return true;
-                continue;
-            }
-            const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            if (new RegExp(`\\b${escaped}\\b`, 'i').test(text)) return true;
-        }
-        return false;
-    };
-
-    const logConversationTurn = async (payload) => {
-        try {
-            await axios.post(`${API_BASE_URL}/api/conversations/append`, {
-                room_id: String(roomId),
-                ...payload,
-            });
-        } catch (_) {}
-    };
-
-    const sendMessage = async (text, convMeta = null) => {
-        const sendInFrame = (frame) =>
-            frame.evaluate((msg) => {
-                const setNativeValue = (el, value) => {
-                    if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {
-                        const proto =
-                            el instanceof HTMLTextAreaElement
-                                ? HTMLTextAreaElement.prototype
-                                : HTMLInputElement.prototype;
-                        const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-                        if (desc?.set) {
-                            desc.set.call(el, value);
-                            return;
-                        }
-                    }
-                    if (el.isContentEditable) el.textContent = value;
-                    else el.value = value;
-                };
-
-                const trySubmit = (el) => {
-                    el.dispatchEvent(
-                        new InputEvent('input', {
-                            bubbles: true,
-                            inputType: 'insertText',
-                            data: msg,
-                        })
-                    );
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                    const form = el.closest && el.closest('form');
-                    if (form && typeof form.requestSubmit === 'function') {
-                        try {
-                            form.requestSubmit();
-                        } catch (_) {}
-                    }
-                    const btn =
-                        (form &&
-                            form.querySelector(
-                                'button[type="submit"], [type="submit"], button.primary'
-                            )) ||
-                        document.querySelector('button[type="submit"]');
-                    if (btn) btn.click();
-                    el.dispatchEvent(
-                        new KeyboardEvent('keydown', {
-                            key: 'Enter',
-                            code: 'Enter',
-                            keyCode: 13,
-                            which: 13,
-                            bubbles: true,
-                        })
-                    );
-                };
-
-                const candidates = [
-                    ...document.querySelectorAll('textarea:not([readonly])'),
-                    ...document.querySelectorAll('input[type="text"]:not([readonly])'),
-                    ...document.querySelectorAll('[contenteditable="true"]'),
-                    document.querySelector('input[type="text"]'),
-                ].filter(Boolean);
-
-                const visible = (el) => {
-                    const r = el.getBoundingClientRect?.();
-                    return r && r.width > 0 && r.height > 0;
-                };
-
-                for (const el of candidates) {
-                    if (!el || el.disabled) continue;
-                    if (!visible(el) && candidates.some((c) => c !== el && visible(c))) continue;
-                    try {
-                        el.focus();
-                        setNativeValue(el, msg);
-                        trySubmit(el);
-                        return true;
-                    } catch (_) {
-                        /* try next */
-                    }
-                }
-                return false;
-            }, text);
-
-        try {
-            const frames = page.frames();
-            let ok = false;
-            for (const frame of frames) {
-                try {
-                    if (ok) break;
-                    ok = await sendInFrame(frame);
-                } catch (_) {
-                    /* cross-origin or unloaded */
-                }
-            }
-            if (ok) {
-                const preview = text.length > 100 ? `${text.slice(0, 100)}…` : text;
-                console.log(`[CHAT][BOT] sent: ${preview}`);
-                if (convMeta?.participantUsername) {
-                    void logConversationTurn({
-                        username: convMeta.participantUsername,
-                        imvu_avatar_id: convMeta.participantAvatarId ?? null,
-                        role: 'assistant',
-                        content: text,
-                    });
-                }
-            } else {
-                console.log(
-                    '[CHAT][BOT] send failed: no chat input in any frame (check IMVU UI / shadow DOM)'
-                );
-            }
-        } catch (e) {
-            console.log('[CHAT][BOT] send error:', e?.message || e);
-        }
-    };
+    const botMentionAliases = collectBotMentionAliases(BOT_USERNAME, BOT_DISPLAY_NAME);
+    const logConversationTurn = createConversationLogger({ apiBaseUrl: API_BASE_URL, roomId });
+    const sendMessage = createSendMessage({ page, logConversationTurn });
 
     const onJoin = async (username) => {
         console.log(`[JOIN] ${username}`);
@@ -493,12 +314,13 @@ export async function startUserTracking(page, roomId, options = {}) {
         } catch (e) {}
     };
 
-    let selfUserId = null;
-    let botJoinedChat = false;
-    /** After participants roster is known (or fallback), allow chat welcomes for true join_queue arrivals only */
-    let welcomeArrivalsEnabled = false;
-    let participantsRosterSynced = false;
-    let welcomeArrivalsEnableTimer = null;
+    const state = {
+        selfUserId: null,
+        botJoinedChat: false,
+        welcomeArrivalsEnabled: false,
+        participantsRosterSynced: false,
+        welcomeArrivalsEnableTimer: null,
+    };
 
     const enableWelcomeForNewArrivals = () => {
         for (const aid of lastUserMap.keys()) {
@@ -509,25 +331,25 @@ export async function startUserTracking(page, roomId, options = {}) {
             }
         }
         // ✅ Mark roster as synced (covers fallback timer path)
-        participantsRosterSynced = true;
-        welcomeArrivalsEnabled = true;
-        if (welcomeArrivalsEnableTimer) {
-            clearTimeout(welcomeArrivalsEnableTimer);
-            welcomeArrivalsEnableTimer = null;
+        state.participantsRosterSynced = true;
+        state.welcomeArrivalsEnabled = true;
+        if (state.welcomeArrivalsEnableTimer) {
+            clearTimeout(state.welcomeArrivalsEnableTimer);
+            state.welcomeArrivalsEnableTimer = null;
         }
         console.log(`[SYNC] 🔓 Welcome gate OPEN — ${skipWelcomeAvatarIds.size} existing users blocked`);
     };
 
     const isSelfId = (id) =>
         id != null &&
-        selfUserId != null &&
-        String(id) === String(selfUserId);
+        state.selfUserId != null &&
+        String(id) === String(state.selfUserId);
 
     const announceJoinQueuePresence = (avatarId, label) => {
         if (!avatarId || isSelfId(avatarId)) return;
 
         // 🚫 BLOCK if still in initial sync phase
-        if (!participantsRosterSynced || !welcomeArrivalsEnabled) {
+        if (!state.participantsRosterSynced || !state.welcomeArrivalsEnabled) {
             return;
         }
 
@@ -540,13 +362,6 @@ export async function startUserTracking(page, roomId, options = {}) {
         void onJoin(normalizeImvuUsername(n) || n);
     };
 
-    const welcomeHandleKey = (displayName) => {
-        const h = String(normalizeImvuUsername(displayName) || '')
-            .trim()
-            .toLowerCase();
-        if (!h || EXCLUDED_HANDLES.includes(h)) return null;
-        return h;
-    };
 
     /**
      * @returns {boolean} true if a welcome was scheduled (caller may call onJoin once)
@@ -554,8 +369,8 @@ export async function startUserTracking(page, roomId, options = {}) {
     const scheduleWelcomeForAvatar = (avatarId, displayName, convMeta) => {
         if (
             !avatarId ||
-            !botJoinedChat ||
-            !welcomeArrivalsEnabled ||
+            !state.botJoinedChat ||
+            !state.welcomeArrivalsEnabled ||
             isSelfId(avatarId) ||
             skipWelcomeAvatarIds.has(avatarId)
         ) {
@@ -606,7 +421,7 @@ export async function startUserTracking(page, roomId, options = {}) {
 
     const updateCount = () => {
         // Occupancy should reflect active avatar IDs even before name resolution.
-        const phase = botJoinedChat ? 'AFTER_JOIN' : 'BEFORE_JOIN';
+        const phase = state.botJoinedChat ? 'AFTER_JOIN' : 'BEFORE_JOIN';
         console.log(`[COUNT][${phase}] 👥 Total Occupants: ${lastUserMap.size}`);
         scheduleDashboardSync();
     };
@@ -617,686 +432,37 @@ export async function startUserTracking(page, roomId, options = {}) {
         countTimer = setTimeout(updateCount, 300);
     };
 
-
-    const decodeId = (id) => {
-        if (id == null || id === '') return null;
-        const s = String(id);
-
-        if (/^\d+$/.test(s)) return s;
-
-        // IMVU often sends unpadded base64 user IDs (e.g. Mzc4MTA5MTI4 -> 378109128)
-        if (/^[A-Za-z0-9+/]+$/.test(s) && s.length >= 4) {
-            try {
-                const padded = s.padEnd(Math.ceil(s.length / 4) * 4, '=');
-                const decoded = Buffer.from(padded, 'base64').toString('utf-8');
-                if (/^\d+$/.test(decoded)) return decoded;
-            } catch { /* ignore */ }
-        }
-
-        if (typeof s === 'string' && s.length > 10 && s.includes('=')) {
-            try {
-                return Buffer.from(s, 'base64').toString('utf-8');
-            } catch (e) { }
-        }
-        return s;
-    };
-
-    const isImvuRoomProtocolLine = (msg) => {
-        const t = (msg || '').trim();
-        return t.startsWith('*');
-    };
-
-    const chatVerbose = () =>
-        process.env.CHAT_VERBOSE === '1' || process.env.CHAT_VERBOSE === 'true';
-
-    const decodeChatEnvelope = (rawMessage) => {
-        if (!rawMessage || typeof rawMessage !== 'string') return null;
-        try {
-            const padded = rawMessage.padEnd(Math.ceil(rawMessage.length / 4) * 4, '=');
-            const decoded = Buffer.from(padded, 'base64').toString('utf-8');
-            return JSON.parse(decoded);
-        } catch {
-            return null;
-        }
-    };
-
-    const displayNameFromEnvelope = (env) => {
-        if (!env || typeof env !== 'object') return null;
-        const asLabel = (v) => {
-            if (typeof v !== 'string') return null;
-            const t = v.trim();
-            if (!t || /^\d+$/.test(t)) return null;
-            return t;
-        };
-        const candidates = [
-            env.username,
-            env.user_name,
-            env.display_name,
-            env.displayName,
-            env.screen_name,
-            env.screenName,
-            env.name,
-            env.from_user,
-            env.fromUser,
-            env.senderName,
-            env.sender_username,
-            env.avatar_name,
-            env.avatarName,
-        ];
-        for (const v of candidates) {
-            const n = asLabel(v);
-            if (n) return n;
-        }
-        if (env.user && typeof env.user === 'object') {
-            const u = env.user;
-            const n = asLabel(
-                u.username || u.display_name || u.displayName || u.name || u.screen_name
-            );
-            if (n) return n;
-        }
-        if (env.sender && typeof env.sender === 'object') {
-            const s = env.sender;
-            const n = asLabel(
-                s.username || s.display_name || s.displayName || s.name
-            );
-            if (n) return n;
-        }
-        return null;
-    };
-
-    const imvuAvNameCache = new Map();
-    const imvuAvNameInflight = new Map();
-
-    /**
-     * Resolve username from numeric id via IMVU user API (session cookies).
-     * API: https://api.imvu.com/user/user-{id} → denormalized[…].data.username
-     */
-    const resolveImvuHandleFromNumericId = async (uid) => {
-        const id = String(uid);
-        if (!/^\d+$/.test(id)) return null;
-        if (imvuAvNameCache.has(id)) return imvuAvNameCache.get(id);
-        const inflight = imvuAvNameInflight.get(id);
-        if (inflight) return inflight;
-
-        const promise = (async () => {
-            if (!page || page.isClosed()) return null;
-            try {
-                const name = await page.evaluate(async (numericId) => {
-                    const isRenderableName = (s) => {
-                        if (typeof s !== 'string') return false;
-                        const t = s.trim();
-                        if (!t || /^\d+$/.test(t)) return false;
-                        if (/^[\u2800\s\u2000-\u200D\uFEFF]+$/.test(t)) {
-                            return false;
-                        }
-                        return true;
-                    };
-
-                    try {
-                        const apiUrl = `https://api.imvu.com/user/user-${numericId}`;
-                        const res = await fetch(apiUrl, {
-                            credentials: 'include',
-                            mode: 'cors',
-                            headers: { Accept: 'application/json' },
-                        });
-                        if (!res.ok) return null;
-                        const json = await res.json();
-                        const denorm = json.denormalized || {};
-                        const entry =
-                            (json.id && denorm[json.id]) ||
-                            Object.values(denorm)[0];
-                        const d = entry?.data;
-                        if (!d) return null;
-                        const u =
-                            typeof d.username === 'string'
-                                ? d.username.trim()
-                                : '';
-                        if (u) return u;
-                        const dn =
-                            typeof d.display_name === 'string'
-                                ? d.display_name.trim()
-                                : '';
-                        if (isRenderableName(dn)) return dn;
-                        return null;
-                    } catch {
-                        return null;
-                    }
-                }, id);
-                const norm = name ? normalizeImvuUsername(name) : null;
-                if (norm) imvuAvNameCache.set(id, norm);
-                return norm || null;
-            } catch {
-                return null;
-            } finally {
-                imvuAvNameInflight.delete(id);
-            }
-        })();
-
-        imvuAvNameInflight.set(id, promise);
-        return promise;
-    };
-
-    const handleFinalJoin = (avatarId) => {
-        if (!avatarId) return;
-
-        // 🚨 HARD BLOCK — already processed
-        if (processedJoins.has(avatarId)) {
-            return;
-        }
-        processedJoins.add(avatarId);
-
-        const name = lastUserMap.get(avatarId);
-        if (!name || String(name).trim() === '') {
-            processedJoins.delete(avatarId);
-            return;
-        }
-
-        const label = isSelfId(avatarId)
-            ? BOT_USERNAME
-            : normalizeImvuUsername(String(name));
-
-        announceJoinQueuePresence(avatarId, label);
-
-        const scheduled = scheduleWelcomeForAvatar(avatarId, label, {
-            participantUsername: label,
-            participantAvatarId: String(avatarId),
-        });
-
-        // 🔓 allow future joins ONLY after leave
-        if (!scheduled) {
-            processedJoins.delete(avatarId);
-        }
-    };
-
-    async function handleIncomingMessage(msg) {
-        if (process.env.WS_DEBUG === '1' || process.env.WS_DEBUG === 'true') {
-            console.log('[WS_DEBUG]', JSON.stringify(msg, null, 2));
-        }
-        const actions = Array.isArray(msg) ? msg : [msg];
-
-        for (const action of actions) {
-            const record = action.record || '';
-            const props = action.properties || {};
-            const queue = action.queue || '';
-            const mount = action.mount || '';
-
-            if (record === 'msg_c2g_connect' && action.user_id) {
-                selfUserId = decodeId(action.user_id);
-            }
-
-            // 1. Initial Room Load (Create Mount: participants)
-            if (
-                record === 'msg_g2c_create_mount' &&
-                (mount === 'participants' || mount === 'edge:participants')
-            ) {
-                const participants =
-                    props.items ||
-                    props.participants ||
-                    props.users ||
-                    [];
-
-                // ⚠️ If it's a PATCH update (type 2), DO NOT reset
-                const isPatch = action.type === 2;
-
-                if (!isPatch) {
-                    lastUserMap.clear(); // only clear on full load
-                    skipWelcomeAvatarIds.clear();
-                    joinQueueBackendAnnounced.clear();
-                }
-
-                participants.forEach(p => {
-                    const rawId = p.avatar_id || p.user_id || p.id;
-                    const avatarId = decodeId(rawId);
-
-                    if (p.state === 'removed') {
-                        if (avatarId && lastUserMap.has(avatarId)) {
-                            const username = lastUserMap.get(avatarId);
-                            lastUserMap.delete(avatarId);
-                            if (username && typeof onLeave === 'function') {
-                                onLeave(username);
-                            }
-                        }
-                        return;
-                    }
-
-                    const rawUser =
-                        p.username ||
-                        p.display_name ||
-                        p.name ||
-                        p.screen_name;
-                    const username = normalizeImvuUsername(rawUser);
-
-                    if (
-                        avatarId &&
-                        username &&
-                        !EXCLUDED_HANDLES.includes(username.toLowerCase())
-                    ) {
-                        const existing = lastUserMap.get(avatarId);
-                        const existingNorm =
-                            existing != null
-                                ? normalizeImvuUsername(String(existing))
-                                : existing;
-
-                        if (existingNorm && existingNorm === username) {
-                            return;
-                        }
-
-                        lastUserMap.set(avatarId, username);
-                        if (!existing || existing === null) {
-                            // ❌ Ignore initial room population
-                            if (!participantsRosterSynced) {
-                                return;
-                            }
-
-                            // ✅ Only real joins after bot is ready
-                            if (avatarId) joinQueueBackendAnnounced.add(avatarId);
-                            onJoin(username);
-                        }
-                    }
-                });
-
-                if (!isPatch) {
-                    participants.forEach((p) => {
-                        if (p.state === 'removed') return;
-                        const rawId = p.avatar_id || p.user_id || p.id;
-                        const aid = decodeId(rawId);
-                        if (aid) skipWelcomeAvatarIds.add(aid);
-                    });
-                    participantsRosterSynced = true;
-                    if (botJoinedChat && !welcomeArrivalsEnabled) {
-                        // Always delay to let initial joined_queue events settle
-                        if (welcomeArrivalsEnableTimer) clearTimeout(welcomeArrivalsEnableTimer);
-                        welcomeArrivalsEnableTimer = setTimeout(() => {
-                            welcomeArrivalsEnableTimer = null;
-                            enableWelcomeForNewArrivals();
-                        }, 5000);
-                    }
-                }
-
-                triggerCountUpdate();
-            }
-
-            // 2. User Joined (Joined Queue)
-            else if (
-                record === 'msg_g2c_joined_queue' &&
-                typeof queue === 'string' &&
-                queue.startsWith('/chat/')
-            ) {
-                // 🚫 HARD FILTER — ignore all non-chat queues
-                if (!queue || !queue.startsWith('/chat/')) {
-                    return;
-                }
-
-                // 🛡️ Block ALL events until welcome gate is open
-                if (!welcomeArrivalsEnabled) {
-                    // Still track the bot's own join to set botJoinedChat
-                    const avatarId = decodeId(action.user_id);
-                    if (avatarId && isSelfId(avatarId) && !botJoinedChat) {
-                        if (!lastUserMap.has(avatarId)) lastUserMap.set(avatarId, null);
-                        const beforeJoinCount = lastUserMap.size > 0 ? lastUserMap.size - 1 : 0;
-                        console.log(`[COUNT][BEFORE_JOIN] 👥 Total Occupants: ${beforeJoinCount}`);
-                        console.log(`[COUNT][AFTER_JOIN] 👥 Total Occupants: ${lastUserMap.size}`);
-                        botJoinedChat = true;
-                        // Always use delay — let initial joined_queue events settle first
-                        if (welcomeArrivalsEnableTimer) clearTimeout(welcomeArrivalsEnableTimer);
-                        welcomeArrivalsEnableTimer = setTimeout(() => {
-                            welcomeArrivalsEnableTimer = null;
-                            enableWelcomeForNewArrivals();
-                        }, 5000);
-                        void refreshRoomName();
-                        triggerCountUpdate();
-                    } else if (avatarId && !lastUserMap.has(avatarId)) {
-                        // Track existing users silently during bootstrap
-                        lastUserMap.set(avatarId, null);
-                        console.log(`[JOIN][QUEUE][BOOTSTRAP] silently tracking ${avatarId}`);
-                        triggerCountUpdate();
-                    }
-                    continue;
-                }
-
-                const avatarId = decodeId(action.user_id);
-                const hadUser = avatarId ? lastUserMap.has(avatarId) : false;
-
-                if (avatarId && !lastUserMap.has(avatarId)) {
-                    lastUserMap.set(avatarId, null);
-                    console.log(
-                        `[JOIN][QUEUE] ${isSelfId(avatarId) ? 'bot' : 'occupant'} · resolving https://api.imvu.com/user/user-${avatarId}`
-                    );
-                    if (/^\d+$/.test(String(avatarId))) {
-                        void resolveImvuHandleFromNumericId(avatarId).then(
-                            (name) => {
-                                if (!name || !lastUserMap.has(avatarId)) {
-                                    return;
-                                }
-                                const cur = lastUserMap.get(avatarId);
-                                if (
-                                    cur !== null &&
-                                    cur !== undefined &&
-                                    String(cur).trim() !== ''
-                                ) {
-                                    handleFinalJoin(avatarId);
-                                    triggerCountUpdate();
-                                    return;
-                                }
-
-                                const label = isSelfId(avatarId)
-                                    ? BOT_USERNAME
-                                    : name;
-
-                                lastUserMap.set(avatarId, label);
-                                console.log(
-                                    `[JOIN][QUEUE] ${label} · profile API`
-                                );
-
-                                handleFinalJoin(avatarId);
-                                triggerCountUpdate();
-                            }
-                        );
-                    }
-                } else if (
-                    avatarId &&
-                    lastUserMap.has(avatarId) &&
-                    welcomeArrivalsEnabled &&
-                    botJoinedChat &&
-                    !isSelfId(avatarId) &&
-                    !skipWelcomeAvatarIds.has(avatarId) &&
-                    !joinQueueBackendAnnounced.has(avatarId) // 🚨 Block already-announced users
-                ) {
-                    const cur = lastUserMap.get(avatarId);
-                    const hasResolved =
-                        cur != null &&
-                        cur !== undefined &&
-                        String(cur).trim() !== '';
-                    if (hasResolved) {
-                        handleFinalJoin(avatarId);
-                        triggerCountUpdate();
-                    } else if (/^\d+$/.test(String(avatarId))) {
-                        console.log(
-                            `[JOIN][QUEUE] occupant · resolving https://api.imvu.com/user/user-${avatarId}`
-                        );
-                        void resolveImvuHandleFromNumericId(avatarId).then(
-                            (name) => {
-                                if (!name || !lastUserMap.has(avatarId)) {
-                                    return;
-                                }
-                                const inner = lastUserMap.get(avatarId);
-                                if (
-                                    inner != null &&
-                                    inner !== undefined &&
-                                    String(inner).trim() !== ''
-                                ) {
-                                    handleFinalJoin(avatarId);
-                                    triggerCountUpdate();
-                                    return;
-                                }
-                                const label = name;
-                                lastUserMap.set(avatarId, label);
-                                console.log(
-                                    `[JOIN][QUEUE] ${label} · profile API`
-                                );
-                                handleFinalJoin(avatarId);
-                                triggerCountUpdate();
-                            }
-                        );
-                    }
-                }
-
-                if (avatarId && isSelfId(avatarId) && !botJoinedChat) {
-                    const beforeJoinCount = hadUser ? lastUserMap.size : Math.max(lastUserMap.size - 1, 0);
-                    const afterJoinCount = lastUserMap.size;
-                    console.log(`[COUNT][BEFORE_JOIN] 👥 Total Occupants: ${beforeJoinCount}`);
-                    console.log(`[COUNT][AFTER_JOIN] 👥 Total Occupants: ${afterJoinCount}`);
-                    botJoinedChat = true;
-                    // Always delay — never immediate, let joined_queue events settle
-                    if (!welcomeArrivalsEnabled) {
-                        if (welcomeArrivalsEnableTimer) clearTimeout(welcomeArrivalsEnableTimer);
-                        welcomeArrivalsEnableTimer = setTimeout(() => {
-                            welcomeArrivalsEnableTimer = null;
-                            enableWelcomeForNewArrivals();
-                        }, 5000);
-                    }
-                    void refreshRoomName();
-                }
-
-                triggerCountUpdate();
-            }
-
-            // 3. User Left (Left Queue)
-            else if (record === 'msg_g2c_left_queue' || record === 'msg_g2c_user_exited') {
-                const avatarId = decodeId(action.user_id || action.avatar_id);
-
-                if (avatarId && lastUserMap.has(avatarId)) {
-                    if (isSelfId(avatarId)) {
-                        lastUserMap.delete(avatarId);
-                        skipWelcomeAvatarIds.delete(avatarId);
-                        joinQueueBackendAnnounced.delete(avatarId);
-                        // Clean session state for bot self
-                        activeJoinSessions.delete(avatarId);
-                        welcomeTimestamps.delete(avatarId);
-                        processedJoins.delete(avatarId);
-                        triggerCountUpdate();
-                        continue;
-                    }
-                    const username = lastUserMap.get(avatarId);
-                    lastUserMap.delete(avatarId);
-                    skipWelcomeAvatarIds.delete(avatarId);
-                    joinQueueBackendAnnounced.delete(avatarId);
-                    // State-based unlock: allow welcome again on rejoin
-                    activeJoinSessions.delete(avatarId);
-                    processedJoins.delete(avatarId);
-                    if (username) {
-                        onLeave(username);
-                    }
-                    triggerCountUpdate();
-                }
-            }
-
-            // 4. Read room chat messages from websocket frames
-            else if (
-                (record === 'msg_g2c_send_message' || record === 'msg_c2g_send_message') &&
-                queue.startsWith('/chat/') &&
-                mount === 'messages'
-            ) {
-                const envelope = decodeChatEnvelope(action.message);
-                const envelopeName = normalizeImvuUsername(
-                    displayNameFromEnvelope(envelope)
-                );
-                const rawSender =
-                    action.user_id ??
-                    envelope?.userId ??
-                    envelope?.user_id ??
-                    envelope?.userID;
-                const senderId = decodeId(rawSender != null ? String(rawSender) : null);
-                if (senderId && isSelfId(senderId)) {
-                    lastUserMap.set(senderId, BOT_USERNAME);
-                }
-                const wireName = normalizeImvuUsername(
-                    typeof action.username === 'string'
-                        ? action.username.trim()
-                        : typeof action.display_name === 'string'
-                          ? action.display_name.trim()
-                          : null
-                );
-
-                if (senderId && envelopeName) {
-                    const cur = lastUserMap.get(senderId);
-                    if (cur == null || cur === '') {
-                        lastUserMap.set(senderId, envelopeName);
-                    }
-                }
-                if (senderId && wireName && /^\d+$/.test(wireName) === false) {
-                    const cur = lastUserMap.get(senderId);
-                    if (cur == null || cur === '') {
-                        lastUserMap.set(senderId, wireName);
-                    }
-                }
-
-                const resolvedName = senderId
-                    ? normalizeImvuUsername(lastUserMap.get(senderId))
-                    : null;
-                let senderLabel =
-                    (resolvedName && String(resolvedName)) ||
-                    envelopeName ||
-                    (wireName && !/^\d+$/.test(wireName) ? wireName : null);
-                if (!senderLabel) {
-                    senderLabel = isSelfId(senderId) ? BOT_USERNAME : 'Guest';
-                }
-                if (
-                    senderLabel === 'Guest' &&
-                    senderId &&
-                    /^\d+$/.test(String(senderId))
-                ) {
-                    const fromAv = await resolveImvuHandleFromNumericId(
-                        senderId
-                    );
-                    if (fromAv) {
-                        const label = isSelfId(senderId)
-                            ? BOT_USERNAME
-                            : normalizeImvuUsername(fromAv);
-                        lastUserMap.set(senderId, label);
-                        senderLabel = label;
-                    }
-                }
-                if (isSelfId(senderId)) {
-                    senderLabel = BOT_USERNAME;
-                }
-                const text =
-                    envelope?.message ||
-                    envelope?.text ||
-                    envelope?.body ||
-                    envelope?.chat_message;
-                if (typeof text === 'string' && text.trim()) {
-                    if (!chatVerbose() && isImvuRoomProtocolLine(text)) return;
-                    const direction =
-                        record === 'msg_c2g_send_message' ? 'OUT' : 'IN';
-                    const trimmed = text.trim();
-                    console.log(`[CHAT][${direction}] ${senderLabel}: ${trimmed}`);
-                    const avatarForLog =
-                        senderId && /^\d+$/.test(String(senderId))
-                            ? String(senderId)
-                            : null;
-                    void logConversationTurn({
-                        username: senderLabel,
-                        imvu_avatar_id: avatarForLog,
-                        role: direction === 'OUT' ? 'assistant' : 'user',
-                        content: trimmed,
-                    });
-
-                    if (
-                        direction === 'IN' &&
-                        senderId != null &&
-                        !isSelfId(senderId) &&
-                        (messageInvokesSivaCharacterAi(trimmed) ||
-                            messageMentionsBot(trimmed))
-                    ) {
-                        const dedupeKey = `${roomId}:${senderId}:${trimmed}`;
-                        if (!mentionReplyDedupe.has(dedupeKey)) {
-                            mentionReplyDedupe.add(dedupeKey);
-                            if (mentionReplyDedupe.size > MENTION_REPLY_DEDUPE_CAP) {
-                                const first = mentionReplyDedupe
-                                    .values()
-                                    .next().value;
-                                mentionReplyDedupe.delete(first);
-                            }
-                            const sivaHit = messageInvokesSivaCharacterAi(trimmed);
-                            void (async () => {
-                                try {
-                                    const res = sivaHit
-                                        ? await axios.post(
-                                              `${API_BASE_URL}/api/siva-chat`,
-                                              {
-                                                  message:
-                                                      stripSivaCharacterAiTriggers(
-                                                          trimmed
-                                                      ) || trimmed,
-                                                  username: senderLabel,
-                                                  room_id: String(roomId),
-                                                  imvu_avatar_id: avatarForLog,
-                                                  already_logged_user_message:
-                                                      true,
-                                              }
-                                          )
-                                        : await axios.post(
-                                              `${API_BASE_URL}/api/lurk`,
-                                              {
-                                                  message: trimmed,
-                                                  username: senderLabel,
-                                                  room_id: String(roomId),
-                                                  imvu_avatar_id: avatarForLog,
-                                                  bot_username: BOT_USERNAME,
-                                                  bot_display_name:
-                                                      BOT_DISPLAY_NAME &&
-                                                      BOT_DISPLAY_NAME.toLowerCase() !==
-                                                          BOT_USERNAME.toLowerCase()
-                                                          ? BOT_DISPLAY_NAME
-                                                          : undefined,
-                                                  already_logged_user_message:
-                                                      true,
-                                              }
-                                          );
-                                    const reply = res.data?.reply;
-                                    if (
-                                        reply &&
-                                        typeof reply === 'string' &&
-                                        reply.trim()
-                                    ) {
-                                        await sendMessage(reply.trim(), {
-                                            participantUsername: senderLabel,
-                                            participantAvatarId:
-                                                avatarForLog ?? undefined,
-                                        });
-                                    }
-                                } catch {
-                                    /* ignore */
-                                }
-                            })();
-                        }
-                    }
-                }
-            }
-
-            // 5. Resolve Real Username (Mount: node for user or profile inventory)
-            else if (
-                record === 'msg_g2c_create_mount' &&
-                (queue.includes('inv:/user/user-') || queue.includes('inv:/profile/user-')) &&
-                mount === 'node'
-            ) {
-                const userIdPart = queue.split('user-')[1] || '';
-                const userId = decodeId(userIdPart.split('/')[0]);
-                const data = props || {};
-
-                const realName = data.username || data.user_name || data.display_name || data.screen_name;
-
-                if (userId && realName && lastUserMap.has(userId)) {
-                    const existing = lastUserMap.get(userId);
-                    const displayName = isSelfId(userId)
-                        ? BOT_USERNAME
-                        : normalizeImvuUsername(realName);
-
-                    if (existing === displayName) return;
-
-                    lastUserMap.set(userId, displayName);
-
-                    if (!existing || existing === null) {
-                        // ❌ Ignore initial room population
-                        if (!participantsRosterSynced) {
-                            return;
-                        }
-
-                        // ✅ Only real joins after bot is ready
-                        onJoin(displayName);
-                    } else {
-                        console.log(`[UPDATE] ${existing} → ${displayName}`);
-                    }
-
-                    triggerCountUpdate();
-                }
-            }
-        }
-    }
+    const resolveImvuHandleFromNumericId = createImvuHandleResolver({ page });
+    const handleIncomingMessage = createIncomingMessageHandler({
+        API_BASE_URL,
+        BOT_DISPLAY_NAME,
+        BOT_USERNAME,
+        MENTION_REPLY_DEDUPE_CAP,
+        activeJoinSessions,
+        announceJoinQueuePresence,
+        botMentionAliases,
+        enableWelcomeForNewArrivals,
+        isSelfId,
+        joinQueueBackendAnnounced,
+        lastUserMap,
+        logConversationTurn,
+        mentionReplyDedupe,
+        onJoin,
+        onLeave,
+        processedJoins,
+        refreshRoomName,
+        resolveImvuHandleFromNumericId,
+        roomId,
+        scheduleWelcomeForAvatar,
+        sendMessage,
+        skipWelcomeAvatarIds,
+        state,
+        triggerCountUpdate,
+        welcomeTimestamps,
+    });
 
     setInterval(() => {
-        if (botJoinedChat) {
+        if (state.botJoinedChat) {
             scheduleDashboardSync();
         }
     }, 45000);
@@ -1305,31 +471,6 @@ export async function startUserTracking(page, roomId, options = {}) {
         void handleIncomingMessage(data);
     };
 
-    // Helper: Static fallback check using DOM once (still runs in browser)
-    const runDOMFallback = async () => {
-        try {
-            const domUsers = await page.evaluate(() => {
-                const results = [];
-                const links = document.querySelectorAll('a[href*="/next/av/"]');
-                links.forEach(l => {
-                    const parts = l.href.split('/next/av/')[1].split('/');
-                    if (parts[0]) results.push(parts[0]);
-                });
-                return Array.from(new Set(results));
-            });
-
-            if (lastUserMap.size === 0 && domUsers.length > 0) {
-                console.log(`[CDP-WS] 🛡️ DOM Baseline: ${domUsers.length} users`);
-                domUsers.forEach(name => {
-                    if (!Array.from(lastUserMap.values()).some(n => n.toLowerCase() === name.toLowerCase())) {
-                        const dummyId = `dom_${name.toLowerCase()}`;
-                        lastUserMap.set(dummyId, name);
-                    }
-                });
-                triggerCountUpdate();
-            }
-        } catch (e) {}
-    };
-
+    const runDOMFallback = createDomFallback({ page, lastUserMap, triggerCountUpdate });
     setTimeout(runDOMFallback, 5000);
 }
