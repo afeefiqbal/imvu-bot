@@ -1,5 +1,4 @@
 import 'dotenv/config';
-import './discord-server.js';
 import puppeteer from 'puppeteer';
 import fs from 'fs';
 import path from 'path';
@@ -65,7 +64,16 @@ const performLogin = async (page) => {
         console.log(`[${BOT_NAME}] 🔐 Logging in as ${botMatch.username}...`);
         
         // Force navigate to login
-        await page.goto('https://www.imvu.com/login/', { waitUntil: 'networkidle2' }).catch(() => {});
+        await page.goto('https://www.imvu.com/login/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch((e) => {
+             console.error(`[${BOT_NAME}] Login goto failed:`, e.message);
+        });
+        await new Promise(r => setTimeout(r, 8000));
+
+        if (page.url().includes('chrome-error://')) {
+             console.log(`[${BOT_NAME}] ⚠️ Network blocked (chrome-error://). Retrying login page...`);
+             await page.goto('https://www.imvu.com/login/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(()=>{});
+             await new Promise(r => setTimeout(r, 8000));
+        }
         await new Promise(r => setTimeout(r, 8000));
 
         // Detect splash page vs login form
@@ -238,8 +246,8 @@ const startJoiner = async (roomId = '') => {
         const localMatch = localBots.find(b => b.username === backendBot.username) || localBots[0];
 
         // Use backend credentials, fallback to local bots.json if backend returns placeholder values
-        botMatch.username = (backendBot.username && backendBot.username !== 'Unset') ? backendBot.username : (localMatch?.username || 's1va');
-        botMatch.password = (backendBot.password && backendBot.password !== 'Unset' && backendBot.password !== 'secret') ? backendBot.password : (localMatch?.password || 'password');
+        botMatch.username = (backendBot.username && backendBot.username !== 'Unset') ? backendBot.username : (localMatch?.username || process.env.BOT_ALPHA_USERNAME || 's1va');
+        botMatch.password = (backendBot.password && backendBot.password !== 'Unset' && backendBot.password !== 'secret') ? backendBot.password : (localMatch?.password || process.env.BOT_ALPHA_PASSWORD || 'password');
         
         // Use assigned room ID if none provided
         if (!roomId && backendBot.room_ids) {
@@ -288,19 +296,23 @@ const startJoiner = async (roomId = '') => {
         process.exit(1);
     }
 
-    const activeProfileDir = path.join(__dirname, 'profiles', `${BOT_NAME}_${roomId}`);
-    cleanupProfileLock(activeProfileDir);
+    const USER_DATA_DIR = path.resolve(__dirname, 'profiles', `${BOT_NAME}-${roomId}`);
+    cleanupProfileLock(USER_DATA_DIR);
 
     const browser = await puppeteer.launch({
         headless: true, // Switched to headless
-        userDataDir: activeProfileDir,
+        userDataDir: USER_DATA_DIR,
+        ignoreHTTPSErrors: true, // Critical for bypassing proxy/cert intercept issues
         args: [
             '--no-sandbox', 
             '--disable-setuid-sandbox', 
             '--window-size=1280,800',
             '--disable-web-security',
             '--enable-webgl',
-            '--use-gl=angle'
+            '--use-gl=angle',
+            '--ignore-certificate-errors',     // Fixes chromewebdata
+            '--ignore-certificate-errors-spki-list',
+            '--disable-features=IsolateOrigins,site-per-process'
         ]
     });
 
@@ -320,7 +332,15 @@ const startJoiner = async (roomId = '') => {
         discordChannelId: botMatch.discord_channel_id || (typeof backendBot !== 'undefined' ? backendBot?.discord_channel_id : undefined)
     });
 
-    await page.goto(`https://www.imvu.com/next/chat/room-${roomId}/`, { waitUntil: 'domcontentloaded' });
+    await page.goto(`https://www.imvu.com/next/chat/room-${roomId}/`, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(e => {
+         console.warn(`[${BOT_NAME}] Initial room navigation caught:`, e.message);
+    });
+
+    if (page.url().includes('chrome-error://')) {
+         console.log(`[${BOT_NAME}] ⚠️ Network blocked (chrome-error://). Retrying room page...`);
+         await new Promise(r => setTimeout(r, 3000));
+         await page.goto(`https://www.imvu.com/next/chat/room-${roomId}/`, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(()=>{});
+    }
 
     await performLogin(page);
     
@@ -343,13 +363,17 @@ const startJoiner = async (roomId = '') => {
         await page.mouse.move(400, 400);
 
         // Keep Alive Loop
-        setInterval(async () => {
+        const keepAliveTimer = setInterval(async () => {
             try {
-                if (!page.isClosed()) {
-                    await page.mouse.move(400 + Math.random() * 300, 300 + Math.random() * 300);
-                    await page.keyboard.press('Shift');
+                if (page.isClosed()) {
+                    clearInterval(keepAliveTimer);
+                    return;
                 }
-            } catch {}
+                await page.mouse.move(400 + Math.random() * 300, 300 + Math.random() * 300);
+                await page.keyboard.press('Shift');
+            } catch (e) {
+                console.error(`[${BOT_NAME}] Keep-alive error:`, e.message);
+            }
         }, 12000);
 
         console.log(`[${BOT_NAME}] 🟢 Bot is active and staying in the room.`);
@@ -360,4 +384,7 @@ const startJoiner = async (roomId = '') => {
 
 // Start the joiner
 const targetRoom = process.argv[2] || '';
-startJoiner(targetRoom);
+startJoiner(targetRoom).catch(err => {
+    console.error(`[${BOT_NAME}] Fatal Error in startJoiner:`, err);
+    process.exit(1);
+});

@@ -1,12 +1,15 @@
 import axios from 'axios';
+import { bulkPost } from './api-queue.js';
 
 export const createConversationLogger = ({ apiBaseUrl, roomId }) => async (payload) => {
     try {
-        await axios.post(`${apiBaseUrl}/api/conversations/append`, {
+        bulkPost('/api/conversations/append', {
             room_id: String(roomId),
             ...payload,
         });
-    } catch {}
+    } catch (e) {
+        console.log('[CHAT-LOGGER] Log failed:', e.message);
+    }
 };
 
 export const createSendMessage = ({ page, logConversationTurn }) => async (text, convMeta = null) => {
@@ -51,10 +54,11 @@ export const createSendMessage = ({ page, logConversationTurn }) => async (text,
                 );
             };
             const candidates = [
-                ...document.querySelectorAll('textarea:not([readonly])'),
-                ...document.querySelectorAll('input[type="text"]:not([readonly])'),
-                ...document.querySelectorAll('[contenteditable="true"]'),
-                document.querySelector('input[type="text"]'),
+                document.querySelector('textarea.input-text'),
+                document.querySelector('.input-text'),
+                document.querySelector('[class*="chat-input"] textarea'),
+                document.querySelector('[contenteditable="true"]'),
+                ...document.querySelectorAll('textarea:not([readonly])')
             ].filter(Boolean);
             const visible = (el) => {
                 const r = el.getBoundingClientRect?.();
@@ -64,6 +68,7 @@ export const createSendMessage = ({ page, logConversationTurn }) => async (text,
                 if (!el || el.disabled) continue;
                 if (!visible(el) && candidates.some((c) => c !== el && visible(c))) continue;
                 try {
+                    el.click();
                     el.focus();
                     setNativeValue(el, msg);
                     trySubmit(el);

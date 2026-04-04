@@ -12,7 +12,12 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const BOT_NAME      = process.env.BOT_NAME      || 'UnnamedBot';
-const USER_DATA_DIR = path.resolve(__dirname, 'profiles', BOT_NAME);
+const roomId = process.argv[2] || 'default';
+const USER_DATA_DIR = path.resolve(
+  __dirname,
+  'profiles',
+  `${BOT_NAME}-${roomId}`
+);
 const BOT_PROXY     = process.env.BOT_PROXY     || null;
 const BACKEND_URL   = "http://127.0.0.1:8000";
 
@@ -128,11 +133,13 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
         const processedGlobal = new Set();
         const lastSentGlobal = new Map();
 
-        // --- THE MASSIVE 6000+ WORD SPAM LIBRARY ---
-        const spamLibrary = [];
-        for (let i = 0; i < 500; i++) {
-            spamLibrary.push(`Chat message #${i}: This is a high-volume transmission intended for stress-testing and room population engagement. We are currently broadcasting a sequence of over six thousand words to verify the bot's endurance and the room's throughput capacity. Each word is carefully curated to ensure maximum stability. Let me tell you about the future of automation and how we can achieve great things through persistent and reliable logic systems. Imagine a world where every task is optimized. ${i % 10 === 0 ? "IMPORTANT: This system is operating at peak efficiency." : "Keep chatting and stay active!"}`);
-        }
+        // --- HUMAN-LIKE ENGAGEMENT ---
+        const personalities = [
+            ["Hey everyone! 👋", "This room is pretty cool.", "How's everyone doing today?"],
+            ["Yo 😎", "What's up", "Cool place", "Nice vibes here."],
+            ["Hello!", "Anyone here?", "Nice outfits", "Just hanging out."]
+        ];
+        const spamLibrary = personalities[Math.floor(Math.random() * personalities.length)];
         
         let activeFilamentSpamRooms = [];
         let activeFilamentMutedRooms = [];
@@ -248,6 +255,12 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
                                 continue;
                             }
 
+                            const MAX_TABS = 10;
+                            if (imvuPages.length >= MAX_TABS) {
+                                console.log(`[${BOT_NAME}] ⚠️ Max tabs reached. Skipping new room.`);
+                                continue;
+                            }
+
                             joiningRooms.add(normalized);
                             console.log(`[${BOT_NAME}] 🆕 JOIN COMMAND: Opening new tab for Room ${normalized}`);
                             try {
@@ -289,6 +302,8 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
                             const targetPg = imvuPages.find(pg => pg.url().includes('room-' + msg.room_id));
                             if (targetPg) {
                                 console.log(`[Dashboard] Sending Message to Room ${msg.room_id}: ${msg.pending_message}`);
+                                const delay = 3000 + Math.random() * 7000;
+                                await new Promise(r => setTimeout(r, delay));
                                 await say(targetPg, msg.pending_message);
                             }
                         }
@@ -306,7 +321,7 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
             }
         }, 25000 + Math.random() * 10000); // 25-35s sync interval (much safer)
 
-        // --- THE MASSIVE SPAM ENGINE ---
+        // --- PERIODIC ENGAGEMENT ---
         setInterval(async () => {
             const allPages = await browser.pages();
             const imvuPages = allPages.filter(p => p.url().includes('imvu.com/next/chat'));
@@ -318,15 +333,16 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
 
                 const spamOn = activeFilamentSpamRooms.some((r) => String(r).trim() === String(roomId).trim());
                 if (roomId && spamOn) {
-                    // SLOWER SPAM: Wait a random long time
-                    await new Promise(r => setTimeout(r, Math.random() * 20000));
+                    await new Promise(r => setTimeout(r, 2000 + Math.random() * 5000));
                     
                     const massiveMsg = spamLibrary[Math.floor(Math.random() * spamLibrary.length)];
-                    console.log(`[SAFE SPAM] Room ${roomId} | Choosing fragment...`);
+                    console.log(`[ENGAGEMENT] Room ${roomId} | Choosing fragment...`);
+                    const delay = 3000 + Math.random() * 7000;
+                    await new Promise(r => setTimeout(r, delay));
                     await say(p, massiveMsg);
                 }
             }
-        }, 45000 + Math.random() * 50000); // 45-95s spam interval (Very safe)
+        }, 45000 + Math.random() * 50000); // 45-95s interval
 
         let isListening = false;
         // --- CHAT LISTENER ---
@@ -586,6 +602,8 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
                                 const welcomeMsg = `Welcome to the room, @${cleanName}! 👋`;
                                 console.log(`[Response] Welcoming user: ${cleanName} in Room ${roomId}`);
                                 lastSentGlobal.set(roomId, welcomeMsg);
+                                const delay = 3000 + Math.random() * 7000;
+                                await new Promise(r => setTimeout(r, delay));
                                 await say(p, welcomeMsg);
                             }
                             continue;
@@ -611,6 +629,8 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
                             if (reply) {
                                 console.log(`[Response] Sending AI reply in Room ${roomId}: ${reply}`);
                                 lastSentGlobal.set(roomId, reply);
+                                const delay = 3000 + Math.random() * 7000;
+                                await new Promise(r => setTimeout(r, delay));
                                 await say(p, reply);
                             }
                         } catch (err) { }
@@ -637,30 +657,28 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
  
         async function say(p, text) {
             try {
-                // Human typing simulation: 2-5 sec delay
-                await new Promise(r => setTimeout(r, 2000 + Math.random() * 3000));
+                // Focus the tab natively to avoid headless background suspension on type
+                await p.bringToFront().catch(() => null);
+
+                await p.evaluate(() => {
+                    const input = document.querySelector('textarea.input-text') || document.querySelector('textarea[placeholder*="Say something"]');
+                    if (input) {
+                        input.focus();
+                        input.value = "";
+                        input.dispatchEvent(new Event('input', { bubbles: true }));
+                    }
+                });
+
+                // Human-like character typing at OS level
+                await p.keyboard.type(text, { delay: 50 + Math.random() * 30 });
                 
-                await p.evaluate(async (txt) => {
+                await new Promise(r => setTimeout(r, 500 + Math.random() * 500));
+
+                await p.evaluate(() => {
                     const input = document.querySelector('textarea.input-text') || document.querySelector('textarea[placeholder*="Say something"]');
                     const btn = document.querySelector('button.btn-send');
                     if (input && btn) {
-                        input.focus();
-                        input.value = "";
-                        
-                        // Human-like character typing
-                        for (let i = 0; i < txt.length; i++) {
-                            const char = txt.charAt(i);
-                            input.value += char;
-                            input.dispatchEvent(new Event('input', { bubbles: true }));
-                            // Random delay between 50-150ms per char
-                            await new Promise(r => setTimeout(r, 50 + Math.random() * 100));
-                        }
-                        
                         input.dispatchEvent(new Event('change', { bubbles: true }));
-                        
-                        // Brief pause after typing before clicking send
-                        await new Promise(r => setTimeout(r, 500 + Math.random() * 500));
-                        
                         btn.disabled = false;
                         btn.click();
                         // Also trigger Enter for reliability
@@ -668,7 +686,7 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
                             bubbles: true, cancelable: true, keyCode: 13, key: 'Enter'
                         }));
                     }
-                }, text);
+                });
             } catch (e) {}
         }
 

@@ -1,9 +1,10 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { spawn } from 'child_process';
+import { spawn, fork } from 'child_process';
 import axios from 'axios';
 import dotenv from 'dotenv';
+import { bulkPost } from './api-queue.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -36,19 +37,55 @@ async function fetchRoomsForBot() {
     }
 }
 
+const activeBots = new Map();
+
+function runBot(roomId) {
+    if (activeBots.has(roomId)) return;
+    activeBots.set(roomId, true);
+    
+    console.log(`\n[MULTI-LAUNCHER] 🚀 Spawning isolated bot process for Room: ${roomId}`);
+    
+    const child = spawn('node', ['room-joiner.js', roomId], {
+        cwd: __dirname,
+        stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
+        env: { ...process.env, BOT_PROFILE: profileName }
+    });
+    
+    child.on('message', (msg) => {
+        if (msg && msg.type === 'api' && msg.payload) {
+             bulkPost(msg.payload.endpoint, msg.payload.data);
+        }
+    });
+
+    child.on('exit', (code) => {
+        console.log(`[MULTI-LAUNCHER] ⚠️ Bot ${roomId} exited with code ${code}. Restarting in 10s...`);
+        activeBots.delete(roomId);
+        setTimeout(() => runBot(roomId), 10000);
+    });
+}
+
+let discordStarted = false;
+
+function startDiscord() {
+    if (discordStarted) return;
+    discordStarted = true;
+
+    spawn('node', ['discord-server.js'], {
+        cwd: __dirname,
+        stdio: 'inherit'
+    });
+}
+
 async function run() {
+    console.log(`[MULTI-LAUNCHER] 🌐 Booting Discord Integration Server...`);
+    startDiscord();
+
     const rooms = await fetchRoomsForBot();
     console.log(`[MULTI-LAUNCHER] 🔥 Preparing to join ${rooms.length} completely separate chat rooms!`);
     
-    for (const roomId of rooms) {
-        console.log(`\n[MULTI-LAUNCHER] 🚀 Spawning isolated bot process for Room: ${roomId}`);
-        
-        // Spawn a completely independent node process for this room
-        spawn('node', ['room-joiner.js', roomId], {
-            cwd: __dirname,
-            stdio: 'inherit',
-            env: { ...process.env, BOT_PROFILE: profileName }
-        });
+    const MAX_BOTS = 5;
+    for (const roomId of rooms.slice(0, MAX_BOTS)) {
+        runBot(roomId);
         
         // Give the network 8 seconds to settle before booting the next Chrome profile
         console.log(`[MULTI-LAUNCHER] ⏳ Waiting 8 seconds before launching next room...`);

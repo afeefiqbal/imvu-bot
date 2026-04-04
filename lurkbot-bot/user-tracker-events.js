@@ -79,6 +79,8 @@ const hasResolvedName = (v) =>
     String(v).trim() !== '';
 
 export const createIncomingMessageHandler = (ctx) => {
+    const userLastReply = new Map();
+
     const handleFinalJoin = (avatarId) => {
         if (!avatarId) return;
         if (ctx.processedJoins.has(avatarId)) return;
@@ -240,7 +242,7 @@ export const createIncomingMessageHandler = (ctx) => {
                             console.log(`[JOIN][QUEUE] ${label} · profile API`);
                             handleFinalJoin(avatarId);
                             ctx.triggerCountUpdate();
-                        });
+                        }).catch(e => console.error(`[JOIN][QUEUE] Error resolving avatar ${avatarId}:`, e.message));
                     }
                 } else if (
                     avatarId &&
@@ -271,7 +273,7 @@ export const createIncomingMessageHandler = (ctx) => {
                             console.log(`[JOIN][QUEUE] ${name} · profile API`);
                             handleFinalJoin(avatarId);
                             ctx.triggerCountUpdate();
-                        });
+                        }).catch(e => console.error(`[JOIN][QUEUE] Error resolving occupant ${avatarId}:`, e.message));
                     }
                 }
 
@@ -393,7 +395,10 @@ export const createIncomingMessageHandler = (ctx) => {
                             room_id: String(ctx.roomId),
                             room_name: ctx.state.roomName,
                             discord_channel_id: ctx.discordChannelId
-                        }).catch(e => console.log(`[DISCORD-API] Error sending to bot server:`, e.message));
+                        }).catch(e => {
+                            const detail = e.response?.data || e.message;
+                            console.log(`[DISCORD-API] Error sending to bot server:`, detail);
+                        });
                     }
 
                     if (
@@ -403,9 +408,22 @@ export const createIncomingMessageHandler = (ctx) => {
                         (messageInvokesSivaCharacterAi(trimmed) ||
                             messageMentionsBot(trimmed, ctx.botMentionAliases))
                     ) {
+                        const now = Date.now();
+                        if (now - (userLastReply.get(senderId) || 0) < 15000) {
+                            console.log(`[AI-CHAT] 🚦 Ignoring ${senderLabel} (15s cooldown limit)`);
+                            continue; // Note: In a loop, continue instead of return since we want to process other records!
+                        }
+                        userLastReply.set(senderId, now);
+                        
+                        // Clean up the map occasionally
+                        if (userLastReply.size > 200) userLastReply.clear();
+
                         const dedupeKey = `${ctx.roomId}:${senderId}:${trimmed}`;
                         if (!ctx.mentionReplyDedupe.has(dedupeKey)) {
                             ctx.mentionReplyDedupe.add(dedupeKey);
+                            setTimeout(() => {
+                                ctx.mentionReplyDedupe.delete(dedupeKey);
+                            }, 15000);
                             if (ctx.mentionReplyDedupe.size > ctx.MENTION_REPLY_DEDUPE_CAP) {
                                 const first = ctx.mentionReplyDedupe.values().next().value;
                                 ctx.mentionReplyDedupe.delete(first);
@@ -442,7 +460,9 @@ export const createIncomingMessageHandler = (ctx) => {
                                             participantAvatarId: avatarForLog ?? undefined,
                                         });
                                     }
-                                } catch {}
+                                } catch (e) {
+                                    console.error(`[AI-CHAT] Error communicating with AI backend:`, e.message);
+                                }
                             })();
                         }
                     }

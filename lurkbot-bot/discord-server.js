@@ -164,7 +164,7 @@ if (!token) {
 
 // Log in and then start the Express server
 client.login(token).then(() => {
-    app.listen(3000, () => {
+    app.listen(3000, '127.0.0.1', () => {
         // Successfully bound to port
     }).on('error', (e) => {
         if (e.code === 'EADDRINUSE') {

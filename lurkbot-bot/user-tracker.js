@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { bulkPost } from './api-queue.js';
 import { getWelcomeMessage } from './welcomeMessages.js';
 import { createConversationLogger, createSendMessage } from './user-tracker-chat.js';
 import {
@@ -263,7 +264,7 @@ export async function startUserTracking(page, roomId, options = {}) {
         if (syncBotUsername) body.bot_username = syncBotUsername;
 
         try {
-            await axios.post(`${API_BASE_URL}/api/rooms/sync`, body);
+            bulkPost('/api/rooms/sync', body);
             console.log(
                 `[SYNC] room ${rid} · "${body.rooms[0].name}" · pop ${population} · ${visitors.length} visitors`
             );
@@ -309,7 +310,7 @@ export async function startUserTracking(page, roomId, options = {}) {
         console.log(`[JOIN] ${username}`);
 
         try {
-            await axios.post(`${API_BASE_URL}/api/room-users`, {
+            bulkPost('/api/room-users', {
                 username, room_id: roomId, event: 'join', timestamp: new Date().toISOString()
             });
         } catch (e) {}
@@ -322,7 +323,7 @@ export async function startUserTracking(page, roomId, options = {}) {
         if (username === BOT_USERNAME) return;
 
         try {
-            await axios.post(`${API_BASE_URL}/api/room-users`, {
+            bulkPost('/api/room-users', {
                 username, room_id: roomId, event: 'leave', timestamp: new Date().toISOString()
             });
         } catch (e) {}
@@ -476,16 +477,20 @@ export async function startUserTracking(page, roomId, options = {}) {
         welcomeTimestamps,
     });
 
+    let roomNameRetries = 0;
+    let checkRoomNameInterval = null;
     if (process.env.DISCORD_BOT_API_URL) {
         // Wait until roomName is successfully scraped from IMVU before initializing Discord channel
-        const checkRoomNameInterval = setInterval(async () => {
+        checkRoomNameInterval = setInterval(async () => {
+            roomNameRetries++;
             const cleanName = (state.roomName || '').toLowerCase().replace(/[^a-z]/g, '');
             // Do not accept any variation of the generic loading page title
-            if (state.roomName && !cleanName.includes('imvunext') && cleanName !== 'imvu' && state.roomName !== 'Unknown') {
+            if ((state.roomName && !cleanName.includes('imvunext') && cleanName !== 'imvu' && state.roomName !== 'Unknown') || roomNameRetries >= 40) {
                 clearInterval(checkRoomNameInterval);
+                checkRoomNameInterval = null;
                 axios.post(process.env.DISCORD_BOT_API_URL.replace('imvu-chat', 'imvu-init-room'), {
                     room_id: String(roomId),
-                    room_name: state.roomName,
+                    room_name: state.roomName || 'Unknown Room',
                     discord_channel_id: options.discordChannelId
                 }).catch(()=>null);
             } else {
@@ -495,11 +500,27 @@ export async function startUserTracking(page, roomId, options = {}) {
         }, 1500);
     }
 
-    setInterval(() => {
+    const syncIntervalId = setInterval(() => {
         if (state.botJoinedChat) {
             scheduleDashboardSync();
         }
     }, 45000);
+
+    const cleanupIntervalId = setInterval(() => {
+        if (processedJoins.size > 500) processedJoins.clear();
+        if (mentionReplyDedupe.size > 500) mentionReplyDedupe.clear();
+        if (welcomeTimestamps.size > 500) welcomeTimestamps.clear();
+    }, 60000);
+
+    // CRITICAL FIX: Ensure intervals are cleared and page references dropped when page closes!
+    page.on('close', () => {
+        if (checkRoomNameInterval) clearInterval(checkRoomNameInterval);
+        clearInterval(syncIntervalId);
+        clearInterval(cleanupIntervalId);
+        if (dashboardSyncTimer) clearTimeout(dashboardSyncTimer);
+        if (countTimer) clearTimeout(countTimer);
+        if (state.welcomeArrivalsEnableTimer) clearTimeout(state.welcomeArrivalsEnableTimer);
+    });
 
     globalMessageHandler = (data) => {
         void handleIncomingMessage(data);
