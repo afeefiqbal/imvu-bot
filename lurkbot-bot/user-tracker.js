@@ -276,11 +276,13 @@ export async function startUserTracking(page, roomId, options = {}) {
         const fromApi = await fetchRoomDetailsFromApi();
         if (fromApi?.name) {
             ROOM_NAME = fromApi.name;
+            state.roomName = ROOM_NAME;
             console.log(`[ROOM] ${ROOM_NAME} (api)`);
         } else {
             const fromDom = await fetchRoomTitleFromDom();
             if (fromDom) {
                 ROOM_NAME = fromDom;
+                state.roomName = ROOM_NAME;
                 console.log(`[ROOM] ${ROOM_NAME} (dom)`);
             }
         }
@@ -290,6 +292,18 @@ export async function startUserTracking(page, roomId, options = {}) {
     const botMentionAliases = collectBotMentionAliases(BOT_USERNAME, BOT_DISPLAY_NAME);
     const logConversationTurn = createConversationLogger({ apiBaseUrl: API_BASE_URL, roomId });
     const sendMessage = createSendMessage({ page, logConversationTurn });
+
+    // Listen to incoming messages from the dynamically generated Discord Room Channels
+    if (global.discordBridge) {
+        global.discordBridge.on('chat', async ({ targetRoomId, content }) => {
+            if (!state.botJoinedChat) return;
+            
+            // We now map based on the absolute Room ID extracted from the Discord Channel Topic!
+            if (targetRoomId === String(roomId)) {
+                await sendMessage(content);
+            }
+        });
+    }
 
     const onJoin = async (username) => {
         console.log(`[JOIN] ${username}`);
@@ -437,6 +451,7 @@ export async function startUserTracking(page, roomId, options = {}) {
         API_BASE_URL,
         BOT_DISPLAY_NAME,
         BOT_USERNAME,
+        discordChannelId: options.discordChannelId,
         MENTION_REPLY_DEDUPE_CAP,
         activeJoinSessions,
         announceJoinQueuePresence,
@@ -460,6 +475,25 @@ export async function startUserTracking(page, roomId, options = {}) {
         triggerCountUpdate,
         welcomeTimestamps,
     });
+
+    if (process.env.DISCORD_BOT_API_URL) {
+        // Wait until roomName is successfully scraped from IMVU before initializing Discord channel
+        const checkRoomNameInterval = setInterval(async () => {
+            const cleanName = (state.roomName || '').toLowerCase().replace(/[^a-z]/g, '');
+            // Do not accept any variation of the generic loading page title
+            if (state.roomName && !cleanName.includes('imvunext') && cleanName !== 'imvu' && state.roomName !== 'Unknown') {
+                clearInterval(checkRoomNameInterval);
+                axios.post(process.env.DISCORD_BOT_API_URL.replace('imvu-chat', 'imvu-init-room'), {
+                    room_id: String(roomId),
+                    room_name: state.roomName,
+                    discord_channel_id: options.discordChannelId
+                }).catch(()=>null);
+            } else {
+                // Manually trigger a refresh if it hasn't happened yet
+                await refreshRoomName().catch(()=>null);
+            }
+        }, 1500);
+    }
 
     setInterval(() => {
         if (state.botJoinedChat) {

@@ -382,6 +382,20 @@ export const createIncomingMessageHandler = (ctx) => {
                         content: trimmed,
                     });
 
+                    // Option 2: Forward chat event to external Discord Bot Server
+                    if (process.env.DISCORD_BOT_API_URL) {
+                        void axios.post(process.env.DISCORD_BOT_API_URL, {
+                            event: 'imvu_chat',
+                            direction: direction,   // 'IN' from user, 'OUT' from bot
+                            username: senderLabel,
+                            imvu_avatar_id: avatarForLog,
+                            message: trimmed,
+                            room_id: String(ctx.roomId),
+                            room_name: ctx.state.roomName,
+                            discord_channel_id: ctx.discordChannelId
+                        }).catch(e => console.log(`[DISCORD-API] Error sending to bot server:`, e.message));
+                    }
+
                     if (
                         direction === 'IN' &&
                         senderId != null &&

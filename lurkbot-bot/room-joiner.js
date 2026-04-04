@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import './discord-server.js';
 import puppeteer from 'puppeteer';
 import fs from 'fs';
 import path from 'path';
@@ -15,7 +16,6 @@ dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
 const BOT_NAME = "RoomJoiner";
 const BOTS_FILE = path.join(__dirname, 'bots.json');
-const USER_DATA_DIR = path.join(__dirname, 'profiles', BOT_NAME);
 const API_BASE_URL = process.env.APP_URL || 'http://localhost:8000';
 
 if (!fs.existsSync(BOTS_FILE)) {
@@ -25,9 +25,9 @@ if (!fs.existsSync(BOTS_FILE)) {
 
 // Settings will be fetched from backend or bots.json inside startJoiner
 
-const cleanupProfileLock = () => {
+const cleanupProfileLock = (profileDir) => {
     try {
-        const lockPath = path.join(USER_DATA_DIR, 'SingletonLock');
+        const lockPath = path.join(profileDir, 'SingletonLock');
         if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath);
     } catch (e) { }
 };
@@ -222,8 +222,6 @@ const activateAvatar = async (page) => {
 let botMatch = { username: '', password: '', profile: 'S1VA' };
 
 const startJoiner = async (roomId = '') => {
-    cleanupProfileLock();
-    
     // Fetch settings from backend if not provided via CLI or if we want to sync with backend
     const profileName = process.env.BOT_PROFILE || 'Bot-Alpha';
     console.log(`[${BOT_NAME}] 📡 Fetching settings for profile: ${profileName}...`);
@@ -245,14 +243,31 @@ const startJoiner = async (roomId = '') => {
         
         // Use assigned room ID if none provided
         if (!roomId && backendBot.room_ids) {
-            // Take the first room ID from the list (comma separated or single)
+            // Take all rooms assigned to this bot
             const roomList = backendBot.room_ids.split(',').map(id => {
                 const trimmed = id.trim();
-                // Extract room ID from full URLs like https://www.imvu.com/next/chat/room-203390141-3573/
                 const urlMatch = trimmed.match(/room-([\d-]+)/);
                 return urlMatch ? urlMatch[1] : trimmed;
-            });
-            roomId = roomList[0];
+            }).filter(Boolean);
+            
+            roomId = roomList[0]; // The current process will take the first room
+            
+            // Instantly branch off new transparent processes for any additional rooms!
+            if (roomList.length > 1) {
+                console.log(`[${BOT_NAME}] 👯 Detected ${roomList.length} rooms! Spawning isolated clones...`);
+                // Use dynamic import so it doesn't clutter top imports
+                import('child_process').then(({ spawn }) => {
+                    for (let i = 1; i < roomList.length; i++) {
+                        console.log(`[${BOT_NAME}] 🚀 Branching clone for Room: ${roomList[i]}`);
+                        // Launch identical copy of itself specifically targeted to the next room
+                        spawn('node', [path.basename(__filename), roomList[i]], {
+                            cwd: __dirname,
+                            stdio: 'inherit', // Shares the same terminal window output!
+                            env: process.env
+                        });
+                    }
+                });
+            }
         }
         
         // Fallback to default if still no roomId
@@ -273,9 +288,12 @@ const startJoiner = async (roomId = '') => {
         process.exit(1);
     }
 
+    const activeProfileDir = path.join(__dirname, 'profiles', `${BOT_NAME}_${roomId}`);
+    cleanupProfileLock(activeProfileDir);
+
     const browser = await puppeteer.launch({
         headless: true, // Switched to headless
-        userDataDir: USER_DATA_DIR,
+        userDataDir: activeProfileDir,
         args: [
             '--no-sandbox', 
             '--disable-setuid-sandbox', 
@@ -299,6 +317,7 @@ const startJoiner = async (roomId = '') => {
     await startUserTracking(page, roomId, {
         botName: profileName,
         botUsername: botMatch.username,
+        discordChannelId: botMatch.discord_channel_id || (typeof backendBot !== 'undefined' ? backendBot?.discord_channel_id : undefined)
     });
 
     await page.goto(`https://www.imvu.com/next/chat/room-${roomId}/`, { waitUntil: 'domcontentloaded' });
