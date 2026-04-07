@@ -1,57 +1,246 @@
 import puppeteer from 'puppeteer';
 import axios from 'axios';
 import dotenv from 'dotenv';
+import express from 'express';
 import fs from 'fs';
 import path from 'path';
+import { EventEmitter } from 'events';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
-
-dotenv.config();
+import { startUserTracking } from './user-tracker.js';
+import { parseProxyFromProcessEnv, resolveChromeProxy, proxyConfigured } from './proxy-env.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const BOT_NAME      = process.env.BOT_NAME      || 'UnnamedBot';
-const roomId = process.argv[2] || 'default';
-const USER_DATA_DIR = path.resolve(
-  __dirname,
-  'profiles',
-  `${BOT_NAME}-${roomId}`
-);
-const BOT_PROXY     = process.env.BOT_PROXY     || null;
-const BACKEND_URL   = "http://127.0.0.1:8000";
+dotenv.config({ path: path.join(__dirname, '..', '.env') });
+
+if (!global.discordBridge) {
+    global.discordBridge = new EventEmitter();
+}
+global.discordBridge.setMaxListeners(0);
+
+/** Same as room-joiner: discord-server POSTs here so messages reach this Node process. */
+function startDiscordRelayForBot(botLabel) {
+    const portRaw = (process.env.IMVU_DISCORD_RELAY_PORT || '').trim();
+    if (!portRaw) {
+        console.log(
+            `[${botLabel}] IMVU_DISCORD_RELAY_PORT unset — Discord→IMVU relay off (multi-launcher sets this per bot)`
+        );
+        return null;
+    }
+    const port = parseInt(portRaw, 10);
+    if (!Number.isFinite(port) || port <= 0) return null;
+    const app = express();
+    app.use(express.json());
+    app.post('/discord-relay', (req, res) => {
+        try {
+            const { targetRoomId, content } = req.body || {};
+            if (targetRoomId != null && content != null && global.discordBridge) {
+                global.discordBridge.emit('chat', {
+                    targetRoomId: String(targetRoomId),
+                    content: String(content),
+                });
+            }
+            res.json({ ok: true });
+        } catch {
+            res.status(500).json({ ok: false });
+        }
+    });
+    const srv = app.listen(port, '127.0.0.1', () => {
+        console.log(`[${botLabel}] Discord→IMVU relay on http://127.0.0.1:${port}/discord-relay`);
+    });
+    srv.on('error', (e) => {
+        console.error(`[${botLabel}] Discord relay :${port} — ${e.message}`);
+    });
+    return srv;
+}
+
+function trackerRoomId(raw) {
+    const s = String(raw ?? '').trim();
+    const m = s.match(/room-([\d-]+)/i);
+    if (m) return m[1];
+    const m2 = s.match(/(\d+-\d+)/);
+    return m2 ? m2[1] : s.replace(/[^\d-]/g, '') || s;
+}
+
+/** multi-launcher picks a new proxy when child exits with this code (pool/Webshare). */
+const EXIT_PROXY_ROTATE = 2;
+
+function isHealthyImvuRoomUrl(u) {
+    if (!u || typeof u !== 'string') return false;
+    if (u.startsWith('chrome-error://')) return false;
+    return u.includes('imvu.com/next/chat') && u.includes('room-');
+}
+
+function listHealthyImvuRoomPages(pages) {
+    return pages.filter((p) => {
+        try {
+            return isHealthyImvuRoomUrl(p.url());
+        } catch {
+            return false;
+        }
+    });
+}
+
+function proxyTunnelFailed(message) {
+    return /ERR_TUNNEL_CONNECTION_FAILED|ERR_PROXY_CONNECTION_FAILED|ERR_NO_SUPPORTED_PROXIES/i.test(
+        String(message || '')
+    );
+}
+
+/**
+ * Node HTTPS via HTTP CONNECT — mirrors what Chrome needs. Fails fast before launching the browser.
+ * IMVU_SKIP_PROXY_PREFLIGHT=1 to skip.
+ */
+async function proxyHttpsPreflight(parsed) {
+    if (process.env.IMVU_SKIP_PROXY_PREFLIGHT === '1' || process.env.IMVU_SKIP_PROXY_PREFLIGHT === 'true') {
+        return true;
+    }
+    if (!proxyConfigured(parsed)) return true;
+    const withProto = parsed.serverForChrome.includes('://')
+        ? parsed.serverForChrome
+        : `http://${parsed.serverForChrome}`;
+    let u;
+    try {
+        u = new URL(withProto);
+    } catch {
+        return true;
+    }
+    if (!u.hostname) return true;
+    const port = parseInt(u.port || '80', 10);
+    const proxy = { protocol: 'http', host: u.hostname, port };
+    if (parsed.auth?.username) {
+        proxy.auth = { username: parsed.auth.username, password: parsed.auth.password || '' };
+    }
+    try {
+        await axios.get('https://www.imvu.com/', {
+            timeout: 22000,
+            proxy,
+            validateStatus: () => true,
+            maxRedirects: 5,
+        });
+        return true;
+    } catch (e) {
+        console.warn(`[proxy-preflight] ${e.message}`);
+        return false;
+    }
+}
+
+const BACKEND_URL = process.env.APP_URL || 'http://127.0.0.1:8000';
+
+/** IMVU “Join room” CTA — wait + click instead of racing evaluate(). */
+const JOIN_ROOM_BTN_SELECTOR = 'button.cs2-btn-primary, button[class*="join"], .btn-join';
+const MAX_ROOM_TABS = Math.max(1, parseInt(process.env.IMVU_MAX_TABS || '20', 10));
+
+async function applyProxyAuthToPage(page, auth) {
+    if (!page || page.isClosed() || !auth) return;
+    await page.authenticate({ username: auth.username, password: auth.password || '' });
+}
+
+async function wireProxyAuthForBrowser(browser, auth) {
+    if (!auth) return;
+    const hook = async (pg) => {
+        try {
+            await applyProxyAuthToPage(pg, auth);
+        } catch (e) {
+            console.warn(`[imvu-bot] proxy authenticate:`, e.message);
+        }
+    };
+    browser.on('targetcreated', async (target) => {
+        const pg = await target.page();
+        if (pg) await hook(pg);
+    });
+    for (const pg of await browser.pages()) await hook(pg);
+}
+
+function cleanupProfileLock(profileDir) {
+    for (const name of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+        try {
+            const p = path.join(profileDir, name);
+            if (fs.existsSync(p)) fs.unlinkSync(p);
+        } catch {}
+    }
+}
 
 (async () => {
     try {
-        console.log(`🚀 Starting ${BOT_NAME} (Alexa) in SIMPLE mode...`);
-        
+        const BOT_NAME = (process.env.BOT_NAME || '').trim();
+        if (!BOT_NAME) {
+            console.error('imvu-bot: BOT_NAME is required');
+            process.exit(1);
+        }
+        console.log('RUNNING BOT:', process.env.BOT_NAME);
+
+        const USER_DATA_DIR = path.resolve(__dirname, 'profiles', BOT_NAME);
+        cleanupProfileLock(USER_DATA_DIR);
+        const parsed = parseProxyFromProcessEnv();
+        const chromeProxy = resolveChromeProxy(parsed);
+
+        const credRes = await axios.get(`${BACKEND_URL}/api/bots/${encodeURIComponent(BOT_NAME)}`);
+        if (!credRes.data?.username) {
+            throw new Error(`Bot not found: ${BOT_NAME}`);
+        }
+        /** No password / no login here — session must exist in this profile (e.g. room-joiner logged in once). */
+        const botMatch = {
+            username: credRes.data.username,
+            profile: credRes.data.profile || credRes.data.name || BOT_NAME,
+            discordChannelId: credRes.data.discord_channel_id || null,
+        };
+
+        console.log(
+            `[${BOT_NAME}] BOOT | profileDir=${USER_DATA_DIR} | account=${botMatch.username} | proxy=${parsed.redacted}` +
+                (parsed.auth && !chromeProxy.usePageAuthenticate ? ' | proxy-auth=embedded' : '') +
+                ` | login=room-joiner only`
+        );
+        if (!process.env.DISCORD_BOT_API_URL) {
+            console.warn(
+                `[${BOT_NAME}] DISCORD_BOT_API_URL unset — no Discord mirror/init (set e.g. http://127.0.0.1:3000/api/imvu-chat)`
+            );
+        }
+
+        if (proxyConfigured(parsed)) {
+            const tunnelOk = await proxyHttpsPreflight(parsed);
+            if (!tunnelOk) {
+                console.error(
+                    `[${BOT_NAME}] Proxy HTTPS tunnel test failed before Chrome (Node CONNECT). ` +
+                        `Check with curl using the same host:port and proxy auth as BOT_PROXY_HOST / BOT_PROXY_USER (or a single BOT_PROXY URL). ` +
+                        `If that fails, the proxy cannot tunnel HTTPS — not a Puppeteer-only bug. ` +
+                        `For IMVU chat prefer sticky residential/ISP proxies; datacenter IPs often break WSS. ` +
+                        `Webshare: try WEBSHARE_PROXY_MODE=backbone. Exiting ${EXIT_PROXY_ROTATE} for launcher rotation.`
+                );
+                process.exit(EXIT_PROXY_ROTATE);
+            }
+        }
+
         const launchArgs = [
-            "--start-maximized", 
-            "--no-sandbox", 
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled"
+            '--start-maximized',
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-blink-features=AutomationControlled',
         ];
-        if (BOT_PROXY) launchArgs.push(`--proxy-server=${BOT_PROXY}`);
+        if (chromeProxy.arg) {
+            launchArgs.push(`--proxy-server=${chromeProxy.arg}`);
+        }
 
         const browser = await puppeteer.launch({
-            headless: true,
+            headless: 'new',
             executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
             userDataDir: USER_DATA_DIR,
             args: launchArgs,
-            defaultViewport: null
+            defaultViewport: null,
         });
+
+        await wireProxyAuthForBrowser(browser, chromeProxy.usePageAuthenticate ? parsed.auth : null);
+
+        startDiscordRelayForBot(BOT_NAME);
 
         const pages = await browser.pages();
         const page = pages.length > 0 ? pages[0] : await browser.newPage();
-
-        // --- LOAD CREDENTIALS ---
-        const botsPath = path.resolve(__dirname, 'bots.json');
-        const bots = JSON.parse(fs.readFileSync(botsPath, 'utf8'));
-        const botMatch = bots.find(b => b.username === BOT_NAME) || bots[0];
-        console.log(`[${BOT_NAME}] Using account: ${botMatch.username}`);
-
-        console.log(`[${BOT_NAME}] Fetching target rooms for bot...`);
+        if (chromeProxy.usePageAuthenticate && parsed.auth) await applyProxyAuthToPage(page, parsed.auth);
+        
+        console.log(`[${BOT_NAME}] Fetching target rooms for bot from dashboard...`);
         let initialRooms = [];
         try {
             const res = await axios.post(`${BACKEND_URL}/api/rooms/sync`, { rooms: [], bot_name: BOT_NAME, bot_username: botMatch.username });
@@ -63,66 +252,57 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
         }
 
         const firstRoom = initialRooms.length > 0 ? initialRooms[0] : '255338726-5';
+        const initialRoomId = trackerRoomId(firstRoom);
 
-        // --- STEP 1: Go directly to the first room ---
-        console.log(`[${BOT_NAME}] Using account: ${botMatch.username}`);
-        console.log(`[${BOT_NAME}] Going to initial room: ${firstRoom}...`);
-        await page.goto(`https://www.imvu.com/next/chat/room-${firstRoom}/`, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => null);
+        console.log(`[${BOT_NAME}] Using account (API): ${botMatch.username}`);
+        console.log(`[${BOT_NAME}] Opening room (session from profile only — run room-joiner if guest): ${initialRoomId}`);
+        let firstNavOk = false;
+        try {
+            await page.goto(`https://www.imvu.com/next/chat/room-${initialRoomId}/`, {
+                waitUntil: 'domcontentloaded',
+                timeout: 60000,
+            });
+            if (page.url().startsWith('chrome-error://')) {
+                throw new Error(`chrome-error after navigation: ${page.url()}`);
+            }
+            firstNavOk = true;
+        } catch (e) {
+            console.error(`[${BOT_NAME}] ❌ First room navigation failed: ${e.message}`);
+            if (parsed.serverForChrome && proxyTunnelFailed(e.message)) {
+                console.error(
+                    `[${BOT_NAME}] Proxy CONNECT tunnel failed — exiting ${EXIT_PROXY_ROTATE} so multi-launcher can rotate proxy`
+                );
+                process.exit(EXIT_PROXY_ROTATE);
+            }
+            process.exit(1);
+        }
+
+        await startUserTracking(page, initialRoomId, {
+            botName: BOT_NAME,
+            botUsername: botMatch.username,
+            discordChannelId: botMatch.discordChannelId,
+        });
         await new Promise(r => setTimeout(r, 5000));
         await page.screenshot({ path: path.join(__dirname, 'debug-bot.png') });
 
-        // --- STEP 2: Check if guest (login-link visible in nav) ---
-        const isGuest = await page.$('.login-link') !== null;
-        console.log(`[${BOT_NAME}] Guest mode: ${isGuest}`);
-
-        if (isGuest) {
-            console.log(`[${BOT_NAME}] Clicking LOG IN nav link...`);
-            await page.click('.login-link');
-            await new Promise(r => setTimeout(r, 3000));
-            await page.screenshot({ path: path.join(__dirname, 'debug-bot.png') });
-
-            // Wait for the modal login form
-            await page.waitForSelector('input[type="password"]', { timeout: 15000 }).catch(() => null);
-
-            try {
-                const usernameInput = await page.$('input[type="text"], input[type="email"]');
-                const passwordInput = await page.$('input[type="password"]');
-
-                if (usernameInput) {
-                    await usernameInput.click({ clickCount: 3 });
-                    await usernameInput.type(botMatch.username, { delay: 60 });
-                    console.log(`[${BOT_NAME}] Typed username: ${botMatch.username}`);
-                }
-                if (passwordInput) {
-                    await passwordInput.click({ clickCount: 3 });
-                    await passwordInput.type(botMatch.password, { delay: 60 });
-                    console.log(`[${BOT_NAME}] Typed password.`);
-                }
-
-                // Press Enter to submit
-                await page.keyboard.press('Enter');
-                console.log(`[${BOT_NAME}] Submitted. Waiting for login...`);
-                await new Promise(r => setTimeout(r, 8000));
-                await page.screenshot({ path: path.join(__dirname, 'debug-bot.png') });
-            } catch (err) {
-                console.error(`[${BOT_NAME}] Login error: ${err.message}`);
-            }
-        } else {
-            console.log(`[${BOT_NAME}] Already logged in!`);
+        const guestLink = await page.$('.login-link');
+        if (guestLink) {
+            console.error(
+                `[${BOT_NAME}] SESSION NOT READY: guest UI (.login-link). imvu-bot does not log in.\n` +
+                    `  Run once per bot (saves cookies): BOT_NAME=${BOT_NAME} node room-joiner.js "<room-ids>"\n` +
+                    `  Profile dir: profiles/${BOT_NAME}/ — then restart this process.`
+            );
         }
 
-        // --- STEP 3: Click Join if visible ---
+        // --- Join if still on preview (same profile should already be logged in) ---
         console.log(`[${BOT_NAME}] Checking for Join button...`);
-        const joinBtn = await page.waitForSelector('button.cs2-btn-primary, button[class*="join"]', { timeout: 15000 }).catch(() => null);
-        if (joinBtn) {
-            console.log(`[${BOT_NAME}] Forcing JOIN click via evaluate...`);
-            await page.evaluate(() => {
-                const btn = document.querySelector('button.cs2-btn-primary, button[class*="join"]');
-                if (btn) btn.click();
-            });
-            await new Promise(r => setTimeout(r, 8000));
-        } else {
-            console.log(`[${BOT_NAME}] Already in room or no join button found.`);
+        try {
+            await page.waitForSelector(JOIN_ROOM_BTN_SELECTOR, { timeout: 30000, visible: true });
+            await page.click(JOIN_ROOM_BTN_SELECTOR).catch(() => null);
+            console.log(`[${BOT_NAME}] Join click sent (waitForSelector + click).`);
+            await new Promise((r) => setTimeout(r, 8000));
+        } catch {
+            console.log(`[${BOT_NAME}] Already in room or no join button within 30s.`);
         }
 
         let lastSyncHash = "";
@@ -153,7 +333,12 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
             isSyncing = true;
             try {
                 const allPages = await browser.pages();
-                const imvuPages = allPages.filter(p => p.url().includes('imvu.com/next/chat') && p.url().includes('room-'));
+                for (const p of allPages) {
+                    try {
+                        if (p.url().startsWith('chrome-error://')) await p.close().catch(() => null);
+                    } catch {}
+                }
+                const imvuPages = listHealthyImvuRoomPages(await browser.pages());
                 const roomsToSync = [];
                 
                 console.log(`[${BOT_NAME}] Sync: Detected ${imvuPages.length} active IMVU room pages.`);
@@ -191,14 +376,21 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
                     }).catch(() => null);
 
                     if (data) {
-                        roomsToSync.push({
-                            id: String(roomId).trim(),
-                            name: data.roomName,
-                            image_url: data.roomUrl,
-                            visitors: data.visitors,
-                            population: data.population || 0
-                        });
+                        const rn = String(data.roomName || '').trim();
+                        if (/^www\.imvu\.com$/i.test(rn)) {
+                            console.warn(
+                                `[${BOT_NAME}] Skipping dashboard sync for room ${roomId} — error/placeholder title "${rn}" (proxy or load failure)`
+                            );
+                        } else {
+                            roomsToSync.push({
+                                id: String(roomId).trim(),
+                                name: data.roomName,
+                                image_url: data.roomUrl,
+                                visitors: data.visitors,
+                                population: data.population || 0,
+                            });
                         }
+                    }
                 }
                 
                 const currentHash = JSON.stringify(roomsToSync);
@@ -238,12 +430,15 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
                     // Background Room Management
                     (async () => {
                         const currentTargets = Array.from(targetRooms);
-                        const imvuPages = (await browser.pages()).filter(pg => pg.url().includes('imvu.com/next/chat') && pg.url().includes('room-'));
+                        const imvuPages = listHealthyImvuRoomPages(await browser.pages());
                         
                         // 1. Join new global target rooms
                         for (const tRoom of currentTargets) {
-                            const normalized = tRoom;
-                            const isAlreadyOpen = imvuPages.some(pg => pg.url().includes(`room-${normalized}`));
+                            const normalized = trackerRoomId(tRoom);
+                            const isAlreadyOpen = imvuPages.some((pg) => {
+                                const m = pg.url().match(/room-([\d-]+)/);
+                                return m && m[1] === normalized;
+                            });
                             
                             if (isAlreadyOpen) {
                                 // console.log(`[${BOT_NAME}] Room ${normalized} already open in a tab.`);
@@ -255,22 +450,44 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
                                 continue;
                             }
 
-                            const MAX_TABS = 10;
-                            if (imvuPages.length >= MAX_TABS) {
-                                console.log(`[${BOT_NAME}] ⚠️ Max tabs reached. Skipping new room.`);
+                            if (imvuPages.length >= MAX_ROOM_TABS) {
+                                console.log(
+                                    `[${BOT_NAME}] MAX TABS HIT (${MAX_ROOM_TABS}) — skipping new room. Raise IMVU_MAX_TABS if needed.`
+                                );
                                 continue;
                             }
 
                             joiningRooms.add(normalized);
                             console.log(`[${BOT_NAME}] 🆕 JOIN COMMAND: Opening new tab for Room ${normalized}`);
+                            const roomUrl = `https://www.imvu.com/next/chat/room-${normalized}/`;
+                            let newPage = null;
                             try {
-                                const newPage = await browser.newPage();
-                                await newPage.goto(`https://www.imvu.com/next/chat/room-${normalized}/`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+                                newPage = await browser.newPage();
+                                if (chromeProxy.usePageAuthenticate && parsed.auth) {
+                                    await applyProxyAuthToPage(newPage, parsed.auth);
+                                }
+                                await newPage.goto(roomUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+                                if (newPage.url().startsWith('chrome-error://')) {
+                                    throw new Error(`chrome-error after navigation: ${newPage.url()}`);
+                                }
+                                await startUserTracking(newPage, trackerRoomId(normalized), {
+                                    botName: BOT_NAME,
+                                    botUsername: botMatch.username,
+                                    discordChannelId: botMatch.discordChannelId,
+                                });
                             } catch (err) {
                                 console.error(`[${BOT_NAME}] ❌ FAILED to open Room ${normalized}: ${err.message}`);
+                                if (newPage && !newPage.isClosed()) {
+                                    await newPage.close().catch(() => null);
+                                }
+                                if (parsed.serverForChrome && proxyTunnelFailed(err.message)) {
+                                    console.error(
+                                        `[${BOT_NAME}] Proxy CONNECT tunnel failed — exiting ${EXIT_PROXY_ROTATE} so multi-launcher can rotate proxy`
+                                    );
+                                    process.exit(EXIT_PROXY_ROTATE);
+                                }
                             } finally {
-                                // Give it 30s to load before we allow trying again
-                                setTimeout(() => joiningRooms.delete(normalized), 30000);
+                                setTimeout(() => joiningRooms.delete(normalized), 10000);
                             }
                         }
 
@@ -312,7 +529,7 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
                 
                 // --- DEBUG: Save screenshot every interval to see what the bot sees ---
                 if (imvuPages.length > 0) {
-                    await imvuPages[0].screenshot({ path: path.join(__dirname, 'debug-bot.png') }).catch(() => null);
+                    await imvuPages[0].screenshot({ path: path.join(__dirname, `${botMatch.username}-status.png`) }).catch(() => null);
                 }
 
             } catch (e) { /* ignore */ }
@@ -324,7 +541,9 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
         // --- PERIODIC ENGAGEMENT ---
         setInterval(async () => {
             const allPages = await browser.pages();
-            const imvuPages = allPages.filter(p => p.url().includes('imvu.com/next/chat'));
+            const imvuPages = allPages.filter(
+                (p) => p.url().includes('imvu.com/next/chat') && !p.url().startsWith('chrome-error://')
+            );
 
             for (const p of imvuPages) {
                 const u = p.url();
@@ -351,7 +570,9 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
             isListening = true;
             try {
                 const allPages = await browser.pages();
-                const imvuPages = allPages.filter(p => p.url().includes('imvu.com/next/chat'));
+                const imvuPages = allPages.filter(
+                    (p) => p.url().includes('imvu.com/next/chat') && !p.url().startsWith('chrome-error://')
+                );
 
                 for (const p of imvuPages) {
                     const match = p.url().match(/room-([\d\-]+)/);
@@ -404,7 +625,7 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
                     if (pageState.error) {
                         console.log(`[${BOT_NAME}][Room:${roomId}] Room Blocker: ${pageState.error}`);
                         if (pageState.error === 'LOGGED_OUT') {
-                             console.log(`[${BOT_NAME}] Session expired on this tab. Bot might need re-login.`);
+                            console.log(`[${BOT_NAME}] Session expired on tab — restart room-joiner for this bot to refresh cookies.`);
                         }
                     }
 
@@ -434,21 +655,27 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
                     if (pageState.hasJoinBtn && !pageState.isJoined) {
                         console.log(`[${BOT_NAME}][Room:${roomId}] Join button visible! Clicking...`);
                         try {
-                            const btn = await p.$('button.cs2-btn-primary, button[class*="join"], .btn-join');
-                            if (btn) {
-                                const box = await btn.boundingBox();
-                                if (box) {
-                                    await p.mouse.move(box.x + box.width/2, box.y + box.height/2);
-                                    await p.mouse.down();
-                                    await new Promise(r => setTimeout(r, 100));
-                                    await p.mouse.up();
-                                    console.log(`[${BOT_NAME}][Room:${roomId}] Precision click sent.`);
-                                } else {
-                                    await btn.click();
+                            await p.waitForSelector(JOIN_ROOM_BTN_SELECTOR, { timeout: 30000, visible: true });
+                            await p.click(JOIN_ROOM_BTN_SELECTOR).catch(() => null);
+                            console.log(`[${BOT_NAME}][Room:${roomId}] Join click (waitForSelector + click).`);
+                        } catch (e) {
+                            try {
+                                const btn = await p.$(JOIN_ROOM_BTN_SELECTOR);
+                                if (btn) {
+                                    const box = await btn.boundingBox();
+                                    if (box) {
+                                        await p.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+                                        await p.mouse.down();
+                                        await new Promise((r) => setTimeout(r, 100));
+                                        await p.mouse.up();
+                                        console.log(`[${BOT_NAME}][Room:${roomId}] Fallback precision click.`);
+                                    } else {
+                                        await btn.click();
+                                    }
                                 }
-                                await new Promise(r => setTimeout(r, 5000));
-                            }
-                        } catch (e) { /* ignore */ }
+                            } catch (_) { /* ignore */ }
+                        }
+                        await new Promise((r) => setTimeout(r, 5000));
                     }
 
                     if (pageState.isJoined && !state.isJoined) {
@@ -561,8 +788,9 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
                     }).catch(() => ({ results: [], visitorsMapSize: 0 }));
 
                     const chatDataArray = syncData.results;
- 
-                    // Process all new messages
+
+                    // CDP user-tracker handles Discord, welcomes, mention replies — enable DOM duplicate path only if needed.
+                    if (process.env.IMVU_DOM_CHAT_AI === '1') {
                     for (const chat of chatDataArray) {
                         // 1. FILTER: Ignore bot's own activity or unknown users
                         const botNames = [botMatch.username.toLowerCase(), BOT_NAME.toLowerCase(), 's1va', 'siva', 'you'];
@@ -635,7 +863,8 @@ const BACKEND_URL   = "http://127.0.0.1:8000";
                             }
                         } catch (err) { }
                     }
-                    
+                    }
+
                     if (processedGlobal.size > 1000) {
                         const arr = Array.from(processedGlobal).slice(-500);
                         processedGlobal.clear();

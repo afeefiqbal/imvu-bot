@@ -34,6 +34,10 @@ class ImvuBotResource extends Resource
                     ->password()
                     ->required()
                     ->maxLength(255),
+                Forms\Components\TextInput::make('discord_channel_id')
+                    ->label('Discord guild or parent channel ID')
+                    ->helperText('Used by discord-server to create per-room channels. Falls back to DISCORD_CHANNEL_ID in .env if empty.')
+                    ->maxLength(255),
                 Forms\Components\TagsInput::make('room_ids')
                     ->label('Target Rooms')
                     ->placeholder('Add Room ID and press enter')

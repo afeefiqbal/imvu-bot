@@ -21,39 +21,28 @@ import {
  * Intercepts frames directly from the network layer.
  */
 
-let globalMessageHandler = () => {};
+export const attachToPageCDP = async (page, onMessage) => {
+    try {
+        const session = await page.target().createCDPSession();
+        await session.send('Network.enable');
 
-export const attachToAllTargets = async (browser) => {
-    const attachSession = async (target) => {
-        try {
-            const session = await target.createCDPSession();
-            await session.send('Network.enable');
+        session.on('Network.webSocketFrameReceived', ({ response }) => {
+            try {
+                const data = JSON.parse(response.payloadData);
+                onMessage(data);
+            } catch {}
+        });
 
-            session.on('Network.webSocketFrameReceived', ({ response }) => {
-                try {
-                    const data = JSON.parse(response.payloadData);
-                    globalMessageHandler(data);
-                } catch {}
-            });
+        session.on('Network.webSocketFrameSent', ({ response }) => {
+            try {
+                const data = JSON.parse(response.payloadData);
+                onMessage(data);
+            } catch {}
+        });
 
-            session.on('Network.webSocketFrameSent', ({ response }) => {
-                try {
-                    const data = JSON.parse(response.payloadData);
-                    globalMessageHandler(data);
-                } catch {}
-            });
-
-        } catch (e) {}
-    };
-
-    // 1. Attach to existing targets (Service Workers, Main Page, etc)
-    const targets = browser.targets();
-    for (const target of targets) {
-        attachSession(target);
+    } catch (e) {
+        console.error(`[TRACKER] CDP attach failed:`, e.message);
     }
-
-    // 2. Attach to future targets (Web Workers, Iframes, etc)
-    browser.on('targetcreated', attachSession);
 };
 
 export async function startUserTracking(page, roomId, options = {}) {
@@ -65,21 +54,24 @@ export async function startUserTracking(page, roomId, options = {}) {
     const API_BASE_URL = process.env.APP_URL || 'http://localhost:8000';
     const syncBotName =
         (options.botName && String(options.botName).trim()) ||
-        process.env.BOT_PROFILE ||
         process.env.BOT_NAME ||
+        process.env.BOT_PROFILE ||
         '';
     const syncBotUsername =
         (options.botUsername && String(options.botUsername).trim()) ||
         process.env.BOT_USERNAME ||
         '';
-    const BOT_USERNAME = process.env.BOT_USERNAME || 'S1VA';
+    const syncLogPrefix = syncBotName ? `[${syncBotName}][SYNC]` : '[SYNC]';
+    const BOT_USERNAME = syncBotUsername || 'S1VA';
     const BOT_DISPLAY_NAME = (process.env.BOT_DISPLAY_NAME || BOT_USERNAME || '').trim();
     const processedJoins = new Set();
     /** Track active join sessions to prevent duplicate welcomes before leave */
     const activeJoinSessions = new Set();
     /** Cooldown timestamps to avoid rapid re‑welcome on same join */
     const welcomeTimestamps = new Map();
-    const WELCOME_COOLDOWN_MS = 15000; // 15 s
+    const WELCOME_COOLDOWN_MS = 15000; // 15 s per avatar (rapid duplicate join_queue)
+    const WELCOME_HANDLE_COOLDOWN_MS = parseInt(process.env.IMVU_WELCOME_REJOIN_MS || '600000', 10); // default 10 min per username
+    const welcomeByHandleLastAt = new Map();
     /** One backend /api/room-users join per avatar from join_queue resolve (even if chat welcome is deferred) */
     const joinQueueBackendAnnounced = new Set();
     const mentionReplyDedupe = new Set();
@@ -216,6 +208,8 @@ export async function startUserTracking(page, roomId, options = {}) {
     };
 
     let dashboardSyncTimer = null;
+    /** Skip console spam when population / visitors / title unchanged (multi-bot shared terminal). */
+    let lastDashboardSyncLogSig = '';
     const scheduleDashboardSync = () => {
         clearTimeout(dashboardSyncTimer);
         dashboardSyncTimer = setTimeout(() => {
@@ -265,11 +259,19 @@ export async function startUserTracking(page, roomId, options = {}) {
 
         try {
             bulkPost('/api/rooms/sync', body);
-            console.log(
-                `[SYNC] room ${rid} · "${body.rooms[0].name}" · pop ${population} · ${visitors.length} visitors`
-            );
+            const visitorSig = visitors
+                .slice()
+                .sort()
+                .join('\u001f');
+            const sig = `${rid}|${body.rooms[0].name}|${population}|${visitorSig}`;
+            if (sig !== lastDashboardSyncLogSig) {
+                lastDashboardSyncLogSig = sig;
+                console.log(
+                    `${syncLogPrefix} room ${rid} · "${body.rooms[0].name}" · pop ${population} · ${visitors.length} visitors`
+                );
+            }
         } catch (e) {
-            console.log('[SYNC] dashboard failed:', e?.message || e);
+            console.log(`${syncLogPrefix} dashboard failed:`, e?.message || e);
         }
     };
 
@@ -294,16 +296,24 @@ export async function startUserTracking(page, roomId, options = {}) {
     const logConversationTurn = createConversationLogger({ apiBaseUrl: API_BASE_URL, roomId });
     const sendMessage = createSendMessage({ page, logConversationTurn });
 
-    // Listen to incoming messages from the dynamically generated Discord Room Channels
+    const state = {
+        selfUserId: null,
+        botJoinedChat: false,
+        welcomeArrivalsEnabled: false,
+        participantsRosterSynced: false,
+        welcomeArrivalsEnableTimer: null,
+    };
+
+    /** One listener per tab; remove on page close to avoid MaxListenersExceeded / leaks. */
+    let onDiscordRelayChat = null;
     if (global.discordBridge) {
-        global.discordBridge.on('chat', async ({ targetRoomId, content }) => {
+        onDiscordRelayChat = async ({ targetRoomId, content }) => {
             if (!state.botJoinedChat) return;
-            
-            // We now map based on the absolute Room ID extracted from the Discord Channel Topic!
             if (targetRoomId === String(roomId)) {
                 await sendMessage(content);
             }
-        });
+        };
+        global.discordBridge.on('chat', onDiscordRelayChat);
     }
 
     const onJoin = async (username) => {
@@ -329,14 +339,6 @@ export async function startUserTracking(page, roomId, options = {}) {
         } catch (e) {}
     };
 
-    const state = {
-        selfUserId: null,
-        botJoinedChat: false,
-        welcomeArrivalsEnabled: false,
-        participantsRosterSynced: false,
-        welcomeArrivalsEnableTimer: null,
-    };
-
     const enableWelcomeForNewArrivals = () => {
         for (const aid of lastUserMap.keys()) {
             if (aid != null && aid !== undefined) {
@@ -352,7 +354,9 @@ export async function startUserTracking(page, roomId, options = {}) {
             clearTimeout(state.welcomeArrivalsEnableTimer);
             state.welcomeArrivalsEnableTimer = null;
         }
-        console.log(`[SYNC] 🔓 Welcome gate OPEN — ${skipWelcomeAvatarIds.size} existing users blocked`);
+        console.log(
+            `${syncLogPrefix} 🔓 Welcome gate OPEN — ${skipWelcomeAvatarIds.size} existing users blocked`
+        );
     };
 
     const isSelfId = (id) =>
@@ -379,7 +383,7 @@ export async function startUserTracking(page, roomId, options = {}) {
 
 
     /**
-     * @returns {boolean} true if a welcome was scheduled (caller may call onJoin once)
+     * @returns {boolean} true if done (welcome scheduled, or skipped on long rejoin cooldown — do not delete processedJoins)
      */
     const scheduleWelcomeForAvatar = (avatarId, displayName, convMeta) => {
         if (
@@ -411,12 +415,27 @@ export async function startUserTracking(page, roomId, options = {}) {
             return false;
         }
 
+        if (WELCOME_HANDLE_COOLDOWN_MS > 0) {
+            const lastByHandle = welcomeByHandleLastAt.get(handleKey);
+            if (
+                lastByHandle != null &&
+                Date.now() - lastByHandle < WELCOME_HANDLE_COOLDOWN_MS
+            ) {
+                activeJoinSessions.delete(avatarId);
+                return true;
+            }
+        }
+
         welcomeTimestamps.set(avatarId, Date.now());
+        welcomeByHandleLastAt.set(handleKey, Date.now());
         if (activeJoinSessions.size > 200) {
             activeJoinSessions.clear();
         }
         if (welcomeTimestamps.size > 400) {
             welcomeTimestamps.clear();
+        }
+        if (welcomeByHandleLastAt.size > 400) {
+            welcomeByHandleLastAt.clear();
         }
         setTimeout(async () => {
             try {
@@ -484,8 +503,9 @@ export async function startUserTracking(page, roomId, options = {}) {
         checkRoomNameInterval = setInterval(async () => {
             roomNameRetries++;
             const cleanName = (state.roomName || '').toLowerCase().replace(/[^a-z]/g, '');
+            const isGeneric = cleanName.includes('imvunext') || cleanName === 'imvu' || cleanName.includes('avatarsocialapp');
             // Do not accept any variation of the generic loading page title
-            if ((state.roomName && !cleanName.includes('imvunext') && cleanName !== 'imvu' && state.roomName !== 'Unknown') || roomNameRetries >= 40) {
+            if ((state.roomName && !isGeneric && state.roomName !== 'Unknown') || roomNameRetries >= 40) {
                 clearInterval(checkRoomNameInterval);
                 checkRoomNameInterval = null;
                 axios.post(process.env.DISCORD_BOT_API_URL.replace('imvu-chat', 'imvu-init-room'), {
@@ -510,10 +530,14 @@ export async function startUserTracking(page, roomId, options = {}) {
         if (processedJoins.size > 500) processedJoins.clear();
         if (mentionReplyDedupe.size > 500) mentionReplyDedupe.clear();
         if (welcomeTimestamps.size > 500) welcomeTimestamps.clear();
+        if (welcomeByHandleLastAt.size > 500) welcomeByHandleLastAt.clear();
     }, 60000);
 
     // CRITICAL FIX: Ensure intervals are cleared and page references dropped when page closes!
     page.on('close', () => {
+        if (onDiscordRelayChat && global.discordBridge) {
+            global.discordBridge.off('chat', onDiscordRelayChat);
+        }
         if (checkRoomNameInterval) clearInterval(checkRoomNameInterval);
         clearInterval(syncIntervalId);
         clearInterval(cleanupIntervalId);
@@ -522,9 +546,9 @@ export async function startUserTracking(page, roomId, options = {}) {
         if (state.welcomeArrivalsEnableTimer) clearTimeout(state.welcomeArrivalsEnableTimer);
     });
 
-    globalMessageHandler = (data) => {
+    await attachToPageCDP(page, (data) => {
         void handleIncomingMessage(data);
-    };
+    });
 
     const runDOMFallback = createDomFallback({ page, lastUserMap, triggerCountUpdate });
     setTimeout(runDOMFallback, 5000);

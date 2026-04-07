@@ -6,6 +6,7 @@ import {
     decodeId,
     displayNameFromEnvelope,
     isImvuRoomProtocolLine,
+    isOnlyBotNameMention,
     messageMentionsBot,
     normalizeImvuUsername,
 } from './user-tracker-utils.js';
@@ -401,12 +402,17 @@ export const createIncomingMessageHandler = (ctx) => {
                         });
                     }
 
+                    const sivaHitIn = messageInvokesSivaCharacterAi(trimmed);
+                    const mentionHit =
+                        !sivaHitIn &&
+                        messageMentionsBot(trimmed, ctx.botMentionAliases) &&
+                        !isOnlyBotNameMention(trimmed, ctx.botMentionAliases);
+
                     if (
                         direction === 'IN' &&
                         senderId != null &&
                         !ctx.isSelfId(senderId) &&
-                        (messageInvokesSivaCharacterAi(trimmed) ||
-                            messageMentionsBot(trimmed, ctx.botMentionAliases))
+                        (sivaHitIn || mentionHit)
                     ) {
                         const now = Date.now();
                         if (now - (userLastReply.get(senderId) || 0) < 15000) {
@@ -428,7 +434,7 @@ export const createIncomingMessageHandler = (ctx) => {
                                 const first = ctx.mentionReplyDedupe.values().next().value;
                                 ctx.mentionReplyDedupe.delete(first);
                             }
-                            const sivaHit = messageInvokesSivaCharacterAi(trimmed);
+                            const sivaHit = sivaHitIn;
                             void (async () => {
                                 try {
                                     const res = sivaHit

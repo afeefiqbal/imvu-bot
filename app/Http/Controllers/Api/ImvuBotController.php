@@ -9,19 +9,22 @@ use Illuminate\Http\Request;
 class ImvuBotController extends Controller
 {
     /**
-     * Get bot settings. If bot doesn't exist, create it!
+     * Get all active bots.
+     */
+    public function index()
+    {
+        return response()->json(ImvuBot::where('is_active', true)->get());
+    }
+
+    /**
+     * Get bot settings (automation must use an existing dashboard bot row).
      */
     public function show($name)
     {
-        $bot = ImvuBot::firstOrCreate(
-            ['name' => $name],
-            [
-                'username' => 'admin_bot', 
-                'password' => 'secret',
-                'is_active' => true,
-                'ai_enabled' => true,
-            ]
-        );
+        $bot = ImvuBot::where('name', $name)->first();
+        if (! $bot) {
+            return response()->json(['message' => 'Bot not found'], 404);
+        }
 
         return response()->json($bot);
     }

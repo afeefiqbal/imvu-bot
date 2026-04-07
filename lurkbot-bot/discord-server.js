@@ -1,6 +1,7 @@
 import express from 'express';
 import bodyParser from 'body-parser';
-import { Client, GatewayIntentBits } from 'discord.js';
+import axios from 'axios';
+import { Client, GatewayIntentBits, ActivityType } from 'discord.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
@@ -22,13 +23,26 @@ const client = new Client({
     ]
 });
 
-client.once('ready', () => {
+const activeRooms = new Set();
+function updatePresence() {
+    if (client.user) {
+        client.user.setActivity(`Active in ${activeRooms.size} room${activeRooms.size === 1 ? '' : 's'}`, { type: ActivityType.Custom });
+    }
+}
+
+client.once('clientReady', () => {
     console.log(`[DISCORD] ✅ Logged in as ${client.user.tag}!`);
     console.log(`[DISCORD] 🌐 Express Server listening on port 3000... waiting for IMVU chats.`);
+    updatePresence();
 });
 
 async function getOrCreateRoomChannel(client, requestedId, room_id, room_name) {
     if (!requestedId) return null;
+    
+    if (room_id && !activeRooms.has(room_id)) {
+        activeRooms.add(room_id);
+        updatePresence();
+    }
     
     // Attempt 1: Try reading it as a direct Server (Guild) ID
     let guild = client.guilds.cache.get(requestedId) || await client.guilds.fetch(requestedId).catch(() => null);
@@ -47,7 +61,9 @@ async function getOrCreateRoomChannel(client, requestedId, room_id, room_name) {
     const roomTopicIdentifier = `IMVU Room ID: ${room_id}`;
     
     // Create a beautiful default name using the room name + 4 digit suffix
-    const cleanName = (room_name || 'room').toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 50);
+    let cleanName = (room_name || 'room').toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 50);
+    if (!cleanName) cleanName = 'room'; // Fallback if name was entirely emojis/unicode
+
     const shortId = room_id.split('-').pop() || room_id.slice(-4);
     const targetChannelName = `${cleanName}-${shortId}`;
     
@@ -139,7 +155,7 @@ import EventEmitter from 'events';
 if (!global.discordBridge) global.discordBridge = new EventEmitter();
 
 // Listen to messages typed inside Discord and relay them to IMVU!
-client.on('messageCreate', (message) => {
+client.on('messageCreate', async (message) => {
     if (message.author.bot) return; // Prevent infinite bot loops
     if (!message.guild) return; // Ignore DMs
 
@@ -147,11 +163,30 @@ client.on('messageCreate', (message) => {
     if (message.channel.topic && message.channel.topic.includes('IMVU Room ID:')) {
         const match = message.channel.topic.match(/IMVU Room ID:\s*([\w-]+)/);
         if (match) {
+            const targetRoomId = match[1];
+            const content = message.content;
             console.log(`[DISCORD -> IMVU] Forwarding message from ${message.author.username} in #${message.channel.name}`);
-            global.discordBridge.emit('chat', {
-                targetRoomId: match[1],
-                content: message.content
-            });
+            const portsStr = (process.env.IMVU_DISCORD_RELAY_PORTS || '').trim();
+            const relayPorts = portsStr
+                .split(/[\s,]+/)
+                .map((s) => parseInt(s.trim(), 10))
+                .filter((n) => Number.isFinite(n) && n > 0 && n < 65536);
+            if (relayPorts.length > 0) {
+                await Promise.allSettled(
+                    relayPorts.map((port) =>
+                        axios.post(
+                            `http://127.0.0.1:${port}/discord-relay`,
+                            { targetRoomId, content },
+                            { timeout: 8000 }
+                        )
+                    )
+                );
+            } else {
+                global.discordBridge.emit('chat', {
+                    targetRoomId,
+                    content,
+                });
+            }
         }
     }
 });

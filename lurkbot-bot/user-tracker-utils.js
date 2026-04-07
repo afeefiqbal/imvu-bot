@@ -111,6 +111,18 @@ export const messageMentionsBot = (chatText, aliases) => {
     return false;
 };
 
+/** Whole message is only @bot or bot name — skip /api/lurk (avoids confused third-person replies). */
+export const isOnlyBotNameMention = (chatText, aliases) => {
+    const t = String(chatText ?? '').trim();
+    if (!t) return false;
+    const stripped = t.replace(/^@+\s*/i, '').trim().toLowerCase();
+    for (const alias of aliases) {
+        if (!alias) continue;
+        if (stripped === String(alias).toLowerCase()) return true;
+    }
+    return false;
+};
+
 export const welcomeHandleKey = (displayName) => {
     const h = String(normalizeImvuUsername(displayName) || '').trim().toLowerCase();
     if (!h || EXCLUDED_HANDLES.includes(h)) return null;

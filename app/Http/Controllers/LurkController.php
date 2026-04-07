@@ -207,6 +207,44 @@ class LurkController extends Controller
         return false;
     }
 
+    /**
+     * @return list<string>
+     */
+    protected function parseRoomIdsFromBotField(?string $roomIdsField): array
+    {
+        if ($roomIdsField === null || $roomIdsField === '') {
+            return [];
+        }
+        $out = [];
+        $rawRooms = array_map('trim', explode(',', $roomIdsField));
+        foreach ($rawRooms as $raw) {
+            if (preg_match('/(?:room-)?([\d-]+)/', $raw, $matches)) {
+                if (! empty($matches[1])) {
+                    $out[] = $matches[1];
+                }
+            }
+        }
+
+        return array_values(array_unique($out));
+    }
+
+    /**
+     * Room IDs any active dashboard bot is configured to use (multi-bot / multi-tab safe deletes).
+     *
+     * @return list<string>
+     */
+    protected function allActiveBotConfiguredRoomIds(): array
+    {
+        $seen = [];
+        foreach (ImvuBot::where('is_active', true)->cursor() as $bot) {
+            foreach ($this->parseRoomIdsFromBotField($bot->room_ids) as $rid) {
+                $seen[(string) $rid] = true;
+            }
+        }
+
+        return array_keys($seen);
+    }
+
     public function syncRooms(Request $request)
     {
         $rooms = $request->input('rooms', []);
@@ -234,15 +272,7 @@ class LurkController extends Controller
             }
 
             if ($bot && ! empty($bot->room_ids)) {
-                $rawRooms = array_map('trim', explode(',', $bot->room_ids));
-                foreach ($rawRooms as $raw) {
-                    if (preg_match('/(?:room-)?([\d-]+)/', $raw, $matches)) {
-                        if (! empty($matches[1])) {
-                            $targetRooms[] = $matches[1];
-                        }
-                    }
-                }
-                $targetRooms = array_values(array_unique($targetRooms));
+                $targetRooms = $this->parseRoomIdsFromBotField($bot->room_ids);
             }
         }
 
@@ -286,10 +316,14 @@ class LurkController extends Controller
 
         }
 
-        // Sync active IDs for dashboard - ONLY if the bot reported ANY rooms
-        // This prevents wiping the dashboard during startup syncs (which are empty)
+        // Prune Room rows not referenced by this sync OR any other active bot's dashboard targets.
+        // (Previously: only current payload → every bot/tab sync deleted everyone else's rooms.)
         if (! empty($activeIds)) {
-            Room::whereNotIn('room_id', $activeIds)->delete();
+            $keep = array_unique(array_merge(
+                $activeIds,
+                $this->allActiveBotConfiguredRoomIds()
+            ));
+            Room::whereNotIn('room_id', $keep)->delete();
         }
 
         $spamTargets = Room::where('is_spamming', true)->pluck('room_id')->toArray();
