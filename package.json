@@ -3,11 +3,14 @@
     "private": true,
     "type": "module",
     "scripts": {
-        "build": "vite build",
+        "build:filament": "npx tailwindcss@3 --input ./resources/css/filament/admin/theme.css --output ./public/css/filament/admin/theme.css --config ./resources/css/filament/admin/tailwind.config.js --minify",
+        "build": "npm run build:filament && vite build",
         "dev": "vite",
         "bot": "node lurkbot-bot/index.js"
     },
     "devDependencies": {
+        "@tailwindcss/forms": "^0.5.11",
+        "@tailwindcss/typography": "^0.5.19",
         "@tailwindcss/vite": "^4.0.0",
         "axios": "^1.13.6",
         "concurrently": "^9.0.1",
