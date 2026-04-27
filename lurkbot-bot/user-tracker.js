@@ -1,6 +1,5 @@
 import axios from 'axios';
 import { bulkPost } from './api-queue.js';
-import { getWelcomeMessage } from './welcomeMessages.js';
 import { createConversationLogger, createSendMessage } from './user-tracker-chat.js';
 import {
     createDomFallback,
@@ -14,6 +13,9 @@ import {
     normalizeRoomApiSlug,
     welcomeHandleKey,
 } from './user-tracker-utils.js';
+
+const getDefaultWelcomeMessage = (name, roomName = 'the room') =>
+    `Hey ${name || 'there'} 👋 welcome to ${roomName}!`;
 
 /**
  * IMVU User Tracker Module - CDP WEBSOCKET MODE 🎯
@@ -443,7 +445,7 @@ export async function startUserTracking(page, roomId, options = {}) {
                     await refreshRoomName();
                 }
 
-                await sendMessage(getWelcomeMessage(displayName, ROOM_NAME), convMeta);
+                await sendMessage(getDefaultWelcomeMessage(displayName, ROOM_NAME), convMeta);
 
             } finally {
                 // 🔓 ALWAYS release lock after welcome
