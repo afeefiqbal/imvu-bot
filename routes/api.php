@@ -14,3 +14,5 @@ Route::get('/bots', [ImvuBotController::class, 'index']);
 Route::get('/bots/{name}', [ImvuBotController::class, 'show']);
 Route::post('/bots/{name}/status', [ImvuBotController::class, 'updateStatus']);
 Route::post('/room-users', [LurkController::class, 'trackRoomUser']);
+Route::get('/stream-audio-config', [LurkController::class, 'streamAudioConfig']);
+Route::post('/imvu-music-state', [LurkController::class, 'imvuMusicState']);

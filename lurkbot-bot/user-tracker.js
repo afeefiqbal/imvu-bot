@@ -341,13 +341,19 @@ export async function startUserTracking(page, roomId, options = {}) {
         } catch (e) {}
     };
 
+    const hasResolvedOccupantName = (v) =>
+        v !== null && v !== undefined && String(v).trim() !== '';
+
     const enableWelcomeForNewArrivals = () => {
+        // Only skip avatars we already know by name (roster / chat). Join_queue bootstrap
+        // rows stay `null` until profile resolves — those must NOT be skipped or they never get welcomed.
         for (const aid of lastUserMap.keys()) {
-            if (aid != null && aid !== undefined) {
-                skipWelcomeAvatarIds.add(String(aid));
-                // 🛡️ Also block backend onJoin for bootstrap users
-                joinQueueBackendAnnounced.add(String(aid));
-            }
+            if (aid == null || aid === undefined) continue;
+            const label = lastUserMap.get(aid);
+            if (!hasResolvedOccupantName(label)) continue;
+            const sid = String(aid);
+            skipWelcomeAvatarIds.add(sid);
+            joinQueueBackendAnnounced.add(sid);
         }
         // ✅ Mark roster as synced (covers fallback timer path)
         state.participantsRosterSynced = true;
@@ -393,7 +399,7 @@ export async function startUserTracking(page, roomId, options = {}) {
             !state.botJoinedChat ||
             !state.welcomeArrivalsEnabled ||
             isSelfId(avatarId) ||
-            skipWelcomeAvatarIds.has(avatarId)
+            skipWelcomeAvatarIds.has(String(avatarId))
         ) {
             return false;
         }
@@ -469,6 +475,26 @@ export async function startUserTracking(page, roomId, options = {}) {
     };
 
     const resolveImvuHandleFromNumericId = createImvuHandleResolver({ page });
+    let roomChatCommandHandler = null;
+    if (
+        process.env.IMVU_MUSIC_ENABLED === '1' ||
+        process.env.IMVU_MUSIC_ENABLED === 'true'
+    ) {
+        try {
+            const { createMusicRoomChatCommandHandler } = await import('./music/index.js');
+            roomChatCommandHandler = await createMusicRoomChatCommandHandler({
+                page,
+                roomId,
+                apiBaseUrl: API_BASE_URL,
+                botName: syncBotName || undefined,
+                sendMessage,
+            });
+            console.log(`${syncLogPrefix} room music commands on (play … / !play / *play / !music · *music)`);
+        } catch (e) {
+            console.warn(`${syncLogPrefix} music init failed:`, e?.message || e);
+        }
+    }
+
     const handleIncomingMessage = createIncomingMessageHandler({
         API_BASE_URL,
         BOT_DISPLAY_NAME,
@@ -489,6 +515,7 @@ export async function startUserTracking(page, roomId, options = {}) {
         processedJoins,
         refreshRoomName,
         resolveImvuHandleFromNumericId,
+        roomChatCommandHandler,
         roomId,
         scheduleWelcomeForAvatar,
         sendMessage,

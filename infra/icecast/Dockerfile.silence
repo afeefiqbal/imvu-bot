@@ -1,0 +1,5 @@
+FROM alpine:3.19
+RUN apk add --no-cache ffmpeg
+COPY silence-entrypoint.sh /silence-entrypoint.sh
+RUN chmod +x /silence-entrypoint.sh
+ENTRYPOINT ["/silence-entrypoint.sh"]

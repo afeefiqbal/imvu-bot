@@ -4,6 +4,7 @@ import { spawn } from 'child_process';
 import axios from 'axios';
 import dotenv from 'dotenv';
 import { bulkPost } from './api-queue.js';
+import { maybeStartMusicIngressTunnel } from './music/tunnelIngress.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -328,6 +329,7 @@ function buildChildEnv(botName, proxyUrl, discordRelayPort) {
     } else {
         delete childEnv.IMVU_DISCORD_RELAY_PORT;
     }
+    childEnv.IMVU_LAUNCHED_FROM_MULTI_LAUNCHER = '1';
     return childEnv;
 }
 
@@ -444,6 +446,8 @@ async function run() {
         console.warn('[MULTI-LAUNCHER] ⚠️ No active bots found! Ensure bots are in the dashboard.');
         return;
     }
+
+    await maybeStartMusicIngressTunnel();
 
     console.log(`\n[MULTI-LAUNCHER] 🔥 Preparing to launch ${bots.length} active bots!`);
     console.log(`[MULTI-LAUNCHER] 📝 Bots found: ${bots.map((b) => b.name).join(', ')}`);

@@ -172,6 +172,11 @@ function cleanupProfileLock(profileDir) {
         }
         console.log('RUNNING BOT:', process.env.BOT_NAME);
 
+        if (!/^(1|true|yes|on)$/i.test(String(process.env.IMVU_LAUNCHED_FROM_MULTI_LAUNCHER || '').trim())) {
+            const { maybeStartMusicIngressTunnel } = await import('./music/tunnelIngress.js');
+            await maybeStartMusicIngressTunnel();
+        }
+
         const USER_DATA_DIR = path.resolve(__dirname, 'profiles', BOT_NAME);
         cleanupProfileLock(USER_DATA_DIR);
         const parsed = parseProxyFromProcessEnv();

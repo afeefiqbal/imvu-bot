@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Icecast for lurkbot music (ffmpeg pushes MP3; IMVU loads public HTTPS URL).
+
+  Passwords must match .env:
+    ICECAST_SOURCE_PASSWORD → <source-password> (default lurkbot_dev)
+
+  Docker: docker compose -f infra/icecast/docker-compose.yml up  ·  compose maps host :8001 → container :8000 (keep Laravel on 8000).
+
+  Native macOS Homebrew: brew install icecast
+    Use icecast.homebrew.xml (Apple Silicon paths); Intel: edit <paths> to /usr/local/opt/icecast/share/icecast
+    mkdir -p /tmp/icecast-log && icecast -c …/infra/icecast/icecast.homebrew.xml
+-->
+<icecast>
+    <location>local</location>
+    <admin>admin@localhost</admin>
+
+    <limits>
+        <clients>256</clients>
+        <sources>32</sources>
+        <queue-size>524288</queue-size>
+        <!-- Longer timeouts: YouTube/DASH can stall >10s between fragments; low source-timeout drops FFmpeg mid-song. -->
+        <client-timeout>120</client-timeout>
+        <header-timeout>30</header-timeout>
+        <source-timeout>180</source-timeout>
+        <!-- 0 = new listeners attach at live edge only; burst replayed a slice of the client queue and could feel "mid-song". -->
+        <burst-on-connect>0</burst-on-connect>
+        <burst-size>65535</burst-size>
+    </limits>
+
+    <authentication>
+        <source-password>lurkbot_dev</source-password>
+        <relay-password>lurkbot_dev_relay</relay-password>
+        <admin-user>admin</admin-user>
+        <admin-password>lurkbot_dev_admin</admin-password>
+    </authentication>
+
+    <hostname>127.0.0.1</hostname>
+
+    <listen-socket>
+        <port>8000</port>
+    </listen-socket>
+
+    <http-headers>
+        <header name="Access-Control-Allow-Origin" value="*"/>
+    </http-headers>
+
+    <!-- Alpine/Docker layout (apk add icecast). Homebrew: see comment at top. -->
+    <paths>
+        <basedir>/usr/share/icecast</basedir>
+        <logdir>/var/log/icecast</logdir>
+        <webroot>/usr/share/icecast/web</webroot>
+        <adminroot>/usr/share/icecast/admin</adminroot>
+        <alias source="/" destination="/status.xsl"/>
+    </paths>
+
+    <logging>
+        <accesslog>access.log</accesslog>
+        <errorlog>error.log</errorlog>
+        <loglevel>3</loglevel>
+        <logsize>10000</logsize>
+    </logging>
+
+    <security>
+        <chroot>0</chroot>
+        <!-- Required when the container runs icecast as root; drops to unprivileged user. -->
+        <changeowner>
+            <user>icecast</user>
+            <group>icecast</group>
+        </changeowner>
+    </security>
+
+    <!-- When no DJ source is on a mount (e.g. /imvu-….mp3), new listeners get this stream instead of HTTP 404.
+         Requires the silence-source service (Dockerfile.silence) publishing to lurkbot-silence.mp3. -->
+    <mount type="default">
+        <public>1</public>
+        <stream-name>IMVU room stream</stream-name>
+        <stream-description>lurkbot</stream-description>
+        <content-type>audio/mpeg</content-type>
+        <fallback-mount>/lurkbot-silence.mp3</fallback-mount>
+        <fallback-override>1</fallback-override>
+    </mount>
+</icecast>

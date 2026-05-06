@@ -372,4 +372,54 @@ class LurkController extends Controller
 
         return response()->json(['status' => 'success']);
     }
+
+    /**
+     * Icecast + public stream URL for the Node music bot (per room).
+     */
+    public function streamAudioConfig(Request $request)
+    {
+        $roomRaw = (string) $request->query('room_id', '');
+        $slug = strtolower(preg_replace('/^room-/i', '', $roomRaw));
+        $slug = preg_replace('/[^0-9-]/', '', $slug);
+        if ($slug === '') {
+            $slug = 'default';
+        }
+
+        $mountTpl = (string) config('music.icecast.mount_template', '/imvu-{room}.mp3');
+        $mount = str_replace('{room}', $slug, $mountTpl);
+        if ($mount !== '' && $mount[0] !== '/') {
+            $mount = '/'.$mount;
+        }
+
+        $pubTpl = (string) config('music.public_stream_url_template', '');
+        $public = $pubTpl !== '' ? str_replace('{room}', $slug, $pubTpl) : '';
+
+        return response()->json([
+            'enabled' => (bool) config('music.enabled', false),
+            'icecast_host' => config('music.icecast.host'),
+            'icecast_port' => (int) config('music.icecast.port'),
+            'icecast_mount' => $mount,
+            'source_user' => config('music.icecast.source_user'),
+            'source_password' => config('music.icecast.source_password'),
+            'public_stream_url' => $public,
+        ]);
+    }
+
+    /**
+     * Optional: last-known playback state for dashboards / debugging.
+     */
+    public function imvuMusicState(Request $request)
+    {
+        $validated = $request->validate([
+            'room_id' => 'required|string',
+            'bot_name' => 'nullable|string',
+            'state' => 'required|string',
+            'track' => 'nullable|array',
+        ]);
+
+        $key = 'imvu_music:'.preg_replace('/\s+/', '', $validated['room_id']);
+        Cache::put($key, $validated, 3600);
+
+        return response()->json(['ok' => true]);
+    }
 }

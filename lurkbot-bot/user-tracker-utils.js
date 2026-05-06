@@ -37,6 +37,15 @@ export const decodeId = (id) => {
 
 export const isImvuRoomProtocolLine = (msg) => (msg || '').trim().startsWith('*');
 
+/** Room chat WS queue: legacy `/chat/123` or Next `inv:/chat/chat-roomId-instance`. */
+export const isImvuRoomChatQueue = (queue) => {
+    const q = String(queue || '');
+    if (!q) return false;
+    if (q.startsWith('/chat/')) return true;
+    if (/^inv:\/chat\//i.test(q)) return true;
+    return false;
+};
+
 export const chatVerbose = () =>
     process.env.CHAT_VERBOSE === '1' || process.env.CHAT_VERBOSE === 'true';
 

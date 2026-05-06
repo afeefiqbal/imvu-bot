@@ -1,0 +1,21 @@
+services:
+  icecast:
+    build: .
+    # Host 8001 → container 8000: matches ICECAST_PORT=8001 in .env and avoids clashing with Laravel on 8000.
+    ports:
+      - "8001:8000"
+    restart: unless-stopped
+
+  # Constant MP3 silence on /lurkbot-silence.mp3 — Icecast serves it when a room mount has no live FFmpeg (no more 404).
+  silence-source:
+    build:
+      context: .
+      dockerfile: Dockerfile.silence
+    depends_on:
+      - icecast
+    restart: unless-stopped
+    environment:
+      ICECAST_SOURCE_PASSWORD: ${ICECAST_SOURCE_PASSWORD:-lurkbot_dev}
+      ICECAST_SILENCE_HOST: icecast
+      ICECAST_SILENCE_PORT: "8000"
+      ICECAST_SILENCE_MOUNT: /lurkbot-silence.mp3

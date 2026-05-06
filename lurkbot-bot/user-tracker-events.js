@@ -5,6 +5,7 @@ import {
     decodeChatEnvelope,
     decodeId,
     displayNameFromEnvelope,
+    isImvuRoomChatQueue,
     isImvuRoomProtocolLine,
     isOnlyBotNameMention,
     messageMentionsBot,
@@ -189,13 +190,7 @@ export const createIncomingMessageHandler = (ctx) => {
                 continue;
             }
 
-            if (
-                record === 'msg_g2c_joined_queue' &&
-                typeof queue === 'string' &&
-                queue.startsWith('/chat/')
-            ) {
-                if (!queue || !queue.startsWith('/chat/')) return;
-
+            if (record === 'msg_g2c_joined_queue' && typeof queue === 'string' && isImvuRoomChatQueue(queue)) {
                 if (!ctx.state.welcomeArrivalsEnabled) {
                     const avatarId = decodeId(action.user_id);
                     if (avatarId && ctx.isSelfId(avatarId) && !ctx.state.botJoinedChat) {
@@ -325,7 +320,7 @@ export const createIncomingMessageHandler = (ctx) => {
 
             if (
                 (record === 'msg_g2c_send_message' || record === 'msg_c2g_send_message') &&
-                queue.startsWith('/chat/') &&
+                isImvuRoomChatQueue(queue) &&
                 mount === 'messages'
             ) {
                 const envelope = decodeChatEnvelope(action.message);
@@ -373,9 +368,21 @@ export const createIncomingMessageHandler = (ctx) => {
 
                 const text = envelope?.message || envelope?.text || envelope?.body || envelope?.chat_message;
                 if (typeof text === 'string' && text.trim()) {
-                    if (!chatVerbose() && isImvuRoomProtocolLine(text)) return;
                     const direction = record === 'msg_c2g_send_message' ? 'OUT' : 'IN';
                     const trimmed = text.trim();
+                    if (
+                        direction === 'IN' &&
+                        typeof ctx.roomChatCommandHandler === 'function'
+                    ) {
+                        const handled = await ctx.roomChatCommandHandler({
+                            text: trimmed,
+                            senderLabel,
+                            senderId,
+                            isSelf: ctx.isSelfId(senderId),
+                        });
+                        if (handled) continue;
+                    }
+                    if (!chatVerbose() && isImvuRoomProtocolLine(text)) return;
                     console.log(`[CHAT][${direction}] ${senderLabel}: ${trimmed}`);
                     const avatarForLog = senderId && /^\d+$/.test(String(senderId)) ? String(senderId) : null;
                     void ctx.logConversationTurn({
