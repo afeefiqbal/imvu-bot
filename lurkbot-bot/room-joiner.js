@@ -853,7 +853,10 @@ const startJoiner = async (roomIdsStr = '') => {
         roomIdsStr = '242955291-481';
     }
 
-    const roomList = roomIdsStr.split(',').map(id => id.replace(/[^0-9-]/g, '')).filter(Boolean);
+    const roomList = roomIdsStr
+        .split(',')
+        .map((id) => id.replace(/[^0-9-]/g, '').replace(/^-+|-+$/g, ''))
+        .filter(Boolean);
     if (roomList.length === 0) {
         console.error(`[${ctxBotName}] ❌ No valid room ids.`);
         process.exit(1);

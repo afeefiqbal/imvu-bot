@@ -302,7 +302,8 @@ function parseRooms(roomString) {
     return roomString.split(',').map(r => {
         const trimmed = r.trim();
         const m = trimmed.match(/room-([\d-]+)/);
-        return m ? m[1] : trimmed;
+        const raw = m ? m[1] : trimmed.replace(/[^0-9-]/g, '');
+        return raw.replace(/^-+|-+$/g, '');
     }).filter(Boolean);
 }
 
