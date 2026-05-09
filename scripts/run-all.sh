@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Local dev: Laravel (composer dev) + bot. For Railway one-service deploy, use railway-web-and-bot.sh.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

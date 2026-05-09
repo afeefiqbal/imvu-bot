@@ -2,5 +2,5 @@
 buildCommand = "composer install --no-dev --optimize-autoloader && npm install && npm run build"
 
 [deploy]
-startCommand = "php artisan serve --host=0.0.0.0 --port=$PORT"
+startCommand = "bash scripts/railway-web-and-bot.sh"
 preDeploy = "php artisan migrate --force"

@@ -229,9 +229,20 @@ function cleanupProfileLock(profileDir) {
             launchArgs.push(`--proxy-server=${chromeProxy.arg}`);
         }
 
+        let executablePath = (process.env.PUPPETEER_EXECUTABLE_PATH || '').trim();
+        if (executablePath && !fs.existsSync(executablePath)) {
+            executablePath = '';
+        }
+        if (!executablePath && process.platform === 'darwin') {
+            const macChrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+            if (fs.existsSync(macChrome)) {
+                executablePath = macChrome;
+            }
+        }
+
         const browser = await puppeteer.launch({
             headless: 'new',
-            executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+            ...(executablePath ? { executablePath } : {}),
             userDataDir: USER_DATA_DIR,
             args: launchArgs,
             defaultViewport: null,
