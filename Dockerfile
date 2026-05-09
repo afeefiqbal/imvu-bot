@@ -24,6 +24,14 @@ WORKDIR /app
 
 COPY . .
 
+# Laravel expects these dirs at runtime (pre-deploy migrate + artisan serve).
+RUN mkdir -p bootstrap/cache \
+    storage/framework/sessions \
+    storage/framework/views \
+    storage/framework/cache/data \
+    storage/logs \
+    && chmod -R a+rwX bootstrap/cache storage
+
 RUN composer install --no-dev --optimize-autoloader --no-interaction --no-scripts \
     && npm ci \
     && npm run build
