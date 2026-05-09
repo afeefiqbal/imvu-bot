@@ -2,6 +2,7 @@
 # (Nixpacks PHP-only images often have no `node` on PATH even with nixpacks.toml.)
 FROM php:8.4-cli
 
+# Puppeteer’s bundled Chrome needs NSS/GBM/X11 stack; php-cli image is too minimal without these.
 RUN apt-get update && apt-get install -y \
     git \
     unzip \
@@ -12,6 +13,32 @@ RUN apt-get update && apt-get install -y \
     curl \
     ca-certificates \
     ffmpeg \
+    fonts-liberation \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libatk1.0-0 \
+    libcairo2 \
+    libcups2 \
+    libdbus-1-3 \
+    libdrm2 \
+    libgbm1 \
+    libglib2.0-0 \
+    libgtk-3-0 \
+    libnspr4 \
+    libnss3 \
+    libpango-1.0-0 \
+    libx11-6 \
+    libx11-xcb1 \
+    libxcb1 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxext6 \
+    libxfixes3 \
+    libxkbcommon0 \
+    libxrandr2 \
+    libxss1 \
+    libxtst6 \
+    xdg-utils \
     && docker-php-ext-install intl zip pdo_mysql \
     && rm -rf /var/lib/apt/lists/*
 
@@ -54,7 +81,8 @@ RUN mkdir -p bootstrap/cache \
 
 RUN composer install --no-dev --optimize-autoloader --no-interaction --no-scripts \
     && npm ci \
-    && npm run build
+    && npm run build \
+    && (cd lurkbot-bot && npm ci)
 
 ENV PORT=8080
 EXPOSE 8080
