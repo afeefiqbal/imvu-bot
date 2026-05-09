@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { resolvedIcecastHost } from './resolvedIcecastHost.js';
 
 /** Same slug rules as Laravel `LurkController::streamAudioConfig`. */
 export function slugForIcecastMount(roomRaw) {
@@ -36,7 +37,7 @@ export function streamConfigFromProcessEnv(roomId) {
     let mountTpl = String(process.env.ICECAST_MOUNT_TEMPLATE || '/imvu-{room}.mp3').trim();
     let mount = mountTpl.replace(/\{room\}/g, slug);
     if (mount && mount[0] !== '/') mount = `/${mount}`;
-    const host = String(process.env.ICECAST_HOST || '127.0.0.1').trim();
+    const host = resolvedIcecastHost();
     const port = parseInt(String(process.env.ICECAST_PORT || '8001'), 10) || 8001;
     const pubTpl = String(process.env.MUSIC_PUBLIC_STREAM_URL_TEMPLATE || '').trim();
     const publicStreamUrl = pubTpl ? pubTpl.replace(/\{room\}/g, slug) : '';

@@ -1,10 +1,16 @@
 <?php
 
+$icecastHost = (string) env('ICECAST_HOST', '127.0.0.1');
+$suffix = (string) env('ICECAST_HOST_SUFFIX', '');
+if ($suffix !== '' && ! in_array($icecastHost, ['127.0.0.1', 'localhost'], true) && ! str_ends_with($icecastHost, $suffix)) {
+    $icecastHost .= $suffix;
+}
+
 return [
     'enabled' => env('MUSIC_ENABLED', false),
 
     'icecast' => [
-        'host' => env('ICECAST_HOST', '127.0.0.1'),
+        'host' => $icecastHost,
         /* Host-side port when Icecast is mapped e.g. Docker 8001→8000; must match Node tunnel + bot. */
         'port' => (int) env('ICECAST_PORT', 8001),
         /** Placeholder `{room}` is replaced with a filesystem-safe slug (e.g. 261755692-875). */

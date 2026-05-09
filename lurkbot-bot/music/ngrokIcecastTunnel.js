@@ -1,6 +1,7 @@
 import net from 'net';
 import http from 'http';
 import { spawn } from 'child_process';
+import { resolvedIcecastHost } from './resolvedIcecastHost.js';
 
 function truthy(v) {
     const s = String(v ?? '')
@@ -119,7 +120,7 @@ export async function maybeStartNgrokTunnelForIcecast() {
     }
 
     const prevTemplate = templateNow;
-    const host = String(process.env.ICECAST_HOST || '127.0.0.1').trim();
+    const host = resolvedIcecastHost();
     const port = parseInt(String(process.env.ICECAST_PORT || '8001'), 10) || 8001;
     const loopHost = host === '0.0.0.0' ? '127.0.0.1' : host;
     const localTarget = `${loopHost}:${port}`;
