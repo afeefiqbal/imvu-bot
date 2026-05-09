@@ -7,6 +7,7 @@ import { applyRoomMediaStreamUrl } from './imvuRoomMediaDom.js';
 import { spawnYtDlpAudioStdout } from './ytDlpAudioStdout.js';
 import { cacheBustHttpsStreamUrl } from './loadStreamConfig.js';
 import { canonicalYoutubeWatchUrl } from './resolvePlay.js';
+import { withIcecastMountEncodeLock } from './icecastMountLock.js';
 
 /** @returns {Promise<number>} HTTP status (0 on failure). */
 function httpGetStatus(host, port, path) {
@@ -241,6 +242,11 @@ export function createRoomPlayer(opts) {
     let ytdlpProc = null;
     let drainLock = false;
     let stopFlag = false;
+    /** When true, drain loop will not start the next track (after !pause). */
+    let paused = false;
+    /** Track that was playing when paused — resumed from the start (live stream has no mid-song seek). */
+    /** @type {{ title: string, url: string } | null} */
+    let pausedTrack = null;
     /** @type {Awaited<ReturnType<typeof loadConfig>> | null} */
     let cachedConfig = null;
 
@@ -269,7 +275,7 @@ export function createRoomPlayer(opts) {
         cachedConfig = cfg;
         if (!cfg?.enabled) return;
 
-        const next = queue.dequeue();
+        let next = queue.dequeue();
         if (!next) {
             queue.setCurrent(null);
             void notifyImvuMusicState({
@@ -280,6 +286,9 @@ export function createRoomPlayer(opts) {
                 state: 'idle',
             });
             return;
+        }
+        while (queue.peek()) {
+            next = queue.dequeue();
         }
 
         const track = {
@@ -319,57 +328,74 @@ export function createRoomPlayer(opts) {
             }
         }
 
-        const iceDest = icecastDestFromConfig(cfg);
-        const { proc, stdin } = createFfmpegIcecastPipe({
-            icecastDestUrl: iceDest,
-        });
-        ffProc = proc;
-        audioIn.on('error', () => {});
-        stdin.on('error', (e) => {
-            console.warn('[music] FFmpeg stdin:', e?.message || e);
-        });
-
-        try {
-            audioIn.pipe(stdin);
-        } catch (e) {
-            console.error('[music] pipe:', e.message);
-            killFf();
+        if (paused) {
+            try {
+                audioIn?.destroy?.();
+            } catch {}
+            if (ytdlpProc) {
+                try {
+                    ytdlpProc.kill('SIGKILL');
+                } catch {}
+                ytdlpProc = null;
+            }
             queue.setCurrent(null);
             return;
         }
 
+        const iceDest = icecastDestFromConfig(cfg);
         const loopHost = cfg.icecastHost === '0.0.0.0' ? '127.0.0.1' : String(cfg.icecastHost || '127.0.0.1');
         const icePort = Number(cfg.icecastPort) || 8001;
         const mountPath = cfg.icecastMount.startsWith('/') ? cfg.icecastMount : `/${cfg.icecastMount}`;
-        setTimeout(async () => {
-            const up = await icecastStatusJsonShowsSource(loopHost, icePort, mountPath);
-            if (!up) {
-                console.warn(
-                    `[music] Icecast has no SOURCE on ${mountPath} at ${loopHost}:${icePort} ~5s after start — ` +
-                        'nothing is registered on that mount (listeners/ngrok get 404). ' +
-                        'Compare ICECAST_SOURCE_USER / ICECAST_SOURCE_PASSWORD in .env with icecast.xml <source-password>, ' +
-                        'and ICECAST_PORT (Docker host is usually 8001). Watch [music] ffmpeg: lines above for auth/connection errors.',
-                );
-            } else {
-                console.log(`[music] Icecast confirms source on ${mountPath} (${loopHost}:${icePort}).`);
-            }
-        }, 5000);
+        const mountLockKey = `${loopHost}:${icePort}${mountPath}`;
 
-        const ms = Math.max(500, parseInt(String(process.env.MUSIC_DOM_STREAM_DELAY_MS || '2500'), 10) || 2500);
-        setTimeout(() => {
-            void pushDomUrl(cfg);
-            console.log('[music] Mount should be live — listeners can use HTTPS stream URL (reload if you saw 404).');
-        }, ms);
-
-        await new Promise((resolve) => {
-            proc.once('exit', (code, sig) => {
-                console.log(
-                    `[music] FFmpeg ended (code=${code}, signal=${sig || 'none'}) — Icecast drops this mount; listeners see 404 until the next !play.`,
-                );
-                resolve();
+        await withIcecastMountEncodeLock(mountLockKey, async () => {
+            const { proc, stdin } = createFfmpegIcecastPipe({
+                icecastDestUrl: iceDest,
             });
+            ffProc = proc;
+            audioIn.on('error', () => {});
+            stdin.on('error', (e) => {
+                console.warn('[music] FFmpeg stdin:', e?.message || e);
+            });
+
+            try {
+                audioIn.pipe(stdin);
+            } catch (e) {
+                console.error('[music] pipe:', e.message);
+                killFf();
+                return;
+            }
+
+            setTimeout(async () => {
+                const up = await icecastStatusJsonShowsSource(loopHost, icePort, mountPath);
+                if (!up) {
+                    console.warn(
+                        `[music] Icecast has no SOURCE on ${mountPath} at ${loopHost}:${icePort} ~5s after start — ` +
+                            'nothing is registered on that mount (listeners/ngrok get 404). ' +
+                            'Compare ICECAST_SOURCE_USER / ICECAST_SOURCE_PASSWORD in .env with icecast.xml <source-password>, ' +
+                            'and ICECAST_PORT (Docker host is usually 8001). Watch [music] ffmpeg: lines above for auth/connection errors.',
+                    );
+                } else {
+                    console.log(`[music] Icecast confirms source on ${mountPath} (${loopHost}:${icePort}).`);
+                }
+            }, 5000);
+
+            const ms = Math.max(500, parseInt(String(process.env.MUSIC_DOM_STREAM_DELAY_MS || '2500'), 10) || 2500);
+            setTimeout(() => {
+                void pushDomUrl(cfg);
+                console.log('[music] Mount should be live — listeners can use HTTPS stream URL (reload if you saw 404).');
+            }, ms);
+
+            await new Promise((resolve) => {
+                proc.once('exit', (code, sig) => {
+                    console.log(
+                        `[music] FFmpeg ended (code=${code}, signal=${sig || 'none'}) — Icecast drops this mount; listeners see 404 until the next !play.`,
+                    );
+                    resolve();
+                });
+            });
+            killFf();
         });
-        killFf();
         queue.setCurrent(null);
     };
 
@@ -377,7 +403,7 @@ export function createRoomPlayer(opts) {
         if (drainLock || ffProc) return;
         drainLock = true;
         try {
-            while (!stopFlag && queue.peek()) {
+            while (!stopFlag && !paused && queue.peek()) {
                 await playOne();
             }
         } finally {
@@ -397,12 +423,75 @@ export function createRoomPlayer(opts) {
             void ensureDrain();
         },
 
-        skip: () => {
-            killFf();
+        /**
+         * Drop the queue, stop the current encode, and play this track next.
+         * (Plain enqueue() does nothing while FFmpeg is running — use this for !play / skip-replace.)
+         */
+        playNow: (track) => {
+            stopFlag = false;
+            paused = false;
+            pausedTrack = null;
+            queue.clearPending();
+            queue.enqueue(track);
+            if (ffProc || ytdlpProc) {
+                killFf();
+            }
+            void ensureDrain();
         },
+
+        /** Skip current song; play next in queue if any. */
+        skip: () => {
+            paused = false;
+            pausedTrack = null;
+            killFf();
+            void ensureDrain();
+        },
+
+        /** Stop encoding; keep queue + current song for !resume (restarts current from beginning). */
+        pause: () => {
+            paused = true;
+            const cur = queue.getCurrent();
+            pausedTrack = cur ? { title: cur.title, url: cur.url } : null;
+            killFf();
+            void notifyImvuMusicState({
+                apiBaseUrl,
+                roomId,
+                botName,
+                track: pausedTrack ? { title: pausedTrack.title, url: pausedTrack.url } : null,
+                state: 'paused',
+            });
+        },
+
+        /** Continue after !pause (current track from start, then any queued tracks). */
+        resume: () => {
+            if (!paused) return;
+            paused = false;
+            const rest = queue.pending();
+            queue.clearPending();
+            if (pausedTrack) {
+                queue.enqueue(pausedTrack);
+                pausedTrack = null;
+            }
+            for (const t of rest) {
+                queue.enqueue(t);
+            }
+            const next = queue.peek();
+            void notifyImvuMusicState({
+                apiBaseUrl,
+                roomId,
+                botName,
+                track: next ? { title: next.title, url: next.url } : null,
+                state: next ? 'playing' : 'idle',
+            });
+            void ensureDrain();
+        },
+
+        isPaused: () => paused,
 
         stop: () => {
             stopFlag = true;
+            paused = false;
+            pausedTrack = null;
             killFf();
             queue.clearAll();
             void notifyImvuMusicState({

@@ -80,6 +80,10 @@ export async function startUserTracking(page, roomId, options = {}) {
     const MENTION_REPLY_DEDUPE_CAP = 400;
     /** Avatar ids already in room at sync / bot join — no welcome DM */
     const skipWelcomeAvatarIds = new Set();
+    /** Avoid opening the welcome gate while IMVU has not reported anyone yet (empty roster → false "new" joins). */
+    let welcomeGateEmptyRetries = 0;
+    const MAX_WELCOME_GATE_EMPTY_RETRIES = 6;
+    const WELCOME_GATE_EMPTY_RETRY_MS = 2500;
 
     /** Display title for welcome messages (from DOM after join). */
     let ROOM_NAME = 'this room';
@@ -345,15 +349,34 @@ export async function startUserTracking(page, roomId, options = {}) {
         v !== null && v !== undefined && String(v).trim() !== '';
 
     const enableWelcomeForNewArrivals = () => {
-        // Only skip avatars we already know by name (roster / chat). Join_queue bootstrap
-        // rows stay `null` until profile resolves — those must NOT be skipped or they never get welcomed.
+        if (
+            lastUserMap.size === 0 &&
+            skipWelcomeAvatarIds.size === 0 &&
+            welcomeGateEmptyRetries < MAX_WELCOME_GATE_EMPTY_RETRIES
+        ) {
+            welcomeGateEmptyRetries++;
+            if (state.welcomeArrivalsEnableTimer) {
+                clearTimeout(state.welcomeArrivalsEnableTimer);
+            }
+            state.welcomeArrivalsEnableTimer = setTimeout(() => {
+                state.welcomeArrivalsEnableTimer = null;
+                enableWelcomeForNewArrivals();
+            }, WELCOME_GATE_EMPTY_RETRY_MS);
+            return;
+        }
+        welcomeGateEmptyRetries = 0;
+
+        // Everyone already in lastUserMap when the gate opens was present during bootstrap
+        // (join_queue or roster). Skip welcome for all of them, including rows still `null`
+        // until IMVU profile resolves — otherwise late name resolution looks like a "new" join.
         for (const aid of lastUserMap.keys()) {
             if (aid == null || aid === undefined) continue;
-            const label = lastUserMap.get(aid);
-            if (!hasResolvedOccupantName(label)) continue;
             const sid = String(aid);
             skipWelcomeAvatarIds.add(sid);
-            joinQueueBackendAnnounced.add(sid);
+            const label = lastUserMap.get(aid);
+            if (hasResolvedOccupantName(label)) {
+                joinQueueBackendAnnounced.add(sid);
+            }
         }
         // ✅ Mark roster as synced (covers fallback timer path)
         state.participantsRosterSynced = true;
@@ -391,17 +414,19 @@ export async function startUserTracking(page, roomId, options = {}) {
 
 
     /**
-     * @returns {boolean} true if done (welcome scheduled, or skipped on long rejoin cooldown — do not delete processedJoins)
+     * @returns {boolean} true if welcome was scheduled (keep processedJoins); false to allow retry / duplicate join_queue coalescing
      */
     const scheduleWelcomeForAvatar = (avatarId, displayName, convMeta) => {
         if (
             !avatarId ||
             !state.botJoinedChat ||
             !state.welcomeArrivalsEnabled ||
-            isSelfId(avatarId) ||
-            skipWelcomeAvatarIds.has(String(avatarId))
+            isSelfId(avatarId)
         ) {
             return false;
+        }
+        if (skipWelcomeAvatarIds.has(String(avatarId))) {
+            return true;
         }
         const handleKey = welcomeHandleKey(displayName);
         if (!handleKey) return false;
@@ -430,7 +455,8 @@ export async function startUserTracking(page, roomId, options = {}) {
                 Date.now() - lastByHandle < WELCOME_HANDLE_COOLDOWN_MS
             ) {
                 activeJoinSessions.delete(avatarId);
-                return true;
+                // Same handle flapping in-room without a leave — suppress. Real leaves clear this map.
+                return false;
             }
         }
 
@@ -522,6 +548,7 @@ export async function startUserTracking(page, roomId, options = {}) {
         skipWelcomeAvatarIds,
         state,
         triggerCountUpdate,
+        welcomeByHandleLastAt,
         welcomeTimestamps,
     });
 

@@ -10,6 +10,8 @@ import {
     isOnlyBotNameMention,
     messageMentionsBot,
     normalizeImvuUsername,
+    roomQueueBelongsToRoom,
+    welcomeHandleKey,
 } from './user-tracker-utils.js';
 import {
     messageInvokesSivaCharacterAi,
@@ -143,7 +145,18 @@ export const createIncomingMessageHandler = (ctx) => {
                     if (p.state === 'removed') {
                         if (avatarId && ctx.lastUserMap.has(avatarId)) {
                             const username = ctx.lastUserMap.get(avatarId);
+                            ctx.welcomeTimestamps?.delete(avatarId);
+                            if (username != null && String(username).trim() !== '') {
+                                const hk = welcomeHandleKey(
+                                    normalizeImvuUsername(String(username)) || String(username).trim(),
+                                );
+                                if (hk) ctx.welcomeByHandleLastAt?.delete(hk);
+                            }
                             ctx.lastUserMap.delete(avatarId);
+                            ctx.skipWelcomeAvatarIds.delete(avatarId);
+                            ctx.joinQueueBackendAnnounced.delete(avatarId);
+                            ctx.activeJoinSessions.delete(avatarId);
+                            ctx.processedJoins.delete(avatarId);
                             if (username && typeof ctx.onLeave === 'function') ctx.onLeave(username);
                         }
                         return;
@@ -307,6 +320,13 @@ export const createIncomingMessageHandler = (ctx) => {
                         continue;
                     }
                     const username = ctx.lastUserMap.get(avatarId);
+                    ctx.welcomeTimestamps?.delete(avatarId);
+                    if (username != null && String(username).trim() !== '') {
+                        const hk = welcomeHandleKey(
+                            normalizeImvuUsername(String(username)) || String(username).trim(),
+                        );
+                        if (hk) ctx.welcomeByHandleLastAt?.delete(hk);
+                    }
                     ctx.lastUserMap.delete(avatarId);
                     ctx.skipWelcomeAvatarIds.delete(avatarId);
                     ctx.joinQueueBackendAnnounced.delete(avatarId);
@@ -323,6 +343,17 @@ export const createIncomingMessageHandler = (ctx) => {
                 isImvuRoomChatQueue(queue) &&
                 mount === 'messages'
             ) {
+                if (!roomQueueBelongsToRoom(queue, ctx.roomId)) {
+                    if (
+                        process.env.IMVU_CHAT_QUEUE_DEBUG === '1' ||
+                        process.env.IMVU_CHAT_QUEUE_DEBUG === 'true'
+                    ) {
+                        console.log(
+                            `[CHAT][skip-queue] room ${ctx.roomId} queue=${String(queue).slice(0, 160)}`,
+                        );
+                    }
+                    continue;
+                }
                 const envelope = decodeChatEnvelope(action.message);
                 const envelopeName = normalizeImvuUsername(displayNameFromEnvelope(envelope));
                 const rawSender =
@@ -427,7 +458,7 @@ export const createIncomingMessageHandler = (ctx) => {
                             continue; // Note: In a loop, continue instead of return since we want to process other records!
                         }
                         userLastReply.set(senderId, now);
-                        
+
                         // Clean up the map occasionally
                         if (userLastReply.size > 200) userLastReply.clear();
 

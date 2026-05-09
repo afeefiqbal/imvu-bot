@@ -46,6 +46,31 @@ export const isImvuRoomChatQueue = (queue) => {
     return false;
 };
 
+/**
+ * When multiple IMVU room tabs attach CDP, some builds deliver the same WS frames to every session.
+ * Only handle chat (music, mentions, logs) if this frame's queue names our room (e.g. chat-261755692-875-…).
+ * @param {string} queue
+ * @param {string} roomId dashboard slug e.g. 261755692-875 or room-261755692-875
+ * @returns {boolean} false when the queue clearly targets a different room
+ */
+export const roomQueueBelongsToRoom = (queue, roomId) => {
+    const key = String(roomId || '')
+        .trim()
+        .replace(/^room-/i, '')
+        .replace(/[^0-9-]/g, '');
+    if (!key || !/^\d+-\d+$/.test(key)) return true;
+    const q = String(queue || '');
+    if (!q || !isImvuRoomChatQueue(q)) return true;
+    const found = [];
+    const re = /(?:chat|room)-(\d+-\d+)/gi;
+    let m;
+    while ((m = re.exec(q)) !== null) {
+        found.push(m[1]);
+    }
+    if (found.length === 0) return true;
+    return found.includes(key);
+};
+
 export const chatVerbose = () =>
     process.env.CHAT_VERBOSE === '1' || process.env.CHAT_VERBOSE === 'true';
 
