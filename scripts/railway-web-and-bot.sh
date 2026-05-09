@@ -35,7 +35,7 @@ if ! curl -sf "http://127.0.0.1:${PORT}/up" >/dev/null; then
 fi
 
 if ! command -v node >/dev/null 2>&1; then
-  echo "==> [railway] ERROR: 'node' not in PATH. Add Node to the image (repo nixpacks.toml adds nodejs to Nixpacks setup)." >&2
+  echo "==> [railway] ERROR: 'node' not in PATH. Use the repo-root Dockerfile on Railway (PHP + Node), or install Node in your image." >&2
   exit 127
 fi
 

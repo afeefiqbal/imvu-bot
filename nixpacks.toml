@@ -1,5 +1,4 @@
-# Railway uses Nixpacks. PHP/Laravel is detected from composer.json, but that image
-# does not include Node at runtime — add it so scripts/railway-web-and-bot.sh can run
-# `node lurkbot-bot/multi-launcher.js`.
+# If Railway builds with Nixpacks only (no root Dockerfile), try to add Node.
+# Prefer the repo-root Dockerfile for PHP + Node — Nixpacks often still omits `node` from PATH.
 [phases.setup]
 nixPkgs = ["...", "nodejs"]
