@@ -26,6 +26,8 @@ class UserFactory extends Factory
     {
         return [
             'name' => fake()->name(),
+            // Discord snowflake–sized; stay within signed 64-bit for MySQL bigInteger + PHP int
+            'discord_id' => fake()->unique()->numberBetween(1_000_000_000_000_000_000, 9_223_372_036_854_775_807),
             'email' => fake()->unique()->safeEmail(),
             'email_verified_at' => now(),
             'password' => static::$password ??= Hash::make('password'),
