@@ -303,11 +303,13 @@ function cleanupProfileLock(profileDir) {
         await page.screenshot({ path: path.join(__dirname, 'debug-bot.png') });
 
         const guestLink = await page.$('.login-link');
+        const profileLooksGuest = !!guestLink;
         if (guestLink) {
             console.error(
                 `[${BOT_NAME}] SESSION NOT READY: guest UI (.login-link). imvu-bot does not log in.\n` +
                     `  Run once per bot (saves cookies): BOT_NAME=${BOT_NAME} node room-joiner.js "<room-ids>"\n` +
-                    `  Profile dir: profiles/${BOT_NAME}/ — then restart this process.`
+                    `  Profile dir: profiles/${BOT_NAME}/ — then restart this process.\n` +
+                    `  On Railway/Docker: mount a persistent volume on that profile path, or cookies are lost every deploy.`
             );
         }
 
@@ -329,6 +331,7 @@ function cleanupProfileLock(profileDir) {
         const tabStates = new Map(); // Global tracking for each roomId
         const processedGlobal = new Set();
         const lastSentGlobal = new Map();
+        let lastGuestDomSkipLog = 0;
 
         // --- HUMAN-LIKE ENGAGEMENT ---
         const personalities = [
@@ -586,6 +589,17 @@ function cleanupProfileLock(profileDir) {
             if (isListening) return;
             isListening = true;
             try {
+                if (profileLooksGuest) {
+                    const now = Date.now();
+                    if (now - lastGuestDomSkipLog > 120000) {
+                        lastGuestDomSkipLog = now;
+                        console.warn(
+                            `[${BOT_NAME}] DOM join/chat loop idle — boot saw guest UI. CDP may still run; seed profile once and persist profiles/${BOT_NAME}/ (volume on Railway).`
+                        );
+                    }
+                    return;
+                }
+
                 const allPages = await browser.pages();
                 const imvuPages = allPages.filter(
                     (p) => p.url().includes('imvu.com/next/chat') && !p.url().startsWith('chrome-error://')
@@ -646,8 +660,8 @@ function cleanupProfileLock(profileDir) {
                         }
                     }
 
-                    // Wake up the tab only if we REALLY need to!
-                    if (!pageState.isJoined) {
+                    // Wake up the tab only if we REALLY need to (skip if we already treat this tab as joined).
+                    if (!pageState.isJoined && !state.isJoined) {
                         const title = await p.title().catch(() => "Unknown");
                         console.log(`[${BOT_NAME}][Room:${roomId}] Tab is not joined. Wake up assessment...`);
                         await p.bringToFront().catch(() => null);
@@ -706,7 +720,7 @@ function cleanupProfileLock(profileDir) {
                         console.log(`[${BOT_NAME}][Room:${roomId}] Status: ${title} | JoinVisible=${pageState.hasJoinBtn} | Error=${pageState.error || 'None'}`);
                         
                         // If we are definitely on a Chat page but the scraper missed the input, force join-state
-                        if (title.includes('Chat') && !pageState.hasJoinBtn) {
+                        if (title.includes('Chat') && !pageState.hasJoinBtn && !profileLooksGuest) {
                              console.log(`[${BOT_NAME}][Room:${roomId}] Forcing Joined state based on page title.`);
                              state.isJoined = true;
                              state.joinAttemptTime = Date.now();
