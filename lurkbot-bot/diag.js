@@ -1,5 +1,6 @@
 import axios from 'axios';
 import dotenv from 'dotenv';
+import { appBaseUrl } from './env-app-url.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -7,7 +8,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
-const API_BASE_URL = process.env.APP_URL || 'http://localhost:8000';
+const API_BASE_URL = appBaseUrl('http://localhost:8000');
 console.log('Testing bot fetch from:', API_BASE_URL);
 
 async function test() {

@@ -4,6 +4,7 @@ import { spawn } from 'child_process';
 import axios from 'axios';
 import dotenv from 'dotenv';
 import { bulkPost } from './api-queue.js';
+import { appBaseUrl } from './env-app-url.js';
 import { maybeStartMusicIngressTunnel } from './music/tunnelIngress.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -19,7 +20,7 @@ dotenv.config({ path: path.join(__dirname, '..', '.env') });
  * Seed each bot once: `BOT_NAME=<name> node room-joiner.js` (with rooms), then use multi-launcher.
  * Set `IMVU_LAUNCH_SCRIPT=room-joiner.js` if you want the launcher to run login+join in each child instead.
  */
-const API_BASE_URL = process.env.APP_URL || 'http://localhost:8000';
+const API_BASE_URL = appBaseUrl('http://localhost:8000');
 
 /** Comma- or newline-separated proxy URLs; used when a bot row has no `proxy`. */
 function parseProxyPool() {
