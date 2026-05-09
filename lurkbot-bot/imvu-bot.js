@@ -610,7 +610,7 @@ function cleanupProfileLock(profileDir) {
 
                     // Diagnostic Scraper
                     const pageState = await p.evaluate(() => {
-                        const bodyText = document.body.innerText;
+                        const bodyText = document.body?.innerText ?? '';
                         const title = document.title;
                         
                         // Critical detection selectors
