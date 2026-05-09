@@ -34,6 +34,11 @@ if ! curl -sf "http://127.0.0.1:${PORT}/up" >/dev/null; then
   exit 1
 fi
 
+if ! command -v node >/dev/null 2>&1; then
+  echo "==> [railway] ERROR: 'node' not in PATH. Add Node to the image (repo nixpacks.toml adds nodejs to Nixpacks setup)." >&2
+  exit 127
+fi
+
 echo "==> [railway] Starting Node bot (multi-launcher)"
 STATUS=0
 node lurkbot-bot/multi-launcher.js || STATUS=$?

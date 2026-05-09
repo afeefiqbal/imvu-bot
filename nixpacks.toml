@@ -1,0 +1,5 @@
+# Railway uses Nixpacks. PHP/Laravel is detected from composer.json, but that image
+# does not include Node at runtime — add it so scripts/railway-web-and-bot.sh can run
+# `node lurkbot-bot/multi-launcher.js`.
+[phases.setup]
+nixPkgs = ["...", "nodejs"]
