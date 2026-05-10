@@ -83,6 +83,32 @@ const hasResolvedName = (v) =>
     v !== undefined &&
     String(v).trim() !== '';
 
+function wsDebugVerboseEnabled() {
+    const m = String(process.env.WS_DEBUG || '').trim().toLowerCase();
+    const v = String(process.env.WS_DEBUG_VERBOSE || '').trim().toLowerCase();
+    return (
+        m === '2' ||
+        m === 'verbose' ||
+        m === 'all' ||
+        v === '1' ||
+        v === 'true' ||
+        v === 'yes'
+    );
+}
+
+/** True when WS_DEBUG should print this payload (avoids Railway 500 logs/s on presence spam). */
+function wsDebugChatCandidate(msg) {
+    const actions = Array.isArray(msg) ? msg : [msg];
+    for (const action of actions) {
+        const record = action.record || '';
+        const queue = action.queue || '';
+        const mount = action.mount || '';
+        if (record !== 'msg_g2c_send_message' && record !== 'msg_c2g_send_message') continue;
+        if (isImvuRoomChatQueue(queue) || isImvuMessagesMount(mount)) return true;
+    }
+    return false;
+}
+
 export const createIncomingMessageHandler = (ctx) => {
     const userLastReply = new Map();
 
@@ -111,8 +137,15 @@ export const createIncomingMessageHandler = (ctx) => {
     };
 
     return async (msg) => {
-        if (process.env.WS_DEBUG === '1' || process.env.WS_DEBUG === 'true') {
-            console.log('[WS_DEBUG]', JSON.stringify(msg, null, 2));
+        const wsDbg =
+            String(process.env.WS_DEBUG || '').trim().toLowerCase() === '1' ||
+            String(process.env.WS_DEBUG || '').trim().toLowerCase() === 'true';
+        if (wsDbg || wsDebugVerboseEnabled()) {
+            if (wsDebugVerboseEnabled() || wsDebugChatCandidate(msg)) {
+                const line = JSON.stringify(msg);
+                const cap = 8000;
+                console.log('[WS_DEBUG]', line.length > cap ? `${line.slice(0, cap)}…` : line);
+            }
         }
         const actions = Array.isArray(msg) ? msg : [msg];
 
@@ -124,6 +157,33 @@ export const createIncomingMessageHandler = (ctx) => {
 
             if (record === 'msg_c2g_connect' && action.user_id) {
                 ctx.state.selfUserId = decodeId(action.user_id);
+                const sid = ctx.state.selfUserId;
+                // join_queue often arrives before connect; isSelfId was false so we only
+                // bootstrapped into lastUserMap and never set botJoinedChat — welcomes/music stay dead.
+                if (sid && !ctx.state.botJoinedChat) {
+                    if (!ctx.lastUserMap.has(sid)) {
+                        ctx.lastUserMap.set(sid, null);
+                    }
+                    if (!ctx.state.welcomeArrivalsEnabled) {
+                        console.log(
+                            `[JOIN][CONNECT] self ${sid} — bot joined chat (connect after join_queue; self id was unknown until now)`,
+                        );
+                        ctx.state.botJoinedChat = true;
+                        if (ctx.state.welcomeArrivalsEnableTimer) {
+                            clearTimeout(ctx.state.welcomeArrivalsEnableTimer);
+                        }
+                        ctx.state.welcomeArrivalsEnableTimer = setTimeout(() => {
+                            ctx.state.welcomeArrivalsEnableTimer = null;
+                            ctx.enableWelcomeForNewArrivals();
+                        }, 5000);
+                        void ctx.refreshRoomName();
+                        ctx.triggerCountUpdate();
+                    } else {
+                        ctx.state.botJoinedChat = true;
+                        console.log(`[JOIN][CONNECT] self ${sid} — botJoinedChat (welcome gate already open)`);
+                        ctx.triggerCountUpdate();
+                    }
+                }
             }
 
             if (
