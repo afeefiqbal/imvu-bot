@@ -437,15 +437,21 @@ export async function startUserTracking(page, roomId, options = {}) {
         }
         welcomeGateEmptyRetries = 0;
 
-        // Everyone already in lastUserMap when the gate opens was present during bootstrap
-        // (join_queue or roster). Skip welcome for all of them, including rows still `null`
-        // until IMVU profile resolves — otherwise late name resolution looks like a "new" join.
+        // Skip self always. Skip others only when we already know their handle — those are true
+        // "already here" occupants (roster or resolved join_queue). Co-arrivals often sit in
+        // lastUserMap as join_queue bootstrap with label null until /user resolves; if we skip
+        // them here they never get a welcome (see bootstrap + gate OPEN in the same second).
+        const selfSid = state.selfUserId != null ? String(state.selfUserId) : null;
         for (const aid of lastUserMap.keys()) {
             if (aid == null || aid === undefined) continue;
             const sid = String(aid);
-            skipWelcomeAvatarIds.add(sid);
+            if (selfSid != null && sid === selfSid) {
+                skipWelcomeAvatarIds.add(sid);
+                continue;
+            }
             const label = lastUserMap.get(aid);
             if (hasResolvedOccupantName(label)) {
+                skipWelcomeAvatarIds.add(sid);
                 joinQueueBackendAnnounced.add(sid);
             }
         }
