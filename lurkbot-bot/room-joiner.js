@@ -813,23 +813,19 @@ const activateAvatar = async (page) => {
     } catch (e) { }
 };
 
-const startJoiner = async (roomIdsStr = '') => {
-    const botKey = (process.env.BOT_NAME || process.env.BOT_PROFILE || '').trim();
-    if (!botKey) {
-        console.error(`[${RUNNER}] Set BOT_NAME (or legacy BOT_PROFILE) before starting room-joiner.`);
-        process.exit(1);
-    }
-    ctxBotName = botKey;
-    console.log('RUNNING BOT:', process.env.BOT_NAME, `pid=${process.pid}`);
-
-    startDiscordRelayServer(ctxBotName);
+/**
+ * Fetch bot, open Chrome profile, navigate home, ensure IMVU login, stabilize.
+ * Caller must set `ctxBotName` (and usually start Discord relay for standalone room-joiner).
+ */
+async function loadJoinerSession(roomIdsStr) {
+    const botKey = ctxBotName;
 
     console.log(`[${ctxBotName}] 📡 Loading bot record from API...`);
     const backendBot = await fetchBotSettings(botKey);
 
     if (!backendBot || !backendBot.username) {
         console.error(`[${ctxBotName}] ❌ Bot not found or missing username in API response.`);
-        process.exit(1);
+        return { ok: false, exitCode: 1 };
     }
 
     console.log(`[${ctxBotName}] ✅ Backend bot record loaded.`);
@@ -837,21 +833,22 @@ const startJoiner = async (roomIdsStr = '') => {
     botMatch.username = backendBot.username;
     botMatch.password = backendBot.password;
 
-    if (!roomIdsStr && backendBot.room_ids) {
-        roomIdsStr = backendBot.room_ids;
+    let effectiveRooms = roomIdsStr;
+    if (!effectiveRooms && backendBot.room_ids) {
+        effectiveRooms = backendBot.room_ids;
     }
-    if (!roomIdsStr) {
+    if (!effectiveRooms) {
         console.warn(`[${ctxBotName}] ⚠️ No rooms in argv or backend; using default room id.`);
-        roomIdsStr = '242955291-481';
+        effectiveRooms = '242955291-481';
     }
 
-    const roomList = roomIdsStr
+    const roomList = effectiveRooms
         .split(',')
         .map((id) => id.replace(/[^0-9-]/g, '').replace(/^-+|-+$/g, ''))
         .filter(Boolean);
     if (roomList.length === 0) {
         console.error(`[${ctxBotName}] ❌ No valid room ids.`);
-        process.exit(1);
+        return { ok: false, exitCode: 1 };
     }
 
     const USER_DATA_DIR = path.resolve(__dirname, 'profiles', ctxBotName);
@@ -908,14 +905,14 @@ const startJoiner = async (roomIdsStr = '') => {
             `[${ctxBotName}] ❌ Still on chrome-error:// after home retry (proxy or network).`
         );
         await browser.close().catch(() => {});
-        process.exit(parsed.serverForChrome ? EXIT_PROXY_ROTATE : 1);
+        return { ok: false, exitCode: parsed.serverForChrome ? EXIT_PROXY_ROTATE : 1 };
     }
 
     const loginOk = await ensureLoggedIn(page1);
     if (!loginOk) {
         console.error(`[${ctxBotName}] ❌ Could not establish IMVU session. Exiting.`);
         await browser.close().catch(() => {});
-        process.exit(parsed.serverForChrome ? EXIT_PROXY_ROTATE : 1);
+        return { ok: false, exitCode: parsed.serverForChrome ? EXIT_PROXY_ROTATE : 1 };
     }
 
     console.log(`[${ctxBotName}] ⏳ Stabilizing session on home before rooms...`);
@@ -923,6 +920,83 @@ const startJoiner = async (roomIdsStr = '') => {
         if (await detectStrictLoggedIn(page1) || (await detectRelaxedAppLoggedIn(page1))) break;
         await new Promise((r) => setTimeout(r, 2000));
     }
+
+    return { ok: true, browser, page1, parsed, chromeProxy, backendBot, roomList };
+}
+
+/**
+ * IMVU login + persist cookies to profiles/<botName>/ (same Puppeteer path as room-joiner bootstrap).
+ * For multi-launcher: does not start Discord relay (imvu-bot binds IMVU_DISCORD_RELAY_PORT next).
+ * @param {{ botName: string, roomIdsStr: string, childEnv: Record<string, string | undefined> }} opts
+ * @returns {Promise<number>} 0 ok, 1 failure, 2 proxy rotate
+ */
+export async function runProfileLoginBootstrap({ botName, roomIdsStr, childEnv }) {
+    const envKeys = Object.keys(childEnv || {});
+    const envBackup = {};
+    for (const k of envKeys) {
+        envBackup[k] = process.env[k];
+    }
+    if (childEnv) {
+        for (const [k, v] of Object.entries(childEnv)) {
+            if (v === undefined || v === null) {
+                delete process.env[k];
+            } else {
+                process.env[k] = String(v);
+            }
+        }
+    }
+
+    const prevCtx = ctxBotName;
+    const prevBotMatch = { ...botMatch };
+    const prevHas = hasLoggedIn;
+    const prevLast = lastLoginAt;
+
+    try {
+        ctxBotName = botName;
+        botMatch = { username: '', password: '', profile: botName };
+        hasLoggedIn = false;
+        lastLoginAt = 0;
+
+        const session = await loadJoinerSession(roomIdsStr || '');
+        if (!session.ok) {
+            return session.exitCode;
+        }
+        await session.browser.close().catch(() => {});
+        console.log(
+            `[${ctxBotName}] ✅ Profile login bootstrap finished (in-process); session saved under profiles/${botName}/`,
+        );
+        return 0;
+    } catch (e) {
+        console.error(`[${botName}] runProfileLoginBootstrap:`, e);
+        return 1;
+    } finally {
+        for (const k of envKeys) {
+            if (envBackup[k] === undefined) delete process.env[k];
+            else process.env[k] = envBackup[k];
+        }
+        ctxBotName = prevCtx;
+        botMatch = prevBotMatch;
+        hasLoggedIn = prevHas;
+        lastLoginAt = prevLast;
+    }
+}
+
+const startJoiner = async (roomIdsStr = '') => {
+    const botKey = (process.env.BOT_NAME || process.env.BOT_PROFILE || '').trim();
+    if (!botKey) {
+        console.error(`[${RUNNER}] Set BOT_NAME (or legacy BOT_PROFILE) before starting room-joiner.`);
+        process.exit(1);
+    }
+    ctxBotName = botKey;
+    console.log('RUNNING BOT:', process.env.BOT_NAME, `pid=${process.pid}`);
+
+    startDiscordRelayServer(ctxBotName);
+
+    const session = await loadJoinerSession(roomIdsStr);
+    if (!session.ok) {
+        process.exit(session.exitCode);
+    }
+    const { browser, page1, parsed, chromeProxy, backendBot, roomList } = session;
 
     const bootstrapOnly = ['1', 'true', 'yes', 'on'].includes(
         String(process.env.ROOM_JOINER_BOOTSTRAP_ONLY || '')
@@ -1015,8 +1089,20 @@ const startJoiner = async (roomIdsStr = '') => {
     }
 };
 
-const targetRoom = process.argv[2] || '';
-startJoiner(targetRoom).catch((err) => {
-    console.error(`[${ctxBotName}] Fatal Error in startJoiner:`, err);
-    process.exit(1);
-});
+function isRoomJoinerMainModule() {
+    const entry = process.argv[1];
+    if (!entry) return false;
+    try {
+        return path.normalize(path.resolve(entry)) === path.normalize(fileURLToPath(import.meta.url));
+    } catch {
+        return false;
+    }
+}
+
+if (isRoomJoinerMainModule()) {
+    const targetRoom = process.argv[2] || '';
+    startJoiner(targetRoom).catch((err) => {
+        console.error(`[${ctxBotName}] Fatal Error in startJoiner:`, err);
+        process.exit(1);
+    });
+}
