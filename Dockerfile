@@ -71,13 +71,14 @@ WORKDIR /app
 
 COPY . .
 
-# Laravel expects these dirs at runtime (pre-deploy migrate + artisan serve).
+# Laravel + IMVU bot: writable dirs at runtime (volume may replace lurkbot-bot/profiles at deploy).
 RUN mkdir -p bootstrap/cache \
     storage/framework/sessions \
     storage/framework/views \
     storage/framework/cache/data \
     storage/logs \
-    && chmod -R a+rwX bootstrap/cache storage
+    lurkbot-bot/profiles \
+    && chmod -R a+rwX bootstrap/cache storage lurkbot-bot/profiles
 
 RUN composer install --no-dev --optimize-autoloader --no-interaction --no-scripts \
     && npm ci \
