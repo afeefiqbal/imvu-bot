@@ -8,7 +8,7 @@ import express from 'express';
 import { startUserTracking } from './user-tracker.js';
 import axios from 'axios';
 import dotenv from 'dotenv';
-import { appBaseUrl } from './env-app-url.js';
+import { backendApiBaseUrl } from './env-app-url.js';
 import { parseProxyFromProcessEnv, resolveChromeProxy } from './proxy-env.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -60,7 +60,7 @@ function startDiscordRelayServer(botLabel) {
 }
 
 const RUNNER = 'RoomJoiner';
-const API_BASE_URL = appBaseUrl('http://127.0.0.1:8000');
+const API_BASE_URL = backendApiBaseUrl('http://127.0.0.1:8000');
 
 let ctxBotName = RUNNER;
 

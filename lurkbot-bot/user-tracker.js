@@ -13,7 +13,7 @@ import {
     normalizeRoomApiSlug,
     welcomeHandleKey,
 } from './user-tracker-utils.js';
-import { appBaseUrl } from './env-app-url.js';
+import { backendApiBaseUrl } from './env-app-url.js';
 
 const getDefaultWelcomeMessage = (name, roomName = 'the room') =>
     `Hey ${name || 'there'} 👋 welcome to ${roomName}!`;
@@ -54,7 +54,7 @@ export async function startUserTracking(page, roomId, options = {}) {
     console.log(`[TRACKER] 🎯 CDP WEBSOCKET MODE enabled for room: ${roomId}`);
 
     const lastUserMap = new Map(); // avatarId -> username
-    const API_BASE_URL = appBaseUrl('http://127.0.0.1:8000');
+    const API_BASE_URL = backendApiBaseUrl('http://127.0.0.1:8000');
     const syncBotName =
         (options.botName && String(options.botName).trim()) ||
         process.env.BOT_NAME ||

@@ -13,14 +13,14 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import puppeteer from 'puppeteer';
-import { appBaseUrl } from './env-app-url.js';
+import { backendApiBaseUrl } from './env-app-url.js';
 import { parseProxyFromProcessEnv, resolveChromeProxy } from './proxy-env.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
-const API_BASE = appBaseUrl('http://127.0.0.1:8000');
+const API_BASE = backendApiBaseUrl('http://127.0.0.1:8000');
 
 async function applyProxyAuthToPage(page, auth) {
     if (!page?.isClosed?.() && auth) await page.authenticate({ username: auth.username, password: auth.password || '' });

@@ -8,7 +8,7 @@ import { EventEmitter } from 'events';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import { startUserTracking } from './user-tracker.js';
-import { appBaseUrl } from './env-app-url.js';
+import { backendApiBaseUrl } from './env-app-url.js';
 import { parseProxyFromProcessEnv, resolveChromeProxy, proxyConfigured } from './proxy-env.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -128,7 +128,7 @@ async function proxyHttpsPreflight(parsed) {
     }
 }
 
-const BACKEND_URL = appBaseUrl('http://127.0.0.1:8000');
+const BACKEND_URL = backendApiBaseUrl('http://127.0.0.1:8000');
 
 /** IMVU “Join room” CTA — wait + click instead of racing evaluate(). */
 const JOIN_ROOM_BTN_SELECTOR = 'button.cs2-btn-primary, button[class*="join"], .btn-join';

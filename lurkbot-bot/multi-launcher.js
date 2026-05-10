@@ -4,7 +4,7 @@ import { spawn } from 'child_process';
 import axios from 'axios';
 import dotenv from 'dotenv';
 import { bulkPost } from './api-queue.js';
-import { appBaseUrl } from './env-app-url.js';
+import { backendApiBaseUrl } from './env-app-url.js';
 import { maybeStartMusicIngressTunnel } from './music/tunnelIngress.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -46,7 +46,8 @@ normalizeEnvForLocalDev();
  * Seed each bot once: `BOT_NAME=<name> node room-joiner.js` (with rooms), then use multi-launcher.
  * Set `IMVU_LAUNCH_SCRIPT=room-joiner.js` if you want the launcher to run login+join in each child instead.
  */
-const API_BASE_URL = appBaseUrl('http://127.0.0.1:8000');
+const API_BASE_URL = backendApiBaseUrl('http://127.0.0.1:8000');
+console.log(`[MULTI-LAUNCHER] Laravel API base (bot→HTTP): ${API_BASE_URL}`);
 
 /** Comma- or newline-separated proxy URLs; used when a bot row has no `proxy`. */
 function parseProxyPool() {
@@ -318,7 +319,11 @@ async function fetchAllBots() {
         const { data } = await axios.get(`${API_BASE_URL}/api/bots`);
         return data && Array.isArray(data) ? data : [];
     } catch (e) {
-        console.error('[MULTI-LAUNCHER] ❌ Failed to contact backend for bots list.', e.message);
+        const st = e.response?.status;
+        console.error(
+            `[MULTI-LAUNCHER] ❌ Failed to contact backend (${API_BASE_URL}/api/bots${st ? ` → HTTP ${st}` : ''}).`,
+            e.message,
+        );
         return [];
     }
 }

@@ -1,8 +1,8 @@
 import axios from 'axios';
-import { appBaseUrl } from './env-app-url.js';
+import { backendApiBaseUrl } from './env-app-url.js';
 
 let queue = [];
-const API_BASE_URL = appBaseUrl('http://127.0.0.1:8000');
+const API_BASE_URL = backendApiBaseUrl('http://127.0.0.1:8000');
 
 setInterval(async () => {
     if (!queue.length) return;

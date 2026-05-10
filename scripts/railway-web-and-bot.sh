@@ -49,6 +49,8 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 echo "==> [railway] Starting Node bot (multi-launcher)"
+# Same container as Laravel: bot must call loopback + PORT (not public APP_URL / not :8000).
+export BOT_API_BASE_URL="http://127.0.0.1:${PORT}"
 STATUS=0
 node lurkbot-bot/multi-launcher.js || STATUS=$?
 exit "${STATUS}"
