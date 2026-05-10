@@ -110,6 +110,10 @@ function wsDebugChatCandidate(msg) {
 }
 
 export const createIncomingMessageHandler = (ctx) => {
+    const welcomeGateDelayMs = Math.max(
+        0,
+        parseInt(String(process.env.IMVU_WELCOME_GATE_MS || '5000'), 10) || 5000
+    );
     const userLastReply = new Map();
 
     const handleFinalJoin = (avatarId) => {
@@ -175,7 +179,7 @@ export const createIncomingMessageHandler = (ctx) => {
                         ctx.state.welcomeArrivalsEnableTimer = setTimeout(() => {
                             ctx.state.welcomeArrivalsEnableTimer = null;
                             ctx.enableWelcomeForNewArrivals();
-                        }, 5000);
+                        }, welcomeGateDelayMs);
                         void ctx.refreshRoomName();
                         ctx.triggerCountUpdate();
                     } else {
@@ -256,7 +260,7 @@ export const createIncomingMessageHandler = (ctx) => {
                         ctx.state.welcomeArrivalsEnableTimer = setTimeout(() => {
                             ctx.state.welcomeArrivalsEnableTimer = null;
                             ctx.enableWelcomeForNewArrivals();
-                        }, 5000);
+                        }, welcomeGateDelayMs);
                     }
                 }
 
@@ -279,7 +283,7 @@ export const createIncomingMessageHandler = (ctx) => {
                         ctx.state.welcomeArrivalsEnableTimer = setTimeout(() => {
                             ctx.state.welcomeArrivalsEnableTimer = null;
                             ctx.enableWelcomeForNewArrivals();
-                        }, 5000);
+                        }, welcomeGateDelayMs);
                         void ctx.refreshRoomName();
                         ctx.triggerCountUpdate();
                     } else if (avatarId && !ctx.lastUserMap.has(avatarId)) {
@@ -359,7 +363,7 @@ export const createIncomingMessageHandler = (ctx) => {
                         ctx.state.welcomeArrivalsEnableTimer = setTimeout(() => {
                             ctx.state.welcomeArrivalsEnableTimer = null;
                             ctx.enableWelcomeForNewArrivals();
-                        }, 5000);
+                        }, welcomeGateDelayMs);
                     }
                     void ctx.refreshRoomName();
                 }

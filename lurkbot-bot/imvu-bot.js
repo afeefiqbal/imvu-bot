@@ -135,6 +135,48 @@ const BACKEND_URL = backendApiBaseUrl('http://127.0.0.1:8000');
 const JOIN_ROOM_BTN_SELECTOR = 'button.cs2-btn-primary, button[class*="join"], .btn-join';
 const MAX_ROOM_TABS = Math.max(1, parseInt(process.env.IMVU_MAX_TABS || '20', 10));
 
+/**
+ * Serialized into the page for `page.evaluate(roomJoinScrapeForPage)`.
+ * Must not close over Node scope. In-page DOM errors become `error: 'IN_PAGE_EVAL'`
+ * so Puppeteer does not throw for ordinary selector misses during hydration.
+ */
+function roomJoinScrapeForPage() {
+    try {
+        const bodyText = document.body?.innerText ?? '';
+        const joinBtn = document.querySelector(
+            'button.cs2-btn-primary, button[class*="join"], .btn-join'
+        );
+        const chatInput = document.querySelector(
+            'textarea.input-text, .input-text, [class*="chat-input"]'
+        );
+        const chatMessages = document.querySelector(
+            '.cs2-chat-messages, .message-list, .chat-messages'
+        );
+        const roomActions = document.querySelector('.cs2-top-actions, .room-menu');
+
+        let error = null;
+        if (bodyText.includes('Room is full')) error = 'ROOM_FULL';
+        else if (bodyText.includes('Access Denied')) error = 'ACCESS_DENIED';
+        else if (bodyText.includes('Please log in')) error = 'LOGGED_OUT';
+
+        const isPhysicallyInside = (!!chatMessages || !!roomActions) && !joinBtn;
+        const representsJoined = isPhysicallyInside || (!!chatInput && !joinBtn);
+
+        return {
+            hasJoinBtn: !!joinBtn && joinBtn.offsetWidth > 0,
+            isJoined: representsJoined,
+            error,
+        };
+    } catch (e) {
+        return {
+            hasJoinBtn: false,
+            isJoined: false,
+            error: 'IN_PAGE_EVAL',
+            detail: String(e && e.message ? e.message : e),
+        };
+    }
+}
+
 async function applyProxyAuthToPage(page, auth) {
     if (!page || page.isClosed() || !auth) return;
     await page.authenticate({ username: auth.username, password: auth.password || '' });
@@ -310,13 +352,40 @@ async function wireProxyAuthForBrowser(browser, auth) {
 
         // --- Join if still on preview (same profile should already be logged in) ---
         console.log(`[${BOT_NAME}] Checking for Join button...`);
-        try {
-            await page.waitForSelector(JOIN_ROOM_BTN_SELECTOR, { timeout: 30000, visible: true });
-            await page.click(JOIN_ROOM_BTN_SELECTOR).catch(() => null);
-            console.log(`[${BOT_NAME}] Join click sent (waitForSelector + click).`);
-            await new Promise((r) => setTimeout(r, 8000));
-        } catch {
-            console.log(`[${BOT_NAME}] Already in room or no join button within 30s.`);
+        const initialJoinScrape = await page.evaluate(roomJoinScrapeForPage).catch((e) => {
+            console.warn(`[${BOT_NAME}] Join check scrape failed: ${e.message}`);
+            return null;
+        });
+        if (initialJoinScrape?.error && ['ROOM_FULL', 'ACCESS_DENIED', 'LOGGED_OUT'].includes(initialJoinScrape.error)) {
+            console.log(`[${BOT_NAME}] Room issue before join: ${initialJoinScrape.error}`);
+        }
+        const shouldClickInitialJoin =
+            initialJoinScrape &&
+            initialJoinScrape.hasJoinBtn &&
+            !initialJoinScrape.isJoined &&
+            !initialJoinScrape.error;
+        if (shouldClickInitialJoin) {
+            try {
+                await page.waitForSelector(JOIN_ROOM_BTN_SELECTOR, { timeout: 30000, visible: true });
+                await page.click(JOIN_ROOM_BTN_SELECTOR).catch(() => null);
+                console.log(`[${BOT_NAME}] Join click sent (waitForSelector + click).`);
+                await new Promise((r) => setTimeout(r, 8000));
+            } catch {
+                console.log(`[${BOT_NAME}] Join click path failed after visible join button.`);
+            }
+        } else if (initialJoinScrape == null) {
+            try {
+                await page.waitForSelector(JOIN_ROOM_BTN_SELECTOR, { timeout: 20000, visible: true });
+                await page.click(JOIN_ROOM_BTN_SELECTOR).catch(() => null);
+                console.log(`[${BOT_NAME}] Join click sent (fallback after scrape unavailable).`);
+                await new Promise((r) => setTimeout(r, 8000));
+            } catch {
+                console.log(`[${BOT_NAME}] Already in room or no join button (scrape unavailable).`);
+            }
+        } else {
+            console.log(
+                `[${BOT_NAME}] Skipping initial join click (inside room, loading, or no CTA — joined=${Boolean(initialJoinScrape?.isJoined)} btn=${Boolean(initialJoinScrape?.hasJoinBtn)} err=${initialJoinScrape?.error || 'none'}).`
+            );
         }
 
         let lastSyncHash = "";
@@ -324,6 +393,8 @@ async function wireProxyAuthForBrowser(browser, auth) {
         const targetRooms = new Set(); // Using GLOBAL Set
         const joiningRooms = new Set();
         const tabStates = new Map(); // Global tracking for each roomId
+        /** Throttle noisy evaluate failures per room (navigation / detached frame). */
+        const roomEvalFailLastLogMs = new Map();
         const processedGlobal = new Set();
         const lastSentGlobal = new Map();
         let lastGuestDomSkipLog = 0;
@@ -617,41 +688,34 @@ async function wireProxyAuthForBrowser(browser, auth) {
                     }
                     const state = tabStates.get(roomId);
 
-                    // Diagnostic Scraper
-                    const pageState = await p.evaluate(() => {
-                        const bodyText = document.body?.innerText ?? '';
-                        const title = document.title;
-                        
-                        // Critical detection selectors
-                        const joinBtn = document.querySelector('button.cs2-btn-primary, button[class*="join"], .btn-join');
-                        const chatInput = document.querySelector('textarea.input-text, .input-text, [class*="chat-input"]');
-                        const chatMessages = document.querySelector('.cs2-chat-messages, .message-list, .chat-messages');
-                        const roomActions = document.querySelector('.cs2-top-actions, .room-menu');
+                    const pageState = await p.evaluate(roomJoinScrapeForPage).catch((e) => {
+                        const now = Date.now();
+                        const last = roomEvalFailLastLogMs.get(roomId) || 0;
+                        if (now - last > 60000) {
+                            console.warn(
+                                `[${BOT_NAME}][Room:${roomId}] Room scrape failed (navigation/target): ${e.message}`
+                            );
+                            roomEvalFailLastLogMs.set(roomId, now);
+                        }
+                        return { hasJoinBtn: false, isJoined: false, error: 'EVAL_FAIL' };
+                    });
 
-                        let error = null;
-                        if (bodyText.includes('Room is full')) error = 'ROOM_FULL';
-                        else if (bodyText.includes('Access Denied')) error = 'ACCESS_DENIED';
-                        else if (bodyText.includes('Please log in')) error = 'LOGGED_OUT';
-                        
-                        // STRICTOR JOINED HEURISTIC:
-                        // 1. Must see chat messages or room actions
-                        // 2. Must NOT see the Join button anymore
-                        const isPhysicallyInside = (!!chatMessages || !!roomActions) && !joinBtn;
-                        
-                        // fallback if those aren't found but chat input IS there
-                        const representsJoined = isPhysicallyInside || (!!chatInput && !joinBtn);
-
-                        return { 
-                            hasJoinBtn: !!joinBtn && (joinBtn.offsetWidth > 0), 
-                            isJoined: representsJoined, 
-                            error 
-                        };
-                    }).catch(() => ({ hasJoinBtn: false, isJoined: false, error: 'EVAL_FAIL' }));
-
-                    if (pageState.error) {
+                    if (pageState.error && ['ROOM_FULL', 'ACCESS_DENIED', 'LOGGED_OUT'].includes(pageState.error)) {
                         console.log(`[${BOT_NAME}][Room:${roomId}] Room Blocker: ${pageState.error}`);
                         if (pageState.error === 'LOGGED_OUT') {
-                            console.log(`[${BOT_NAME}] Session expired on tab — restart room-joiner for this bot to refresh cookies.`);
+                            console.log(
+                                `[${BOT_NAME}] Session expired on tab — restart room-joiner for this bot to refresh cookies.`
+                            );
+                        }
+                    } else if (pageState.error === 'IN_PAGE_EVAL' && pageState.detail) {
+                        const now = Date.now();
+                        const k = `${roomId}:inpage`;
+                        const last = roomEvalFailLastLogMs.get(k) || 0;
+                        if (now - last > 120000) {
+                            console.warn(
+                                `[${BOT_NAME}][Room:${roomId}] Room scrape (in-page): ${pageState.detail}`
+                            );
+                            roomEvalFailLastLogMs.set(k, now);
                         }
                     }
 
@@ -662,23 +726,11 @@ async function wireProxyAuthForBrowser(browser, auth) {
                         await p.bringToFront().catch(() => null);
                         await new Promise(r => setTimeout(r, 2000)); // wait for wake-up
                         
-                        // RE-EVALUATE after wake up!
-                        const freshState = await p.evaluate(() => {
-                            const joinBtn = document.querySelector('button.cs2-btn-primary, button[class*="join"], .btn-join');
-                            const chatInput = document.querySelector('textarea.input-text, .input-text, [class*="chat-input"]');
-                            const chatMessages = document.querySelector('.cs2-chat-messages, .message-list, .chat-messages');
-                            const roomActions = document.querySelector('.cs2-top-actions, .room-menu');
-                            const isPhysicallyInside = (!!chatMessages || !!roomActions) && !joinBtn;
-                            const representsJoined = isPhysicallyInside || (!!chatInput && !joinBtn);
-                            return { 
-                                hasJoinBtn: !!joinBtn && (joinBtn.offsetWidth > 0), 
-                                isJoined: representsJoined
-                            };
-                        }).catch(() => pageState);
+                        const freshState = await p.evaluate(roomJoinScrapeForPage).catch(() => pageState);
                         Object.assign(pageState, freshState);
                     }
 
-                    if (pageState.hasJoinBtn && !pageState.isJoined) {
+                    if (pageState.hasJoinBtn && !pageState.isJoined && !pageState.error) {
                         console.log(`[${BOT_NAME}][Room:${roomId}] Join button visible! Clicking...`);
                         try {
                             await p.waitForSelector(JOIN_ROOM_BTN_SELECTOR, { timeout: 30000, visible: true });
@@ -722,11 +774,17 @@ async function wireProxyAuthForBrowser(browser, auth) {
                              continue;
                         }
 
-                        // If page is blank or stuck on redirect for > 30s, refresh
-                        if (!pageState.hasJoinBtn && !pageState.isJoined && (Date.now() - state.creationTime > 45000)) {
-                             console.log(`[${BOT_NAME}][Room:${roomId}] Tab seems stuck or blank. Refreshing...`);
-                             await p.reload({ waitUntil: 'domcontentloaded' }).catch(() => null);
-                             state.creationTime = Date.now(); // reset timer
+                        // Only hard-refresh after a *clean* scrape says we're not inside (skip on EVAL_FAIL /
+                        // IN_PAGE_EVAL — those often mean navigation/hydration, not a blank tab).
+                        if (
+                            !pageState.error &&
+                            !pageState.hasJoinBtn &&
+                            !pageState.isJoined &&
+                            Date.now() - state.creationTime > 45000
+                        ) {
+                            console.log(`[${BOT_NAME}][Room:${roomId}] Tab seems stuck or blank. Refreshing...`);
+                            await p.reload({ waitUntil: 'domcontentloaded' }).catch(() => null);
+                            state.creationTime = Date.now();
                         }
                         continue;
                     }
