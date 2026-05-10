@@ -5,6 +5,7 @@ import {
     decodeChatEnvelope,
     decodeId,
     displayNameFromEnvelope,
+    isImvuMessagesMount,
     isImvuRoomChatQueue,
     isImvuRoomProtocolLine,
     isOnlyBotNameMention,
@@ -341,7 +342,7 @@ export const createIncomingMessageHandler = (ctx) => {
             if (
                 (record === 'msg_g2c_send_message' || record === 'msg_c2g_send_message') &&
                 isImvuRoomChatQueue(queue) &&
-                mount === 'messages'
+                isImvuMessagesMount(mount)
             ) {
                 if (!roomQueueBelongsToRoom(queue, ctx.roomId)) {
                     if (

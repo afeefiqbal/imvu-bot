@@ -37,6 +37,15 @@ export const decodeId = (id) => {
 
 export const isImvuRoomProtocolLine = (msg) => (msg || '').trim().startsWith('*');
 
+/** IMVU Next chat mount label varies by build (`messages`, `edge:messages`, …). */
+export const isImvuMessagesMount = (mount) => {
+    const m = String(mount || '').toLowerCase();
+    if (!m) return false;
+    if (m === 'messages' || m === 'edge:messages') return true;
+    if (m.endsWith(':messages')) return true;
+    return false;
+};
+
 /** Room chat WS queue: legacy `/chat/123` or Next `inv:/chat/chat-roomId-instance`. */
 export const isImvuRoomChatQueue = (queue) => {
     const q = String(queue || '');

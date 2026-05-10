@@ -24,25 +24,95 @@ const getDefaultWelcomeMessage = (name, roomName = 'the room') =>
  * Intercepts frames directly from the network layer.
  */
 
+/**
+ * Attach CDP Network listeners for WebSocket frames on the page target and any other
+ * Chromium targets that belong to this browser and may carry IMVU traffic (OOPIFs /
+ * extra frames). Without this, chat WS can live in a child target and never reach the
+ * main page's CDP session.
+ */
 export const attachToPageCDP = async (page, onMessage) => {
-    try {
-        const session = await page.target().createCDPSession();
-        await session.send('Network.enable');
+    const browser = page.browser();
+    const sessions = [];
+    const attachedTargets = new WeakSet();
+    /** Drop duplicate frames when multiple targets observe the same WS payload. */
+    const recentRaw = new Map();
+    const DEDUPE_MS = 250;
+    const pruneRecent = () => {
+        const now = Date.now();
+        for (const [k, t] of recentRaw) {
+            if (now - t > DEDUPE_MS * 8) recentRaw.delete(k);
+        }
+    };
 
+    const forwardPayload = (raw) => {
+        if (raw == null || raw === '') return;
+        pruneRecent();
+        const now = Date.now();
+        const key = raw.length > 4000 ? `${raw.slice(0, 2000)}…${raw.slice(-500)}` : raw;
+        const prev = recentRaw.get(key);
+        if (prev != null && now - prev < DEDUPE_MS) return;
+        recentRaw.set(key, now);
+        try {
+            const data = JSON.parse(raw);
+            onMessage(data);
+        } catch {
+            /* non-JSON WS payload */
+        }
+    };
+
+    const wireSession = (session) => {
         session.on('Network.webSocketFrameReceived', ({ response }) => {
-            try {
-                const data = JSON.parse(response.payloadData);
-                onMessage(data);
-            } catch {}
+            forwardPayload(response?.payloadData);
         });
-
         session.on('Network.webSocketFrameSent', ({ response }) => {
-            try {
-                const data = JSON.parse(response.payloadData);
-                onMessage(data);
-            } catch {}
+            forwardPayload(response?.payloadData);
         });
+    };
 
+    const tryAttachTarget = async (target) => {
+        if (attachedTargets.has(target)) return;
+        try {
+            const url = target.url() || '';
+            if (url && !url.includes('imvu.com')) return;
+            const typ = target.type();
+            if (typ === 'browser') return;
+            const session = await target.createCDPSession();
+            await session.send('Network.enable');
+            wireSession(session);
+            sessions.push(session);
+            attachedTargets.add(target);
+        } catch {
+            /* service workers / unsupported targets */
+        }
+    };
+
+    try {
+        await tryAttachTarget(page.target());
+        for (const t of browser.targets()) {
+            if (t === page.target()) continue;
+            await tryAttachTarget(t);
+        }
+
+        const onTargetCreated = (t) => {
+            void tryAttachTarget(t);
+        };
+        browser.on('targetcreated', onTargetCreated);
+
+        const detachAll = async () => {
+            browser.off('targetcreated', onTargetCreated);
+            for (const s of sessions) {
+                try {
+                    await s.detach();
+                } catch {
+                    /* ignore */
+                }
+            }
+            sessions.length = 0;
+        };
+
+        page.once('close', () => {
+            void detachAll();
+        });
     } catch (e) {
         console.error(`[TRACKER] CDP attach failed:`, e.message);
     }
