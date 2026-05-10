@@ -10,6 +10,7 @@ import axios from 'axios';
 import dotenv from 'dotenv';
 import { backendApiBaseUrl } from './env-app-url.js';
 import { parseProxyFromProcessEnv, resolveChromeProxy } from './proxy-env.js';
+import { cleanupChromeProfileSingletonLocks } from './chrome-profile-lock.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -84,15 +85,6 @@ async function wireProxyAuthForBrowser(browser, auth) {
     });
     for (const pg of await browser.pages()) await hook(pg);
 }
-
-const cleanupProfileLock = (profileDir) => {
-    for (const name of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
-        try {
-            const p = path.join(profileDir, name);
-            if (fs.existsSync(p)) fs.unlinkSync(p);
-        } catch {}
-    }
-};
 
 const fetchBotSettings = async (botName) => {
     const url = `${API_BASE_URL}/api/bots/${encodeURIComponent(botName)}`;
@@ -863,7 +855,7 @@ const startJoiner = async (roomIdsStr = '') => {
     }
 
     const USER_DATA_DIR = path.resolve(__dirname, 'profiles', ctxBotName);
-    cleanupProfileLock(USER_DATA_DIR);
+    cleanupChromeProfileSingletonLocks(USER_DATA_DIR, ctxBotName);
 
     const parsed = parseProxyFromProcessEnv({ fallbackRaw: (backendBot.proxy || '').trim() });
     const chromeProxy = resolveChromeProxy(parsed);

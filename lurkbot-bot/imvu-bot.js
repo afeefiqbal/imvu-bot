@@ -10,6 +10,7 @@ import { dirname } from 'path';
 import { startUserTracking } from './user-tracker.js';
 import { backendApiBaseUrl } from './env-app-url.js';
 import { parseProxyFromProcessEnv, resolveChromeProxy, proxyConfigured } from './proxy-env.js';
+import { cleanupChromeProfileSingletonLocks } from './chrome-profile-lock.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -155,15 +156,6 @@ async function wireProxyAuthForBrowser(browser, auth) {
     for (const pg of await browser.pages()) await hook(pg);
 }
 
-function cleanupProfileLock(profileDir) {
-    for (const name of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
-        try {
-            const p = path.join(profileDir, name);
-            if (fs.existsSync(p)) fs.unlinkSync(p);
-        } catch {}
-    }
-}
-
 (async () => {
     try {
         const BOT_NAME = (process.env.BOT_NAME || '').trim();
@@ -179,7 +171,7 @@ function cleanupProfileLock(profileDir) {
         }
 
         const USER_DATA_DIR = path.resolve(__dirname, 'profiles', BOT_NAME);
-        cleanupProfileLock(USER_DATA_DIR);
+        cleanupChromeProfileSingletonLocks(USER_DATA_DIR, BOT_NAME);
         const parsed = parseProxyFromProcessEnv();
         const chromeProxy = resolveChromeProxy(parsed);
 

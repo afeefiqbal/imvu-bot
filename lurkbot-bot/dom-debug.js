@@ -15,6 +15,7 @@ import { fileURLToPath } from 'url';
 import puppeteer from 'puppeteer';
 import { backendApiBaseUrl } from './env-app-url.js';
 import { parseProxyFromProcessEnv, resolveChromeProxy } from './proxy-env.js';
+import { cleanupChromeProfileSingletonLocks } from './chrome-profile-lock.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -38,15 +39,6 @@ async function wireProxyAuthForBrowser(browser, auth) {
         if (pg) await hook(pg);
     });
     for (const pg of await browser.pages()) await hook(pg);
-}
-
-function cleanupLock(profileDir) {
-    for (const name of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
-        try {
-            const p = path.join(profileDir, name);
-            if (fs.existsSync(p)) fs.unlinkSync(p);
-        } catch {}
-    }
 }
 
 async function main() {
@@ -73,9 +65,9 @@ async function main() {
         profileDir = path.join(tmpProfileRoot, 'chrome-profile');
         console.log('[DOM-DEBUG] copying profile →', profileDir, '(so a running bot can keep the original locked)');
         fs.cpSync(canonicalProfile, profileDir, { recursive: true });
-        cleanupLock(profileDir);
+        cleanupChromeProfileSingletonLocks(profileDir, 'dom-debug');
     } else {
-        cleanupLock(profileDir);
+        cleanupChromeProfileSingletonLocks(profileDir, 'dom-debug');
     }
 
     const args = [
