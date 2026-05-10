@@ -10,7 +10,7 @@ import axios from 'axios';
 import dotenv from 'dotenv';
 import { backendApiBaseUrl } from './env-app-url.js';
 import { parseProxyFromProcessEnv, resolveChromeProxy } from './proxy-env.js';
-import { cleanupChromeProfileSingletonLocks } from './chrome-profile-lock.js';
+import { cleanupChromeProfileSingletonLocks, CHROME_EXTRA_SAFE_PROFILE_ARGS } from './chrome-profile-lock.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -857,8 +857,10 @@ async function loadJoinerSession(roomIdsStr) {
     const parsed = parseProxyFromProcessEnv({ fallbackRaw: (backendBot.proxy || '').trim() });
     const chromeProxy = resolveChromeProxy(parsed);
     const launchArgs = [
+        ...CHROME_EXTRA_SAFE_PROFILE_ARGS,
         '--no-sandbox',
         '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
         '--window-size=1280,800',
         '--disable-web-security',
         '--enable-webgl',
@@ -879,6 +881,8 @@ async function loadJoinerSession(roomIdsStr) {
         `[${ctxBotName}] BOOT | profileDir=${USER_DATA_DIR} | account=${botMatch.username} | proxy=${parsed.redacted}` +
             (parsed.auth && !chromeProxy.usePageAuthenticate ? ' | proxy-auth=embedded' : '')
     );
+
+    cleanupChromeProfileSingletonLocks(USER_DATA_DIR, ctxBotName);
 
     const browser = await puppeteer.launch({
         headless: 'new',

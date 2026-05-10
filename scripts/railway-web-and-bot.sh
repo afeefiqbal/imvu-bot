@@ -49,6 +49,14 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 echo "==> [railway] Starting Node bot (multi-launcher)"
+# Persistent volume keeps Chrome Singleton* symlinks from an old container hostname; new
+# deploy then hits "profile in use on another computer". Strip those before Node starts.
+if [[ -d lurkbot-bot/profiles ]]; then
+  echo "==> [railway] Removing stale Chromium Singleton* locks under lurkbot-bot/profiles (volume + new hostname)"
+  find lurkbot-bot/profiles \( -name SingletonLock -o -name SingletonCookie -o -name SingletonSocket \) \
+    \( -type f -o -type l \) -delete 2>/dev/null || true
+fi
+
 # Same container as Laravel: bot must call loopback + PORT (not public APP_URL / not :8000).
 export BOT_API_BASE_URL="http://127.0.0.1:${PORT}"
 STATUS=0

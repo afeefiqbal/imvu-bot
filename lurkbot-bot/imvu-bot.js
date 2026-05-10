@@ -10,7 +10,7 @@ import { dirname } from 'path';
 import { startUserTracking } from './user-tracker.js';
 import { backendApiBaseUrl } from './env-app-url.js';
 import { parseProxyFromProcessEnv, resolveChromeProxy, proxyConfigured } from './proxy-env.js';
-import { cleanupChromeProfileSingletonLocks } from './chrome-profile-lock.js';
+import { cleanupChromeProfileSingletonLocks, CHROME_EXTRA_SAFE_PROFILE_ARGS } from './chrome-profile-lock.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -212,6 +212,7 @@ async function wireProxyAuthForBrowser(browser, auth) {
         }
 
         const launchArgs = [
+            ...CHROME_EXTRA_SAFE_PROFILE_ARGS,
             '--start-maximized',
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -232,6 +233,8 @@ async function wireProxyAuthForBrowser(browser, auth) {
                 executablePath = macChrome;
             }
         }
+
+        cleanupChromeProfileSingletonLocks(USER_DATA_DIR, BOT_NAME);
 
         const browser = await puppeteer.launch({
             headless: 'new',

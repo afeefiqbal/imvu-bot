@@ -15,7 +15,7 @@ import { fileURLToPath } from 'url';
 import puppeteer from 'puppeteer';
 import { backendApiBaseUrl } from './env-app-url.js';
 import { parseProxyFromProcessEnv, resolveChromeProxy } from './proxy-env.js';
-import { cleanupChromeProfileSingletonLocks } from './chrome-profile-lock.js';
+import { cleanupChromeProfileSingletonLocks, CHROME_EXTRA_SAFE_PROFILE_ARGS } from './chrome-profile-lock.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -71,6 +71,7 @@ async function main() {
     }
 
     const args = [
+        ...CHROME_EXTRA_SAFE_PROFILE_ARGS,
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--window-size=1280,900',
