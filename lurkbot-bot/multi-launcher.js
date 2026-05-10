@@ -1,6 +1,6 @@
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import axios from 'axios';
 import dotenv from 'dotenv';
 import { bulkPost } from './api-queue.js';
@@ -45,6 +45,9 @@ normalizeEnvForLocalDev();
  * Default `IMVU_LAUNCH_SCRIPT`: imvu-bot.js (parallel room sync from API; no login — reuse cookies in profiles/<BOT_NAME>).
  * Seed each bot once: `BOT_NAME=<name> node room-joiner.js` (with rooms), then use multi-launcher.
  * Set `IMVU_LAUNCH_SCRIPT=room-joiner.js` if you want the launcher to run login+join in each child instead.
+ *
+ * Production opt-in: `IMVU_BOOTSTRAP_PROFILE_BEFORE_IMVU_BOT=1` runs `room-joiner` in login-only mode
+ * (`ROOM_JOINER_BOOTSTRAP_ONLY`) once per bot, then spawns `imvu-bot.js` (writes cookies to profiles/<BOT_NAME>/).
  */
 const API_BASE_URL = backendApiBaseUrl('http://127.0.0.1:8000');
 console.log(`[MULTI-LAUNCHER] Laravel API base (bot→HTTP): ${API_BASE_URL}`);
@@ -557,10 +560,34 @@ async function run() {
     console.log(`[MULTI-LAUNCHER] 🌐 Booting Discord Integration Server...`);
     startDiscord();
 
+    const bootstrapBeforeImvu =
+        envTruthy('IMVU_BOOTSTRAP_PROFILE_BEFORE_IMVU_BOT') && LAUNCH_SCRIPT_BASE === 'imvu-bot.js';
+
     for (let i = 0; i < botsToLaunch.length; i++) {
         const b = botsToLaunch[i];
         const relayPort = relayPorts[i];
         console.log(`[MULTI-LAUNCHER] 🚀 Launching [${b.name}] (${b.username}) for rooms: ${b.roomsArg}`);
+
+        if (bootstrapBeforeImvu) {
+            console.log(
+                `[MULTI-LAUNCHER] 🔐 Profile bootstrap: room-joiner (login-only) → then imvu-bot for [${b.name}]`,
+            );
+            const bootEnv = buildChildEnv(b.name, b.proxy, relayPort);
+            bootEnv.ROOM_JOINER_BOOTSTRAP_ONLY = '1';
+            bootEnv.IMVU_MUSIC_ENABLED = '0';
+            bootEnv.MUSIC_ENABLED = 'false';
+            const r = spawnSync('node', ['room-joiner.js', b.roomsArg], {
+                cwd: __dirname,
+                env: bootEnv,
+                stdio: 'inherit',
+            });
+            if (r.status !== 0 && r.status != null) {
+                console.warn(
+                    `[MULTI-LAUNCHER] ⚠️ Bootstrap exited with code ${r.status} — ${b.name} may still show guest UI.`,
+                );
+            }
+        }
+
         runBot(b.name, b.roomsArg, {
             proxy: b.proxy,
             proxySource: b.proxySource,

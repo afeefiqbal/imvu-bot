@@ -932,6 +932,19 @@ const startJoiner = async (roomIdsStr = '') => {
         await new Promise((r) => setTimeout(r, 2000));
     }
 
+    const bootstrapOnly = ['1', 'true', 'yes', 'on'].includes(
+        String(process.env.ROOM_JOINER_BOOTSTRAP_ONLY || '')
+            .trim()
+            .toLowerCase(),
+    );
+    if (bootstrapOnly) {
+        console.log(
+            `[${ctxBotName}] ✅ ROOM_JOINER_BOOTSTRAP_ONLY — login persisted to profile; exiting before room join.`,
+        );
+        await browser.close().catch(() => {});
+        process.exit(0);
+    }
+
     const joinOneRoom = async (page, currRoomId) => {
         await preparePage(page);
         const roomUrl = `https://www.imvu.com/next/chat/room-${currRoomId}/`;
