@@ -1,4 +1,4 @@
-/** @typedef {{ title: string, url: string, requestedBy?: string }} MusicTrack */
+/** @typedef {{ title: string, url: string, requestedBy?: string, autoplaySlot?: number }} MusicTrack */
 
 export function createTrackQueue() {
     /** @type {MusicTrack[]} */

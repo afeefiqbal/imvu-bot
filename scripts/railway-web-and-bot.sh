@@ -8,6 +8,15 @@ cd "$ROOT_DIR"
 
 PORT="${PORT:?PORT must be set (Railway provides this)}"
 
+if [[ "${SKIP_DATABASE_MIGRATE:-}" != "1" ]]; then
+  echo "==> [railway] Running database migrations (set SKIP_DATABASE_MIGRATE=1 to skip)"
+  php artisan migrate --force
+else
+  echo "==> [railway] Skipping migrations (SKIP_DATABASE_MIGRATE=1)"
+fi
+
+php artisan storage:link >/dev/null 2>&1 || true
+
 echo "==> [railway] Starting Laravel on 0.0.0.0:${PORT}"
 php artisan serve --host=0.0.0.0 --port="${PORT}" &
 PHP_PID=$!

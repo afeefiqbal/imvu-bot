@@ -5,7 +5,7 @@ import { applyRoomMediaStreamUrl, waitForRoomMediaPlayback } from './imvuRoomMed
 import { createRoomPlayer } from './player.js';
 import { cacheBustHttpsStreamUrl } from './loadStreamConfig.js';
 
-const HELP = `Music: !play … · !playmp3 … · !skip · !pause · !resume · !music`;
+const HELP = `Music: !play … · !playmp3 … · !skip · !pause · !resume · !music · idle playlist is server .env only (not set by chat)`;
 
 function parseCmdLine(text) {
     const t = String(text || '').trim();
@@ -53,6 +53,8 @@ export async function createMusicRoomChatCommandHandler(opts) {
         page,
         loadConfig,
     });
+
+    player.kickAutoplayDrain();
 
     /**
      * @returns {Promise<boolean>} true if this message was a music command (consumed)

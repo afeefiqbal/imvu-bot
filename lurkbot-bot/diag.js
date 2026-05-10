@@ -8,7 +8,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
-const API_BASE_URL = appBaseUrl('http://localhost:8000');
+const API_BASE_URL = appBaseUrl('http://127.0.0.1:8000');
 console.log('Testing bot fetch from:', API_BASE_URL);
 
 async function test() {

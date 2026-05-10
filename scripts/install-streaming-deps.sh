@@ -30,7 +30,8 @@ fi
 echo ""
 echo "==> Icecast via Docker (matches infra/icecast/icecast.xml paths)"
 if command -v docker >/dev/null 2>&1; then
-  echo "  cd \"$ROOT\" && docker compose -f infra/icecast/docker-compose.yml up --build"
+  echo "  cd \"$ROOT\" && npm run local:icecast"
+  echo "  (or only Icecast: docker compose -f infra/icecast/docker-compose.yml up --build)"
 else
   echo "  Install Docker Desktop, then:"
   echo "  cd \"$ROOT\" && docker compose -f infra/icecast/docker-compose.yml up --build"

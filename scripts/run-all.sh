@@ -44,11 +44,24 @@ if [[ "$WITH_ICECAST" == "--with-icecast" ]]; then
   fi
 fi
 
+db_conn="$(get_env_value DB_CONNECTION)"
+if [[ "${db_conn:-sqlite}" == "sqlite" ]] && [[ ! -f database/database.sqlite ]]; then
+  mkdir -p database
+  touch database/database.sqlite
+  echo "==> Created database/database.sqlite (sqlite)"
+fi
+
 APP_URL="${APP_URL:-$(get_env_value APP_URL)}"
+APP_URL="${APP_URL%/}"
+if [[ "$APP_URL" == "http://localhost" ]] || [[ "$APP_URL" == "https://localhost" ]]; then
+  APP_URL="http://127.0.0.1:8000"
+  echo "==> Normalized APP_URL → ${APP_URL} (matches php artisan serve)"
+fi
 APP_URL="${APP_URL:-http://127.0.0.1:8000}"
-echo "==> Backend health wait target: ${APP_URL}"
+export APP_URL
+echo "==> Backend health wait target: ${APP_URL} (exported for Node bot)"
 
 echo "==> Starting Laravel + bot processes"
 exec npx concurrently -k -n app,bot -c blue,green \
   "composer dev" \
-  "bash -lc 'for i in {1..45}; do code=\$(curl -s -o /dev/null -w \"%{http_code}\" \"${APP_URL}\" || true); if [[ \"\$code\" != \"000\" ]]; then echo \"[run-all] Backend reachable at ${APP_URL} (http \$code). Launching bot...\"; exec node lurkbot-bot/multi-launcher.js; fi; sleep 1; done; echo \"[run-all] Backend not reachable at ${APP_URL} after 45s. Check APP_URL / port, then rerun.\"; exit 1'"
+  "bash -lc 'for i in {1..120}; do code=\$(curl -s -o /dev/null -w \"%{http_code}\" \"${APP_URL}\" || true); if [[ \"\$code\" != \"000\" ]]; then echo \"[run-all] Backend reachable at ${APP_URL} (http \$code). Launching bot...\"; exec env APP_URL=\"${APP_URL}\" node lurkbot-bot/multi-launcher.js; fi; sleep 1; done; echo \"[run-all] Backend not reachable at ${APP_URL} after 120s. Check APP_URL / port, then rerun.\"; exit 1'"

@@ -20,7 +20,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
-const API_BASE = appBaseUrl('http://localhost:8000');
+const API_BASE = appBaseUrl('http://127.0.0.1:8000');
 
 async function applyProxyAuthToPage(page, auth) {
     if (!page?.isClosed?.() && auth) await page.authenticate({ username: auth.username, password: auth.password || '' });

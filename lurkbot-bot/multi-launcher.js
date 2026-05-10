@@ -13,6 +13,32 @@ const __dirname = path.dirname(__filename);
 // Load .env from backend root
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
+function envTruthy(key) {
+    const v = String(process.env[key] ?? '')
+        .trim()
+        .toLowerCase();
+    return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+}
+
+/** Local dev: drop Railway private DNS. Drop quick-tunnel env only when music is off (copied prod .env otherwise blocks boot ~45s). Opt out: LURKBOT_KEEP_RAILWAY_ENV=1 */
+function normalizeEnvForLocalDev() {
+    const appEnv = String(process.env.APP_ENV || '').toLowerCase();
+    const onRailway = Boolean(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID);
+    if (appEnv !== 'local' || onRailway) return;
+    if (String(process.env.LURKBOT_KEEP_RAILWAY_ENV || '').trim() === '1') return;
+
+    delete process.env.ICECAST_HOST_SUFFIX;
+
+    const musicOn = envTruthy('IMVU_MUSIC_ENABLED') || envTruthy('MUSIC_ENABLED');
+    if (!musicOn) {
+        delete process.env.CLOUDFLARE_TUNNEL_AUTO;
+        delete process.env.NGROK_TUNNEL_AUTO;
+        delete process.env.CLOUDFLARE_TUNNEL_FORCE;
+    }
+}
+
+normalizeEnvForLocalDev();
+
 /**
  * Multi-bot orchestration: one `spawn()` = one Node child = one Chrome userDataDir via BOT_NAME.
  *
@@ -20,7 +46,7 @@ dotenv.config({ path: path.join(__dirname, '..', '.env') });
  * Seed each bot once: `BOT_NAME=<name> node room-joiner.js` (with rooms), then use multi-launcher.
  * Set `IMVU_LAUNCH_SCRIPT=room-joiner.js` if you want the launcher to run login+join in each child instead.
  */
-const API_BASE_URL = appBaseUrl('http://localhost:8000');
+const API_BASE_URL = appBaseUrl('http://127.0.0.1:8000');
 
 /** Comma- or newline-separated proxy URLs; used when a bot row has no `proxy`. */
 function parseProxyPool() {

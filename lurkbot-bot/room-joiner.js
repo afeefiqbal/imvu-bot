@@ -60,7 +60,7 @@ function startDiscordRelayServer(botLabel) {
 }
 
 const RUNNER = 'RoomJoiner';
-const API_BASE_URL = appBaseUrl('http://localhost:8000');
+const API_BASE_URL = appBaseUrl('http://127.0.0.1:8000');
 
 let ctxBotName = RUNNER;
 

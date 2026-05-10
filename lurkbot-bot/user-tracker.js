@@ -54,7 +54,7 @@ export async function startUserTracking(page, roomId, options = {}) {
     console.log(`[TRACKER] 🎯 CDP WEBSOCKET MODE enabled for room: ${roomId}`);
 
     const lastUserMap = new Map(); // avatarId -> username
-    const API_BASE_URL = appBaseUrl('http://localhost:8000');
+    const API_BASE_URL = appBaseUrl('http://127.0.0.1:8000');
     const syncBotName =
         (options.botName && String(options.botName).trim()) ||
         process.env.BOT_NAME ||

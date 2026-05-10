@@ -8,6 +8,7 @@ import { spawnYtDlpAudioStdout } from './ytDlpAudioStdout.js';
 import { cacheBustHttpsStreamUrl } from './loadStreamConfig.js';
 import { canonicalYoutubeWatchUrl } from './resolvePlay.js';
 import { withIcecastMountEncodeLock } from './icecastMountLock.js';
+import { loadAutoplayTracksFromEnv } from './autoplayPlaylist.js';
 
 /** @returns {Promise<number>} HTTP status (0 on failure). */
 function httpGetStatus(host, port, path) {
@@ -236,6 +237,39 @@ function logPlaybackUrls(next, cfg) {
 export function createRoomPlayer(opts) {
     const { roomId, apiBaseUrl, botName, page, loadConfig } = opts;
     const queue = createTrackQueue();
+    /** @type {{ title: string, url: string }[]} */
+    let autoplayTracks = [];
+    /** @type {Promise<void> | null} */
+    let autoplayLoadPromise = null;
+    /** Next index into autoplayTracks for idle playback (0-based). */
+    let nextAutoplayIndex = 0;
+
+    const bumpAutoplayAfterTrack = (t) => {
+        if (t && typeof t.autoplaySlot === 'number' && autoplayTracks.length > 0) {
+            nextAutoplayIndex = (t.autoplaySlot + 1) % autoplayTracks.length;
+        }
+    };
+
+    const ensureAutoplayTracksLoaded = async () => {
+        if (autoplayTracks.length > 0) return;
+        if (!autoplayLoadPromise) {
+            autoplayLoadPromise = loadAutoplayTracksFromEnv()
+                .then((rows) => {
+                    autoplayTracks = Array.isArray(rows) ? rows.filter((r) => r?.url) : [];
+                    if (autoplayTracks.length) {
+                        console.log(
+                            `[music] autoplay: idle rotation ready (${autoplayTracks.length} track(s) from .env only — users cannot edit this list)`,
+                        );
+                    }
+                })
+                .catch(() => {
+                    autoplayTracks = [];
+                })
+                .then(() => {});
+        }
+        await autoplayLoadPromise;
+    };
+
     /** @type {import('child_process').ChildProcess | null} */
     let ffProc = null;
     /** @type {import('child_process').ChildProcess | null} */
@@ -249,6 +283,23 @@ export function createRoomPlayer(opts) {
     let pausedTrack = null;
     /** @type {Awaited<ReturnType<typeof loadConfig>> | null} */
     let cachedConfig = null;
+
+    /** When the queue is empty, enqueue the next autoplay slot if configured. */
+    const maybeEnqueueAutoplayTrack = async () => {
+        if (queue.peek()) return;
+        if (stopFlag || paused) return;
+        const cfg = await loadConfig();
+        if (!cfg?.enabled) return;
+        await ensureAutoplayTracksLoaded();
+        if (!autoplayTracks.length) return;
+        const slot = nextAutoplayIndex % autoplayTracks.length;
+        const row = autoplayTracks[slot];
+        queue.enqueue({
+            title: row.title || 'Track',
+            url: row.url,
+            autoplaySlot: slot,
+        });
+    };
 
     const killFf = () => {
         if (ytdlpProc) {
@@ -287,9 +338,6 @@ export function createRoomPlayer(opts) {
             });
             return;
         }
-        while (queue.peek()) {
-            next = queue.dequeue();
-        }
 
         const track = {
             ...next,
@@ -323,6 +371,7 @@ export function createRoomPlayer(opts) {
                 console.log('[music] decoder: yt-dlp → FFmpeg → Icecast');
             } catch (e2) {
                 console.error('[music] yt-dlp pipe setup failed:', e2.message);
+                bumpAutoplayAfterTrack(track);
                 queue.setCurrent(null);
                 return;
             }
@@ -363,6 +412,7 @@ export function createRoomPlayer(opts) {
             } catch (e) {
                 console.error('[music] pipe:', e.message);
                 killFf();
+                queue.setCurrent(null);
                 return;
             }
 
@@ -396,6 +446,7 @@ export function createRoomPlayer(opts) {
             });
             killFf();
         });
+        bumpAutoplayAfterTrack(track);
         queue.setCurrent(null);
     };
 
@@ -403,7 +454,9 @@ export function createRoomPlayer(opts) {
         if (drainLock || ffProc) return;
         drainLock = true;
         try {
-            while (!stopFlag && !paused && queue.peek()) {
+            while (!stopFlag && !paused) {
+                await maybeEnqueueAutoplayTrack();
+                if (!queue.peek()) break;
                 await playOne();
             }
         } finally {
@@ -451,7 +504,13 @@ export function createRoomPlayer(opts) {
         pause: () => {
             paused = true;
             const cur = queue.getCurrent();
-            pausedTrack = cur ? { title: cur.title, url: cur.url } : null;
+            pausedTrack = cur
+                ? {
+                      title: cur.title,
+                      url: cur.url,
+                      ...(typeof cur.autoplaySlot === 'number' ? { autoplaySlot: cur.autoplaySlot } : {}),
+                  }
+                : null;
             killFf();
             void notifyImvuMusicState({
                 apiBaseUrl,
@@ -501,6 +560,11 @@ export function createRoomPlayer(opts) {
                 track: null,
                 state: 'stopped',
             });
+        },
+
+        /** Start idle autoplay / drain loop (call once when the room music handler mounts). */
+        kickAutoplayDrain: () => {
+            void ensureDrain();
         },
 
         /** @returns {ReturnType<createTrackQueue>} */
