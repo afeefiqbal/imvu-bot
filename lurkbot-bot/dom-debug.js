@@ -91,12 +91,16 @@ async function main() {
     if (executablePath && !fs.existsSync(executablePath)) executablePath = '';
     if (executablePath) console.log('[DOM-DEBUG] executablePath=', executablePath);
 
+    const protocolTimeoutMs = Math.max(
+        60000,
+        parseInt(String(process.env.PUPPETEER_PROTOCOL_TIMEOUT_MS || '180000'), 10) || 180000
+    );
     const browser = await puppeteer.launch({
         ...(executablePath ? { executablePath } : {}),
         headless: headless ? 'new' : false,
         userDataDir: profileDir,
         ignoreHTTPSErrors: true,
-        protocolTimeout: 120000,
+        protocolTimeout: protocolTimeoutMs,
         args,
     });
     await wireProxyAuthForBrowser(browser, chromeProxy.usePageAuthenticate ? parsed.auth : null);

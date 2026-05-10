@@ -884,11 +884,15 @@ async function loadJoinerSession(roomIdsStr) {
 
     cleanupChromeProfileSingletonLocks(USER_DATA_DIR, ctxBotName);
 
+    const protocolTimeoutMs = Math.max(
+        60000,
+        parseInt(String(process.env.PUPPETEER_PROTOCOL_TIMEOUT_MS || '180000'), 10) || 180000
+    );
     const browser = await puppeteer.launch({
         headless: 'new',
         userDataDir: USER_DATA_DIR,
         ignoreHTTPSErrors: true,
-        protocolTimeout: 120000,
+        protocolTimeout: protocolTimeoutMs,
         args: launchArgs,
     });
 

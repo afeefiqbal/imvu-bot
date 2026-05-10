@@ -131,26 +131,54 @@ async function proxyHttpsPreflight(parsed) {
 
 const BACKEND_URL = backendApiBaseUrl('http://127.0.0.1:8000');
 
-/** IMVU “Join room” CTA — wait + click instead of racing evaluate(). */
-const JOIN_ROOM_BTN_SELECTOR = 'button.cs2-btn-primary, button[class*="join"], .btn-join';
+/** IMVU “Join room” CTA — align with room-joiner (`join-cta` + fallbacks). */
+const JOIN_ROOM_BTN_SELECTOR =
+    'button.join-cta, button.cs2-btn-primary, button[class*="join"], .btn-join, a[role="button"][class*="join"]';
 const MAX_ROOM_TABS = Math.max(1, parseInt(process.env.IMVU_MAX_TABS || '20', 10));
+
+/** CDP `Runtime.*` / `page.evaluate` budget — raises “callFunctionOn timed out” ceiling on slow Railway CPUs. */
+const PUPPETEER_PROTOCOL_TIMEOUT_MS = Math.max(
+    60000,
+    parseInt(String(process.env.PUPPETEER_PROTOCOL_TIMEOUT_MS || '180000'), 10) || 180000
+);
 
 /**
  * Serialized into the page for `page.evaluate(roomJoinScrapeForPage)`.
- * Must not close over Node scope. In-page DOM errors become `error: 'IN_PAGE_EVAL'`
- * so Puppeteer does not throw for ordinary selector misses during hydration.
+ * Must not close over Node scope. In-page DOM errors become `error: 'IN_PAGE_EVAL'`.
+ *
+ * "Joined" must not treat preview shells as inside: preview often has a textarea but
+ * still shows Join — the old `chatInput && !joinBtn` heuristic skipped the join click.
  */
 function roomJoinScrapeForPage() {
     try {
         const bodyText = document.body?.innerText ?? '';
-        const joinBtn = document.querySelector(
-            'button.cs2-btn-primary, button[class*="join"], .btn-join'
-        );
+        const visible = (el) => {
+            if (!el || el.offsetParent === null) return null;
+            const r = el.getBoundingClientRect();
+            return r.width > 4 && r.height > 4 ? el : null;
+        };
+        /** Prefer IMVU Next `join-cta`, then legacy selectors (first *visible* match). */
+        const findJoinCta = () => {
+            const tryOne = (sel) => visible(document.querySelector(sel));
+            let el =
+                tryOne('button.join-cta') ||
+                tryOne('button.cs2-btn-primary') ||
+                tryOne('.btn-join');
+            if (el) return el;
+            const nodes = document.querySelectorAll('button[class*="join"]');
+            for (let i = 0; i < nodes.length; i++) {
+                const v = visible(nodes[i]);
+                if (v) return v;
+            }
+            return null;
+        };
+
+        const joinBtn = findJoinCta();
         const chatInput = document.querySelector(
-            'textarea.input-text, .input-text, [class*="chat-input"]'
+            'textarea.input-text, .input-text, [class*="chat-input"], .uikit-chat-input-textarea, textarea[placeholder*="Say" i]'
         );
         const chatMessages = document.querySelector(
-            '.cs2-chat-messages, .message-list, .chat-messages'
+            '.cs2-chat-messages, .message-list, .chat-messages, [class*="chat-messages"]'
         );
         const roomActions = document.querySelector('.cs2-top-actions, .room-menu');
 
@@ -159,18 +187,23 @@ function roomJoinScrapeForPage() {
         else if (bodyText.includes('Access Denied')) error = 'ACCESS_DENIED';
         else if (bodyText.includes('Please log in')) error = 'LOGGED_OUT';
 
-        const isPhysicallyInside = (!!chatMessages || !!roomActions) && !joinBtn;
-        const representsJoined = isPhysicallyInside || (!!chatInput && !joinBtn);
+        const hasJoinBtn = !!joinBtn;
+        // Inside only when room chrome is present *and* no visible join CTA (preview lies about textarea).
+        const hasStrongInside = !!(chatMessages || roomActions);
+        const representsJoined = hasStrongInside && !hasJoinBtn;
 
         return {
-            hasJoinBtn: !!joinBtn && joinBtn.offsetWidth > 0,
+            hasJoinBtn,
             isJoined: representsJoined,
+            /** True when a join CTA likely exists but we did not match it (do not treat as "inside"). */
+            maybePreview: !!chatInput && !hasJoinBtn && !hasStrongInside,
             error,
         };
     } catch (e) {
         return {
             hasJoinBtn: false,
             isJoined: false,
+            maybePreview: false,
             error: 'IN_PAGE_EVAL',
             detail: String(e && e.message ? e.message : e),
         };
@@ -284,6 +317,7 @@ async function wireProxyAuthForBrowser(browser, auth) {
             userDataDir: USER_DATA_DIR,
             args: launchArgs,
             defaultViewport: null,
+            protocolTimeout: PUPPETEER_PROTOCOL_TIMEOUT_MS,
         });
 
         await wireProxyAuthForBrowser(browser, chromeProxy.usePageAuthenticate ? parsed.auth : null);
@@ -356,36 +390,32 @@ async function wireProxyAuthForBrowser(browser, auth) {
             console.warn(`[${BOT_NAME}] Join check scrape failed: ${e.message}`);
             return null;
         });
-        if (initialJoinScrape?.error && ['ROOM_FULL', 'ACCESS_DENIED', 'LOGGED_OUT'].includes(initialJoinScrape.error)) {
+        const hardBlocker =
+            initialJoinScrape?.error &&
+            ['ROOM_FULL', 'ACCESS_DENIED', 'LOGGED_OUT'].includes(initialJoinScrape.error);
+        if (hardBlocker) {
             console.log(`[${BOT_NAME}] Room issue before join: ${initialJoinScrape.error}`);
         }
-        const shouldClickInitialJoin =
+
+        const clearlyInsideChat =
             initialJoinScrape &&
-            initialJoinScrape.hasJoinBtn &&
-            !initialJoinScrape.isJoined &&
-            !initialJoinScrape.error;
-        if (shouldClickInitialJoin) {
+            initialJoinScrape.isJoined &&
+            !initialJoinScrape.hasJoinBtn &&
+            !initialJoinScrape.maybePreview;
+
+        if (!hardBlocker && !clearlyInsideChat) {
             try {
                 await page.waitForSelector(JOIN_ROOM_BTN_SELECTOR, { timeout: 30000, visible: true });
                 await page.click(JOIN_ROOM_BTN_SELECTOR).catch(() => null);
                 console.log(`[${BOT_NAME}] Join click sent (waitForSelector + click).`);
                 await new Promise((r) => setTimeout(r, 8000));
             } catch {
-                console.log(`[${BOT_NAME}] Join click path failed after visible join button.`);
+                console.log(
+                    `[${BOT_NAME}] No visible join CTA within 30s — likely already in room or IMVU still loading (scrape joined=${Boolean(initialJoinScrape?.isJoined)} btn=${Boolean(initialJoinScrape?.hasJoinBtn)}).`
+                );
             }
-        } else if (initialJoinScrape == null) {
-            try {
-                await page.waitForSelector(JOIN_ROOM_BTN_SELECTOR, { timeout: 20000, visible: true });
-                await page.click(JOIN_ROOM_BTN_SELECTOR).catch(() => null);
-                console.log(`[${BOT_NAME}] Join click sent (fallback after scrape unavailable).`);
-                await new Promise((r) => setTimeout(r, 8000));
-            } catch {
-                console.log(`[${BOT_NAME}] Already in room or no join button (scrape unavailable).`);
-            }
-        } else {
-            console.log(
-                `[${BOT_NAME}] Skipping initial join click (inside room, loading, or no CTA — joined=${Boolean(initialJoinScrape?.isJoined)} btn=${Boolean(initialJoinScrape?.hasJoinBtn)} err=${initialJoinScrape?.error || 'none'}).`
-            );
+        } else if (!hardBlocker && clearlyInsideChat) {
+            console.log(`[${BOT_NAME}] Already in room (chat chrome visible, no join CTA).`);
         }
 
         let lastSyncHash = "";
@@ -730,7 +760,10 @@ async function wireProxyAuthForBrowser(browser, auth) {
                         Object.assign(pageState, freshState);
                     }
 
-                    if (pageState.hasJoinBtn && !pageState.isJoined && !pageState.error) {
+                    const joinHardBlocker =
+                        pageState.error &&
+                        ['ROOM_FULL', 'ACCESS_DENIED', 'LOGGED_OUT'].includes(pageState.error);
+                    if (pageState.hasJoinBtn && !pageState.isJoined && !joinHardBlocker) {
                         console.log(`[${BOT_NAME}][Room:${roomId}] Join button visible! Clicking...`);
                         try {
                             await p.waitForSelector(JOIN_ROOM_BTN_SELECTOR, { timeout: 30000, visible: true });
