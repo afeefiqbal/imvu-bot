@@ -19,16 +19,13 @@ const getDefaultWelcomeMessage = (name, roomName = 'the room') =>
     `Hey ${name || 'there'} 👋 welcome to ${roomName}!`;
 
 /**
- * IMVU User Tracker Module - CDP WEBSOCKET MODE 🎯
- * High-precision tracking using Chrome DevTools Protocol.
- * Intercepts frames directly from the network layer.
+ * IMVU User Tracker Module.
+ * The pure runtime feeds direct WebSocket frames here; the CDP adapter remains for old frame consumers.
  */
 
 /**
- * Attach CDP Network listeners for WebSocket frames on the page target and any other
- * Chromium targets that belong to this browser and may carry IMVU traffic (OOPIFs /
- * extra frames). Without this, chat WS can live in a child target and never reach the
- * main page's CDP session.
+ * Attach CDP Network listeners for WebSocket frames on a browser page target.
+ * This is retained only as a compatibility adapter; the default runtime uses direct WSS.
  */
 export const attachToPageCDP = async (page, onMessage) => {
     const browser = page.browser();
@@ -118,10 +115,27 @@ export const attachToPageCDP = async (page, onMessage) => {
     }
 };
 
-export async function startUserTracking(page, roomId, options = {}) {
-    if (!page || page.isClosed()) return;
+export async function startProtocolUserTracking(protocolClient, roomId, options = {}) {
+    return startUserTracking(
+        {
+            __imvuProtocolClient: protocolClient,
+            isClosed: () => false,
+            on: (event, handler) => protocolClient.on(event, handler),
+        },
+        roomId,
+        { ...options, protocolClient, sessionClient: options.sessionClient || protocolClient?.session }
+    );
+}
 
-    console.log(`[TRACKER] 🎯 CDP WEBSOCKET MODE enabled for room: ${roomId}`);
+export async function startUserTracking(page, roomId, options = {}) {
+    const protocolClient = options.protocolClient || page?.__imvuProtocolClient || null;
+    const sessionClient = options.sessionClient || protocolClient?.session || null;
+    const protocolMode = Boolean(protocolClient);
+    if (!protocolMode && (!page || page.isClosed())) return;
+
+    console.log(
+        `[TRACKER] ${protocolMode ? 'DIRECT WEBSOCKET' : 'CDP WEBSOCKET'} MODE enabled for room: ${roomId}`
+    );
 
     const lastUserMap = new Map(); // avatarId -> username
     const API_BASE_URL = backendApiBaseUrl('http://127.0.0.1:8000');
@@ -160,6 +174,7 @@ export async function startUserTracking(page, roomId, options = {}) {
     let ROOM_NAME = 'this room';
 
     const fetchRoomTitleFromDom = async () => {
+        if (protocolMode) return options.roomName || null;
         try {
             if (!page || page.isClosed()) return null;
             return await page.evaluate(() => {
@@ -213,7 +228,21 @@ export async function startUserTracking(page, roomId, options = {}) {
             return roomDetailsFromApiCache;
         }
         const slug = normalizeRoomApiSlug(roomId);
-        if (!slug || !page || page.isClosed()) {
+        if (!slug) {
+            return null;
+        }
+        if (sessionClient?.fetchRoomDetails) {
+            const details = await sessionClient.fetchRoomDetails(slug);
+            if (details && (details.name || details.image_url)) {
+                roomDetailsFromApiCache = {
+                    name: details.name || '',
+                    image_url: details.image_url || '',
+                };
+                return roomDetailsFromApiCache;
+            }
+            return null;
+        }
+        if (!page || page.isClosed()) {
             return null;
         }
         try {
@@ -371,10 +400,10 @@ export async function startUserTracking(page, roomId, options = {}) {
 
     const botMentionAliases = collectBotMentionAliases(BOT_USERNAME, BOT_DISPLAY_NAME);
     const logConversationTurn = createConversationLogger({ apiBaseUrl: API_BASE_URL, roomId });
-    const sendMessage = createSendMessage({ page, logConversationTurn });
+    const sendMessage = createSendMessage({ page, protocolClient, logConversationTurn });
 
     const state = {
-        selfUserId: null,
+        selfUserId: protocolClient?.bot?.imqUserId || null,
         botJoinedChat: false,
         welcomeArrivalsEnabled: false,
         participantsRosterSynced: false,
@@ -577,7 +606,7 @@ export async function startUserTracking(page, roomId, options = {}) {
         countTimer = setTimeout(updateCount, 300);
     };
 
-    const resolveImvuHandleFromNumericId = createImvuHandleResolver({ page });
+    const resolveImvuHandleFromNumericId = createImvuHandleResolver({ page, sessionClient });
     let roomChatCommandHandler = null;
     if (
         process.env.IMVU_MUSIC_ENABLED === '1' ||
@@ -586,7 +615,8 @@ export async function startUserTracking(page, roomId, options = {}) {
         try {
             const { createMusicRoomChatCommandHandler } = await import('./music/index.js');
             roomChatCommandHandler = await createMusicRoomChatCommandHandler({
-                page,
+                page: protocolMode ? null : page,
+                protocolClient,
                 roomId,
                 apiBaseUrl: API_BASE_URL,
                 botName: syncBotName || undefined,
@@ -666,8 +696,7 @@ export async function startUserTracking(page, roomId, options = {}) {
         if (welcomeByHandleLastAt.size > 500) welcomeByHandleLastAt.clear();
     }, 60000);
 
-    // CRITICAL FIX: Ensure intervals are cleared and page references dropped when page closes!
-    page.on('close', () => {
+    const cleanupTracker = () => {
         if (onDiscordRelayChat && global.discordBridge) {
             global.discordBridge.off('chat', onDiscordRelayChat);
         }
@@ -677,12 +706,25 @@ export async function startUserTracking(page, roomId, options = {}) {
         if (dashboardSyncTimer) clearTimeout(dashboardSyncTimer);
         if (countTimer) clearTimeout(countTimer);
         if (state.welcomeArrivalsEnableTimer) clearTimeout(state.welcomeArrivalsEnableTimer);
-    });
+    };
 
-    await attachToPageCDP(page, (data) => {
-        void handleIncomingMessage(data);
-    });
+    // CRITICAL FIX: Ensure intervals are cleared and page/client references dropped when closed.
+    if (protocolMode) {
+        protocolClient.once('close', cleanupTracker);
+    } else {
+        page.on('close', cleanupTracker);
+    }
 
-    const runDOMFallback = createDomFallback({ page, lastUserMap, triggerCountUpdate });
-    setTimeout(runDOMFallback, 5000);
+    if (protocolMode) {
+        protocolClient.on('frame', (data) => {
+            void handleIncomingMessage(data);
+        });
+    } else {
+        await attachToPageCDP(page, (data) => {
+            void handleIncomingMessage(data);
+        });
+
+        const runDOMFallback = createDomFallback({ page, lastUserMap, triggerCountUpdate });
+        setTimeout(runDOMFallback, 5000);
+    }
 }

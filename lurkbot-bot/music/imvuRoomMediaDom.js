@@ -2,7 +2,7 @@ import { normalizeRoomApiSlug } from '../user-tracker-utils.js';
 
 /**
  * Best-effort: push a stream URL into IMVU Next room media / URL fields (layout-dependent).
- * @param {import('puppeteer').Page} page
+ * @param {{ isClosed?: () => boolean } | null} page
  * @param {string} publicUrl
  * @returns {Promise<boolean>}
  */
@@ -173,7 +173,7 @@ function imvuStreamUrlsMatch(stationUrl, expectedUrl) {
 
 /**
  * Poll IMVU media_player state and confirm expected URL is playing.
- * @param {import('puppeteer').Page} page
+ * @param {{ isClosed?: () => boolean } | null} page
  * @param {{ roomId: string, expectedUrl: string, timeoutMs?: number, intervalMs?: number }} opts
  * @returns {Promise<{ ok: boolean, status?: string, stationUrl?: string, reason?: string }>}
  */

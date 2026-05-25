@@ -19,7 +19,7 @@ import {
     stripSivaCharacterAiTriggers,
 } from './sivaCharacterAi.js';
 
-export const createImvuHandleResolver = ({ page }) => {
+export const createImvuHandleResolver = ({ page, sessionClient }) => {
     const imvuAvNameCache = new Map();
     const imvuAvNameInflight = new Map();
 
@@ -31,6 +31,19 @@ export const createImvuHandleResolver = ({ page }) => {
         if (inflight) return inflight;
 
         const promise = (async () => {
+            if (sessionClient?.fetchUserName) {
+                try {
+                    const name = await sessionClient.fetchUserName(id);
+                    const norm = name ? normalizeImvuUsername(name) : null;
+                    if (norm) imvuAvNameCache.set(id, norm);
+                    return norm || null;
+                } catch {
+                    return null;
+                } finally {
+                    imvuAvNameInflight.delete(id);
+                }
+            }
+
             if (!page || page.isClosed()) return null;
             try {
                 const name = await page.evaluate(async (numericId) => {
@@ -107,6 +120,17 @@ function wsDebugChatCandidate(msg) {
         if (isImvuRoomChatQueue(queue) || isImvuMessagesMount(mount)) return true;
     }
     return false;
+}
+
+function participantDeltaAvatarIds(envelope) {
+    const objects = Array.isArray(envelope?.objects) ? envelope.objects : [];
+    const ids = [];
+    for (const raw of objects) {
+        const text = String(raw || '');
+        const match = text.match(/\/participants\/user-(\d+)(?:$|[/?#])/i);
+        if (match) ids.push(match[1]);
+    }
+    return ids;
 }
 
 export const createIncomingMessageHandler = (ctx) => {
@@ -194,6 +218,12 @@ export const createIncomingMessageHandler = (ctx) => {
                 record === 'msg_g2c_create_mount' &&
                 (mount === 'participants' || mount === 'edge:participants')
             ) {
+                const hasRosterPayload =
+                    Array.isArray(props.items) ||
+                    Array.isArray(props.participants) ||
+                    Array.isArray(props.users);
+                if (!hasRosterPayload) continue;
+
                 const participants = props.items || props.participants || props.users || [];
                 const isPatch = action.type === 2;
 
@@ -400,6 +430,54 @@ export const createIncomingMessageHandler = (ctx) => {
                     if (username) ctx.onLeave(username);
                     ctx.triggerCountUpdate();
                 }
+                continue;
+            }
+
+            if (
+                record === 'msg_g2c_send_message' &&
+                isImvuRoomChatQueue(queue) &&
+                String(mount || '').toLowerCase().endsWith(':participants')
+            ) {
+                if (!roomQueueBelongsToRoom(queue, ctx.roomId)) continue;
+                const envelope = decodeChatEnvelope(action.message);
+                const avatarIds = participantDeltaAvatarIds(envelope);
+                if (!avatarIds.length) continue;
+
+                const deltaAction = String(envelope?.action || '').toLowerCase();
+                for (const avatarId of avatarIds) {
+                    if (deltaAction === 'deleted' || deltaAction === 'removed') {
+                        const username = ctx.lastUserMap.get(avatarId);
+                        ctx.lastUserMap.delete(avatarId);
+                        ctx.skipWelcomeAvatarIds.delete(avatarId);
+                        ctx.joinQueueBackendAnnounced.delete(avatarId);
+                        ctx.activeJoinSessions.delete(avatarId);
+                        ctx.processedJoins.delete(avatarId);
+                        if (username && !ctx.isSelfId(avatarId)) ctx.onLeave(username);
+                        continue;
+                    }
+
+                    if (deltaAction && deltaAction !== 'created' && deltaAction !== 'added') continue;
+                    if (!ctx.lastUserMap.has(avatarId)) {
+                        ctx.lastUserMap.set(avatarId, null);
+                        console.log(
+                            `[JOIN][PARTICIPANTS] occupant · resolving https://api.imvu.com/user/user-${avatarId}`
+                        );
+                    }
+                    if (/^\d+$/.test(String(avatarId))) {
+                        void ctx.resolveImvuHandleFromNumericId(avatarId).then((name) => {
+                            if (!name || !ctx.lastUserMap.has(avatarId)) return;
+                            const cur = ctx.lastUserMap.get(avatarId);
+                            if (!hasResolvedName(cur)) {
+                                const label = ctx.isSelfId(avatarId) ? ctx.BOT_USERNAME : name;
+                                ctx.lastUserMap.set(avatarId, label);
+                                console.log(`[JOIN][PARTICIPANTS] ${label} · profile API`);
+                            }
+                            handleFinalJoin(avatarId);
+                            ctx.triggerCountUpdate();
+                        }).catch(e => console.error(`[JOIN][PARTICIPANTS] Error resolving ${avatarId}:`, e.message));
+                    }
+                }
+                ctx.triggerCountUpdate();
                 continue;
             }
 

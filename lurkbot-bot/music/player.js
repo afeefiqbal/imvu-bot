@@ -230,7 +230,7 @@ function logPlaybackUrls(next, cfg) {
  *   roomId: string,
  *   apiBaseUrl: string,
  *   botName?: string,
- *   page: import('puppeteer').Page | null,
+ *   page: { isClosed?: () => boolean } | null,
  *   loadConfig: () => Promise<object | null>,
  * }} opts
  */

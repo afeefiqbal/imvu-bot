@@ -36,7 +36,7 @@ function parseCmdLine(text) {
 
 /**
  * @param {{
- *   page: import('puppeteer').Page,
+ *   page?: { isClosed?: () => boolean } | null,
  *   roomId: string,
  *   apiBaseUrl: string,
  *   botName?: string,

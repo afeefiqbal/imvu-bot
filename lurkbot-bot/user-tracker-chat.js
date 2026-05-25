@@ -12,7 +12,26 @@ export const createConversationLogger = ({ apiBaseUrl, roomId }) => async (paylo
     }
 };
 
-export const createSendMessage = ({ page, logConversationTurn }) => async (text, convMeta = null) => {
+export const createSendMessage = ({ page, protocolClient, logConversationTurn }) => async (text, convMeta = null) => {
+    if (protocolClient) {
+        try {
+            await protocolClient.sendMessage(text, convMeta || {});
+            const preview = text.length > 100 ? `${text.slice(0, 100)}…` : text;
+            console.log(`[CHAT][BOT] sent via websocket: ${preview}`);
+            if (convMeta?.participantUsername) {
+                void logConversationTurn({
+                    username: convMeta.participantUsername,
+                    imvu_avatar_id: convMeta.participantAvatarId ?? null,
+                    role: 'assistant',
+                    content: text,
+                });
+            }
+        } catch (e) {
+            console.log('[CHAT][BOT] websocket send error:', e?.message || e);
+        }
+        return;
+    }
+
     const sendInFrame = (frame) =>
         frame.evaluate((msg) => {
             const setNativeValue = (el, value) => {

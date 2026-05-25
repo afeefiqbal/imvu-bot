@@ -6,7 +6,6 @@ import dotenv from 'dotenv';
 import { bulkPost } from './api-queue.js';
 import { backendApiBaseUrl } from './env-app-url.js';
 import { maybeStartMusicIngressTunnel } from './music/tunnelIngress.js';
-import { runProfileLoginBootstrap } from './room-joiner.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -19,13 +18,6 @@ function envTruthy(key) {
         .trim()
         .toLowerCase();
     return v === '1' || v === 'true' || v === 'yes' || v === 'on';
-}
-
-function envFalsy(key) {
-    const v = String(process.env[key] ?? '')
-        .trim()
-        .toLowerCase();
-    return v === '0' || v === 'false' || v === 'no' || v === 'off';
 }
 
 /** Local dev: drop Railway private DNS. Drop quick-tunnel env only when music is off (copied prod .env otherwise blocks boot ~45s). Opt out: LURKBOT_KEEP_RAILWAY_ENV=1 */
@@ -48,15 +40,10 @@ function normalizeEnvForLocalDev() {
 normalizeEnvForLocalDev();
 
 /**
- * Multi-bot orchestration: one `spawn()` = one Node child = one Chrome userDataDir via BOT_NAME.
+ * Multi-bot orchestration: one `spawn()` = one Node child using the pure WebSocket IMVU runtime.
  *
- * Default `IMVU_LAUNCH_SCRIPT`: imvu-bot.js (parallel room sync from API; imvu-bot itself does not log in).
- * Before each imvu-bot child, multi-launcher runs in-process `runProfileLoginBootstrap()` from room-joiner.js
- * (same Puppeteer login path; no separate `node room-joiner.js` process) so cookies land in profiles/<BOT_NAME>/.
- * Opt out (faster restarts if session is already good): `IMVU_SKIP_BOOTSTRAP_PROFILE=1`.
- * Set `IMVU_LAUNCH_SCRIPT=room-joiner.js` if every child should be full room-joiner (login+join) instead of imvu-bot.
- *
- * Legacy: `IMVU_BOOTSTRAP_PROFILE_BEFORE_IMVU_BOT=0` / `false` / `off` skips the same step (prefer IMVU_SKIP_BOOTSTRAP_PROFILE).
+ * Default `IMVU_LAUNCH_SCRIPT`: imvu-bot.js. The child does HTTP session setup and direct WSS
+ * room connections.
  */
 const API_BASE_URL = backendApiBaseUrl('http://127.0.0.1:8000');
 console.log(`[MULTI-LAUNCHER] Laravel API base (bot→HTTP): ${API_BASE_URL}`);
@@ -527,7 +514,7 @@ async function run() {
         }
         if (seenBotNames.has(canonicalName)) {
             console.warn(
-                `[MULTI-LAUNCHER] ⚠️ Duplicate bot name "${canonicalName}" in API list — already launching one process; extra row skipped (same Chrome profile would deadlock).`
+                `[MULTI-LAUNCHER] ⚠️ Duplicate bot name "${canonicalName}" in API list — already launching one process; extra row skipped.`
             );
             continue;
         }
@@ -553,17 +540,8 @@ async function run() {
         return;
     }
 
-    const skipProfileLoginBootstrap =
-        LAUNCH_SCRIPT_BASE !== 'imvu-bot.js' ||
-        envTruthy('IMVU_SKIP_BOOTSTRAP_PROFILE') ||
-        envFalsy('IMVU_BOOTSTRAP_PROFILE_BEFORE_IMVU_BOT');
-
     if (LAUNCH_SCRIPT_BASE === 'imvu-bot.js') {
-        console.log(
-            skipProfileLoginBootstrap
-                ? '[MULTI-LAUNCHER] Child script is imvu-bot.js — profile login bootstrap skipped (IMVU_SKIP_BOOTSTRAP_PROFILE=1 or IMVU_BOOTSTRAP_PROFILE_BEFORE_IMVU_BOT=0). Ensure profiles/<BOT_NAME> already has a session.'
-                : '[MULTI-LAUNCHER] Child script is imvu-bot.js — in-process IMVU login before each bot (set IMVU_SKIP_BOOTSTRAP_PROFILE=1 to skip).'
-        );
+        console.log('[MULTI-LAUNCHER] Child script is imvu-bot.js — pure WebSocket runtime.');
     }
 
     const relayBase = parseInt(process.env.IMVU_DISCORD_RELAY_BASE || '30900', 10);
@@ -580,25 +558,6 @@ async function run() {
         const b = botsToLaunch[i];
         const relayPort = relayPorts[i];
         console.log(`[MULTI-LAUNCHER] 🚀 Launching [${b.name}] (${b.username}) for rooms: ${b.roomsArg}`);
-
-        if (!skipProfileLoginBootstrap) {
-            console.log(
-                `[MULTI-LAUNCHER] 🔐 Profile login (in-process) → then imvu-bot for [${b.name}]`,
-            );
-            const bootEnv = buildChildEnv(b.name, b.proxy, relayPort);
-            bootEnv.IMVU_MUSIC_ENABLED = '0';
-            bootEnv.MUSIC_ENABLED = 'false';
-            const code = await runProfileLoginBootstrap({
-                botName: b.name,
-                roomIdsStr: b.roomsArg,
-                childEnv: bootEnv,
-            });
-            if (code !== 0) {
-                console.warn(
-                    `[MULTI-LAUNCHER] ⚠️ Login bootstrap returned ${code} — ${b.name} may still show guest UI.`,
-                );
-            }
-        }
 
         runBot(b.name, b.roomsArg, {
             proxy: b.proxy,

@@ -1,6 +1,5 @@
 /**
- * Proxy config for Puppeteer: Chromium wants --proxy-server without credentials;
- * auth via page.authenticate (or optional IMVU_CHROME_PROXY_EMBED_AUTH).
+ * Proxy config shared by the pure WebSocket runtime and older launch helpers.
  *
  * multi-launcher sets BOT_PROXY_HOST (+ BOT_PROXY_USER / BOT_PROXY_PASS) so children
  * do not inherit user:pass inside BOT_PROXY. Manual runs can still use BOT_PROXY=http://user:pass@host:port.
@@ -63,7 +62,7 @@ export function parseProxyFromProcessEnv(options = {}) {
     return parseProxyUrlString(combined);
 }
 
-/** Chromium: --proxy-server = scheme://host:port only; proxy Basic auth via page.authenticate unless embed flag set */
+/** Legacy helper kept for external scripts that still expect browser-style proxy args. */
 export function resolveChromeProxy(parsed) {
     if (!parsed?.serverForChrome) {
         return { arg: null, usePageAuthenticate: false };
