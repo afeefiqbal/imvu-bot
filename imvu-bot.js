@@ -12,11 +12,15 @@ import { createProxyAgents } from './imvu-protocol/proxy-agent.js';
 import { createImvuSessionClient } from './imvu-protocol/session.js';
 import { ImvuRoomWebSocketClient } from './imvu-protocol/ws-client.js';
 import { startProtocolUserTracking } from './user-tracker.js';
+import { decodeChatEnvelope, decodeId, roomQueueBelongsToRoom } from './user-tracker-utils.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
+// Load env from common local layouts: embedded Laravel parent, sibling Laravel app, then this Node repo.
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
+dotenv.config({ path: path.join(__dirname, '..', 'imvu-bot-laravel', '.env') });
+dotenv.config({ path: path.join(__dirname, '.env') });
 
 if (!global.discordBridge) {
     global.discordBridge = new EventEmitter();
@@ -43,6 +47,36 @@ function trackerRoomId(raw) {
 function envTruthy(key) {
     const v = String(process.env[key] ?? '').trim().toLowerCase();
     return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+}
+
+function envDisabled(key) {
+    const v = String(process.env[key] ?? '').trim().toLowerCase();
+    return v === '0' || v === 'false' || v === 'no' || v === 'off';
+}
+
+function frameShowsSelfRemovedFromRoom(action, roomId, selfUserId) {
+    if (!action || typeof action !== 'object' || !selfUserId) return false;
+    const self = String(selfUserId);
+    const queue = String(action.queue || '');
+    if (queue && !roomQueueBelongsToRoom(queue, roomId)) return false;
+
+    if (action.record === 'msg_g2c_left_queue' || action.record === 'msg_g2c_user_exited') {
+        const avatarId = decodeId(action.user_id || action.avatar_id);
+        return avatarId != null && String(avatarId) === self;
+    }
+
+    if (action.record !== 'msg_g2c_send_message') return false;
+    if (!String(action.mount || '').toLowerCase().includes('participants')) return false;
+
+    const envelope = decodeChatEnvelope(action.message);
+    const deltaAction = String(envelope?.action || '').toLowerCase();
+    if (deltaAction !== 'deleted' && deltaAction !== 'removed') return false;
+
+    const objects = Array.isArray(envelope?.objects) ? envelope.objects : [];
+    return objects.some((raw) => {
+        const text = String(raw || '');
+        return text.includes(`/participants/user-${self}`) && text.includes(`chat-${trackerRoomId(roomId)}`);
+    });
 }
 
 function redactLoginName(name) {
@@ -184,20 +218,24 @@ async function main() {
     startDiscordRelayForBot(BOT_NAME);
 
     const roomClients = new Map();
-    const closingTimers = new Map();
     let activeSpamRooms = [];
+    const selfRejoinEnabled = !envDisabled('IMVU_SELF_REJOIN');
+    const selfRejoinDelayMs = Math.max(
+        1000,
+        parseInt(process.env.IMVU_SELF_REJOIN_DELAY_MS || '5000', 10) || 5000
+    );
 
     const stopRoom = async (roomId) => {
         const id = trackerRoomId(roomId);
         const entry = roomClients.get(id);
         if (!entry) return;
         console.log(`[${BOT_NAME}] Leaving room ${id}`);
+        if (entry.selfRejoinTimer) clearTimeout(entry.selfRejoinTimer);
         try {
             await entry.client.leave();
         } catch {}
         entry.client.close();
         roomClients.delete(id);
-        closingTimers.delete(id);
     };
 
     const startRoom = async (roomId) => {
@@ -232,6 +270,22 @@ async function main() {
 
         console.log(`[${BOT_NAME}] Connecting room ${id}${details?.name ? ` (${details.name})` : ''}`);
         await client.connect();
+        let entry = null;
+        client.on('frame', (action) => {
+            if (!selfRejoinEnabled || !frameShowsSelfRemovedFromRoom(action, id, bot.imqUserId)) return;
+            if (!entry) return;
+            if (entry?.selfRejoinTimer) return;
+            console.warn(
+                `[${BOT_NAME}][${id}] IMVU reported this bot left the room; rejoining in ${selfRejoinDelayMs}ms.`
+            );
+            entry.selfRejoinTimer = setTimeout(() => {
+                entry.selfRejoinTimer = null;
+                if (roomClients.get(id) !== entry) return;
+                void client.ensureVisible('self-removed').catch((error) => {
+                    console.warn(`[${BOT_NAME}][${id}] self rejoin failed: ${error.message}`);
+                });
+            }, selfRejoinDelayMs);
+        });
         await startProtocolUserTracking(client, id, {
             botName: BOT_NAME,
             botUsername: bot.username,
@@ -240,7 +294,7 @@ async function main() {
             roomName: details?.name || '',
         });
 
-        const entry = { client, details, startedAt: Date.now() };
+        entry = { client, details, startedAt: Date.now(), selfRejoinTimer: null };
         roomClients.set(id, entry);
         return entry;
     };
@@ -276,21 +330,6 @@ async function main() {
                 await startRoom(target).catch((error) => {
                     console.error(`[${BOT_NAME}] Failed to start room ${target}: ${error.message}`);
                 });
-            }
-
-            const now = Date.now();
-            for (const roomId of roomClients.keys()) {
-                if (targets.size === 0 || targets.has(roomId)) {
-                    closingTimers.delete(roomId);
-                    continue;
-                }
-                const closeAt = closingTimers.get(roomId);
-                if (!closeAt) {
-                    closingTimers.set(roomId, now + 60000);
-                    console.log(`[${BOT_NAME}] Room ${roomId} no longer targeted; leaving in 60s.`);
-                } else if (now >= closeAt) {
-                    await stopRoom(roomId);
-                }
             }
 
             if (Array.isArray(data.pending_messages)) {

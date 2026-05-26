@@ -286,6 +286,19 @@ export class ImvuRoomWebSocketClient extends EventEmitter {
         return this.session.ensureChatParticipant(this.roomId, userId);
     }
 
+    async ensureVisible(reason = 'manual') {
+        if (!this.isOpen) await this.connect();
+        await this.#ensureChatParticipant();
+        if (!this.chatQueue) {
+            void this.#discoverLegacyChatQueue();
+            return false;
+        }
+        this.visibilityBootstrapped = false;
+        this.#sendVisibilityBootstrap();
+        this.logger.log(`[IMVU-WS][${this.roomId}] visibility refreshed (${reason})`);
+        return true;
+    }
+
     #sendVisibilityBootstrap() {
         if (this.visibilityBootstrapped || !this.isOpen || !this.chatQueue.startsWith('/chat/')) return;
         this.visibilityBootstrapped = true;

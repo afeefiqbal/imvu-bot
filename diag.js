@@ -6,7 +6,10 @@ import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+// Load env from common local layouts: embedded Laravel parent, sibling Laravel app, then this Node repo.
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
+dotenv.config({ path: path.join(__dirname, '..', 'imvu-bot-laravel', '.env') });
+dotenv.config({ path: path.join(__dirname, '.env') });
 
 const API_BASE_URL = backendApiBaseUrl('http://127.0.0.1:8000');
 console.log('Testing bot fetch from:', API_BASE_URL);

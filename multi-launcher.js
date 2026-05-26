@@ -10,8 +10,10 @@ import { maybeStartMusicIngressTunnel } from './music/tunnelIngress.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Load .env from backend root
+// Load env from common local layouts: embedded Laravel parent, sibling Laravel app, then this Node repo.
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
+dotenv.config({ path: path.join(__dirname, '..', 'imvu-bot-laravel', '.env') });
+dotenv.config({ path: path.join(__dirname, '.env') });
 
 function envTruthy(key) {
     const v = String(process.env[key] ?? '')

@@ -9,8 +9,10 @@ import dotenv from 'dotenv';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Load .env from backend root
+// Load env from common local layouts: embedded Laravel parent, sibling Laravel app, then this Node repo.
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
+dotenv.config({ path: path.join(__dirname, '..', 'imvu-bot-laravel', '.env') });
+dotenv.config({ path: path.join(__dirname, '.env') });
 
 const app = express();
 app.use(bodyParser.json());
@@ -191,21 +193,26 @@ client.on('messageCreate', async (message) => {
     }
 });
 
-const token = process.env.DISCORD_TOKEN;
+const token = process.env.DISCORD_TOKEN || process.env.DISCORD_BOT_TOKEN;
 if (!token) {
-    console.error('[DISCORD] ❌ Missing DISCORD_TOKEN in .env!');
+    console.error('[DISCORD] ❌ Missing DISCORD_TOKEN or DISCORD_BOT_TOKEN in .env!');
     process.exit(1);
 }
 
 // Log in and then start the Express server
-client.login(token).then(() => {
-    app.listen(3000, '127.0.0.1', () => {
-        // Successfully bound to port
-    }).on('error', (e) => {
-        if (e.code === 'EADDRINUSE') {
-            console.log('[DISCORD] ⚙️ Express server already running on port 3000 (from another instance).');
-        } else {
-            console.error('[DISCORD] ❌ Server error:', e);
-        }
+client.login(token)
+    .then(() => {
+        app.listen(3000, '127.0.0.1', () => {
+            // Successfully bound to port
+        }).on('error', (e) => {
+            if (e.code === 'EADDRINUSE') {
+                console.log('[DISCORD] ⚙️ Express server already running on port 3000 (from another instance).');
+            } else {
+                console.error('[DISCORD] ❌ Server error:', e);
+            }
+        });
+    })
+    .catch((e) => {
+        console.error('[DISCORD] ❌ Failed to login with Discord bot token:', e.message);
+        process.exit(1);
     });
-});
