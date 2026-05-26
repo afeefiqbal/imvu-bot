@@ -10,6 +10,7 @@ import { parseProxyFromProcessEnv, proxyConfigured } from './proxy-env.js';
 import { createProtocolSpec } from './imvu-protocol/spec.js';
 import { createProxyAgents } from './imvu-protocol/proxy-agent.js';
 import { createImvuSessionClient } from './imvu-protocol/session.js';
+import { ImvuAccountWebSocketClient } from './imvu-protocol/account-ws-client.js';
 import { ImvuRoomWebSocketClient } from './imvu-protocol/ws-client.js';
 import { startProtocolUserTracking } from './user-tracker.js';
 import { decodeChatEnvelope, decodeId, roomQueueBelongsToRoom } from './user-tracker-utils.js';
@@ -237,6 +238,16 @@ async function main() {
     const roomClients = new Map();
     const roomDiscordChannelIds = new Map();
     let activeSpamRooms = [];
+    const accountLevelWsEnabled = !envDisabled('IMVU_ACCOUNT_LEVEL_WS');
+    const accountWs = accountLevelWsEnabled
+        ? new ImvuAccountWebSocketClient({
+              spec,
+              session,
+              agents,
+              bot,
+              logger: console,
+          })
+        : null;
     const selfRejoinEnabled = !envDisabled('IMVU_SELF_REJOIN');
     const selfRejoinDelayMs = Math.max(1000, envInt('IMVU_SELF_REJOIN_DELAY_MS', 5000));
     const selfRejoinMaxPerRoom = Math.max(0, envInt('IMVU_SELF_REJOIN_MAX_PER_ROOM', 1));
@@ -265,14 +276,16 @@ async function main() {
         }
 
         const details = await session.fetchRoomDetails(id);
-        const client = new ImvuRoomWebSocketClient({
-            roomId: id,
-            spec,
-            session,
-            agents,
-            bot,
-            logger: console,
-        });
+        const client = accountWs
+            ? accountWs.createRoomClient(id)
+            : new ImvuRoomWebSocketClient({
+                  roomId: id,
+                  spec,
+                  session,
+                  agents,
+                  bot,
+                  logger: console,
+              });
 
         client.on('error', (error) => {
             console.warn(`[${BOT_NAME}][${id}] websocket error: ${error?.message || error}`);
