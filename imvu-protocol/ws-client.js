@@ -16,7 +16,7 @@ function delay(ms) {
 }
 
 export class ImvuRoomWebSocketClient extends EventEmitter {
-    constructor({ roomId, spec, session, agents = {}, logger = console, bot = {} }) {
+    constructor({ roomId, spec, session, agents = {}, logger = console, bot = {}, visibilityEnabled = true }) {
         super();
         this.roomId = String(roomId || '').trim().replace(/^room-/i, '');
         this.spec = spec;
@@ -24,11 +24,17 @@ export class ImvuRoomWebSocketClient extends EventEmitter {
         this.agents = agents;
         this.logger = logger;
         this.bot = bot;
+        this.visibilityEnabled = visibilityEnabled;
         this.ws = null;
         this.chatQueue = '';
         this.legacyChatSubscribed = false;
         this.legacyChatOpId = null;
         this.visibilityBootstrapped = false;
+        this.participant = null;
+        this.legacyOutfitMessage = '';
+        this.legacySeatMessage = '';
+        this.seatNumber = '';
+        this.seatFurniId = 0;
         this.testMessageSent = false;
         this.closedByUser = false;
         this.connecting = null;
@@ -96,7 +102,7 @@ export class ImvuRoomWebSocketClient extends EventEmitter {
                     if (!this.isOpen) return;
                     this.#sendFrames(this.spec.joinFramesFor(this.roomId), 'join');
                     this.#startPing();
-                    void this.#discoverLegacyChatQueue();
+                    if (this.visibilityEnabled) void this.#discoverLegacyChatQueue();
                 }, joinDelayMs);
                 this.emit('open');
                 resolve();
@@ -178,6 +184,19 @@ export class ImvuRoomWebSocketClient extends EventEmitter {
     #learnFromFrame(action) {
         if (!action || typeof action !== 'object') return;
         const queue = String(action.queue || '');
+        const userId = String(this.bot.imqUserId || this.bot.user_id || this.bot.userId || '').trim();
+        if (
+            action.record === 'msg_g2c_left_queue' &&
+            queue.startsWith('/chat/') &&
+            String(action.user_id || '') === userId
+        ) {
+            this.logger.warn(`[IMVU-WS][${this.roomId}] left legacy ${queue}; will resubscribe before visible join`);
+            this.chatQueue = '';
+            this.legacyChatSubscribed = false;
+            this.legacyChatOpId = null;
+            this.visibilityBootstrapped = false;
+            return;
+        }
         if (action.record === 'msg_g2c_result' && action.op_id === this.legacyChatOpId) {
             if (action.status === 0) {
                 this.logger.log(`[IMVU-WS][${this.roomId}] legacy /chat subscription accepted`);
@@ -190,7 +209,6 @@ export class ImvuRoomWebSocketClient extends EventEmitter {
         }
         if (queue.startsWith('/chat/')) {
             this.chatQueue = queue;
-            this.bot.imqChatQueue = queue;
             if (action.record === 'msg_g2c_joined_queue') {
                 this.#sendVisibilityBootstrap();
             }
@@ -198,6 +216,7 @@ export class ImvuRoomWebSocketClient extends EventEmitter {
     }
 
     async #discoverLegacyChatQueue() {
+        if (!this.visibilityEnabled) return;
         if (this.legacyChatSubscribed || !this.session?.fetchLegacyChatQueue) return;
         const delayMs = Math.max(0, Number(process.env.IMVU_WS_LEGACY_CHAT_DISCOVERY_DELAY_MS || 2000));
         if (delayMs) await delay(delayMs);
@@ -222,7 +241,6 @@ export class ImvuRoomWebSocketClient extends EventEmitter {
 
         this.legacyChatSubscribed = true;
         this.chatQueue = queue;
-        this.bot.imqChatQueue = queue;
         this.legacyChatOpId = this.nextRuntimeOpId++;
         const frame = JSON.stringify({
             record: 'msg_c2g_subscribe',
@@ -253,14 +271,18 @@ export class ImvuRoomWebSocketClient extends EventEmitter {
 
     #sendVisibilityPrepSubscriptions() {
         const userId = String(this.bot.imqUserId || this.bot.user_id || this.bot.userId || '').trim();
-        if (!/^\d+$/.test(userId)) return;
 
         const queues = [
+            `inv:/chat/chat-${this.roomId}`,
             `inv:/scene/scene-${this.roomId}`,
-            `inv:/outfit_list/outfit_list-${userId}-1`,
-            `inv:/outfit/outfit-${userId}-2`,
-            `inv:/outfit/outfit-${userId}-1`,
         ];
+        if (/^\d+$/.test(userId)) {
+            queues.push(
+                `inv:/outfit_list/outfit_list-${userId}-1`,
+                `inv:/outfit/outfit-${userId}-2`,
+                `inv:/outfit/outfit-${userId}-1`
+            );
+        }
 
         for (const queue of queues) {
             const frame = JSON.stringify({
@@ -280,16 +302,40 @@ export class ImvuRoomWebSocketClient extends EventEmitter {
         }
     }
 
+    #rememberParticipant(participant) {
+        if (!participant || typeof participant !== 'object') return;
+        this.participant = participant;
+        if (typeof participant.legacy_outfit_message === 'string' && participant.legacy_outfit_message.trim()) {
+            this.legacyOutfitMessage = participant.legacy_outfit_message.trim();
+        }
+        if (typeof participant.legacy_seat_message === 'string' && participant.legacy_seat_message.trim()) {
+            this.legacySeatMessage = participant.legacy_seat_message.trim();
+        }
+        const seatNumber = Number(participant.seat_number);
+        if (Number.isFinite(seatNumber) && seatNumber > 0) {
+            this.seatNumber = String(seatNumber);
+        }
+        const seatFurniId = Number(participant.seat_furni_id);
+        if (Number.isFinite(seatFurniId)) {
+            this.seatFurniId = seatFurniId;
+        }
+    }
+
     async #ensureChatParticipant() {
         const userId = String(this.bot.imqUserId || this.bot.user_id || this.bot.userId || '').trim();
         if (!/^\d+$/.test(userId) || !this.session?.ensureChatParticipant) return false;
-        return this.session.ensureChatParticipant(this.roomId, userId);
+        const result = await this.session.ensureChatParticipant(this.roomId, userId, {
+            participant: this.participant,
+        });
+        this.#rememberParticipant(result?.participant);
+        return result;
     }
 
     async ensureVisible(reason = 'manual') {
+        if (!this.visibilityEnabled) return false;
         if (!this.isOpen) await this.connect();
         await this.#ensureChatParticipant();
-        if (!this.chatQueue) {
+        if (!this.chatQueue || !this.legacyChatSubscribed) {
             void this.#discoverLegacyChatQueue();
             return false;
         }
@@ -300,19 +346,30 @@ export class ImvuRoomWebSocketClient extends EventEmitter {
     }
 
     #sendVisibilityBootstrap() {
+        if (!this.visibilityEnabled) return;
         if (this.visibilityBootstrapped || !this.isOpen || !this.chatQueue.startsWith('/chat/')) return;
         this.visibilityBootstrapped = true;
 
         const userId = String(this.bot.imqUserId || this.bot.user_id || this.bot.userId || '').trim();
         if (!/^\d+$/.test(userId)) return;
 
-        const seatIndex = String(process.env.IMVU_WS_SEAT_INDEX || '1').trim() || '1';
-        const legacyOutfitMessage = String(this.bot.imvuLegacyOutfitMessage || '').trim();
-        const legacySeatMessage = String(this.bot.imvuLegacySeatMessage || '').trim();
+        const seatAssignmentVersion =
+            String(process.env.IMVU_WS_SEAT_ASSIGNMENT_VERSION || '3').trim() || '3';
+        const seatNumber =
+            this.seatNumber ||
+            String(process.env.IMVU_WS_SEAT_NUMBER || process.env.IMVU_WS_SEAT_INDEX || '1').trim() ||
+            '1';
+        const seatFurniId = Number.isFinite(Number(this.seatFurniId)) ? Number(this.seatFurniId) : 0;
+        const legacyOutfitMessage = String(this.legacyOutfitMessage || '').trim();
+        const legacySeatMessage = String(this.legacySeatMessage || '').trim();
         const bootstrapMessages = ['*imvu:isPureUser'];
 
         if (legacyOutfitMessage) {
             bootstrapMessages.push(legacyOutfitMessage);
+            const legacyUseMessage = legacyOutfitMessage.replace(/^\*putOnOutfit\b/i, '*use');
+            if (legacyUseMessage !== legacyOutfitMessage) {
+                bootstrapMessages.push(legacyUseMessage);
+            }
         } else {
             const outfitProductIds = String(process.env.IMVU_WS_OUTFIT_PRODUCT_IDS || '')
                 .trim()
@@ -321,7 +378,9 @@ export class ImvuRoomWebSocketClient extends EventEmitter {
                 bootstrapMessages.push(`*putOnOutfit ${outfitProductIds}`, `*use ${outfitProductIds}`);
             }
         }
-        bootstrapMessages.push(legacySeatMessage || `*msg SeatAssignment ${seatIndex} ${userId} 1 0`);
+        bootstrapMessages.push(
+            legacySeatMessage || `*msg SeatAssignment ${seatAssignmentVersion} ${userId} ${seatNumber} ${seatFurniId}`
+        );
 
         for (const text of bootstrapMessages) {
             const frame = this.spec.sendFrameFor(this.roomId, text, {
@@ -385,8 +444,11 @@ export class ImvuRoomWebSocketClient extends EventEmitter {
     }
 
     async sendMessage(text, meta = {}) {
+        if (!this.visibilityEnabled) {
+            throw new Error(`Room ${this.roomId} is tracking-only; visible chat is disabled.`);
+        }
         if (!this.isOpen) await this.connect();
-        const chatQueue = this.chatQueue || this.bot.imqChatQueue || '';
+        const chatQueue = this.chatQueue || '';
         if (!chatQueue) {
             throw new Error(
                 `No concrete IMVU chat queue discovered for room ${this.roomId}. ` +

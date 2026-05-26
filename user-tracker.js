@@ -438,7 +438,7 @@ export async function startUserTracking(page, roomId, options = {}) {
         console.log(`[LEAVE] ${username}`);
 
         // Skip bot itself
-        if (username === BOT_USERNAME) return;
+        if (String(username || '').trim().toLowerCase() === String(BOT_USERNAME || '').trim().toLowerCase()) return;
 
         try {
             bulkPost('/api/room-users', {
@@ -534,6 +534,9 @@ export async function startUserTracking(page, roomId, options = {}) {
             return false;
         }
         if (skipWelcomeAvatarIds.has(String(avatarId))) {
+            return true;
+        }
+        if (options.visibilityEnabled === false) {
             return true;
         }
         const handleKey = welcomeHandleKey(displayName);

@@ -54,6 +54,11 @@ function envDisabled(key) {
     return v === '0' || v === 'false' || v === 'no' || v === 'off';
 }
 
+function envInt(key, fallback) {
+    const value = parseInt(process.env[key] || '', 10);
+    return Number.isFinite(value) ? value : fallback;
+}
+
 function rememberRoomDiscordChannels(data, targetMap) {
     const channels = data?.room_discord_channels;
     if (!channels || typeof channels !== 'object' || Array.isArray(channels)) return;
@@ -233,10 +238,10 @@ async function main() {
     const roomDiscordChannelIds = new Map();
     let activeSpamRooms = [];
     const selfRejoinEnabled = !envDisabled('IMVU_SELF_REJOIN');
-    const selfRejoinDelayMs = Math.max(
-        1000,
-        parseInt(process.env.IMVU_SELF_REJOIN_DELAY_MS || '5000', 10) || 5000
-    );
+    const selfRejoinDelayMs = Math.max(1000, envInt('IMVU_SELF_REJOIN_DELAY_MS', 5000));
+    const selfRejoinMaxPerRoom = Math.max(0, envInt('IMVU_SELF_REJOIN_MAX_PER_ROOM', 1));
+    const selfRejoinWindowMs = Math.max(10000, envInt('IMVU_SELF_REJOIN_WINDOW_MS', 10 * 60 * 1000));
+    const selfRejoinCooldownMs = Math.max(10000, envInt('IMVU_SELF_REJOIN_COOLDOWN_MS', 15 * 60 * 1000));
 
     const stopRoom = async (roomId) => {
         const id = trackerRoomId(roomId);
@@ -287,6 +292,25 @@ async function main() {
         client.on('frame', (action) => {
             if (!selfRejoinEnabled || !frameShowsSelfRemovedFromRoom(action, id, bot.imqUserId)) return;
             if (!entry) return;
+            const now = Date.now();
+            if (entry.visibleRejoinPausedUntil && now < entry.visibleRejoinPausedUntil) return;
+
+            entry.selfRemovalEvents = entry.selfRemovalEvents.filter((timestamp) => {
+                return now - timestamp < selfRejoinWindowMs;
+            });
+            entry.selfRemovalEvents.push(now);
+            if (entry.selfRemovalEvents.length > selfRejoinMaxPerRoom) {
+                entry.visibleRejoinPausedUntil = now + selfRejoinCooldownMs;
+                if (entry.selfRejoinTimer) {
+                    clearTimeout(entry.selfRejoinTimer);
+                    entry.selfRejoinTimer = null;
+                }
+                console.warn(
+                    `[${BOT_NAME}][${id}] Visible avatar is flapping; keeping monitoring in background for ` +
+                        `${Math.round(selfRejoinCooldownMs / 60000)}m before another visible repair.`
+                );
+                return;
+            }
             if (entry?.selfRejoinTimer) return;
             console.warn(
                 `[${BOT_NAME}][${id}] IMVU reported this bot left the room; rejoining in ${selfRejoinDelayMs}ms.`
@@ -294,6 +318,7 @@ async function main() {
             entry.selfRejoinTimer = setTimeout(() => {
                 entry.selfRejoinTimer = null;
                 if (roomClients.get(id) !== entry) return;
+                if (entry.visibleRejoinPausedUntil && Date.now() < entry.visibleRejoinPausedUntil) return;
                 void client.ensureVisible('self-removed').catch((error) => {
                     console.warn(`[${BOT_NAME}][${id}] self rejoin failed: ${error.message}`);
                 });
@@ -307,7 +332,14 @@ async function main() {
             roomName: details?.name || '',
         });
 
-        entry = { client, details, startedAt: Date.now(), selfRejoinTimer: null };
+        entry = {
+            client,
+            details,
+            startedAt: Date.now(),
+            selfRejoinTimer: null,
+            selfRemovalEvents: [],
+            visibleRejoinPausedUntil: 0,
+        };
         roomClients.set(id, entry);
         return entry;
     };

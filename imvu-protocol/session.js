@@ -219,6 +219,18 @@ function extractParticipantData(payload, roomId, userId) {
     return null;
 }
 
+function participantSeatPayload(participant) {
+    if (!participant || typeof participant !== 'object') return null;
+    const seatNumber = Number(participant.seat_number);
+    if (!Number.isFinite(seatNumber) || seatNumber <= 0) return null;
+
+    const seatFurniId = Number(participant.seat_furni_id);
+    return {
+        seat_furni_id: Number.isFinite(seatFurniId) ? seatFurniId : 0,
+        seat_number: seatNumber,
+    };
+}
+
 function profileUrlForUsername(username) {
     const cleanUsername = String(username || '').trim();
     if (!cleanUsername) return '';
@@ -476,28 +488,80 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         }
     }
 
-    async function ensureChatParticipant(roomId, userId) {
+    async function fetchChatParticipant(roomId, userId, sauce = '') {
+        const normalizedRoomId = String(roomId || '').trim().replace(/^room-/i, '');
+        const normalizedUserId = String(userId || '').trim();
+        if (!/^\d+-\d+$/.test(normalizedRoomId) || !/^\d+$/.test(normalizedUserId)) return null;
+
+        const response = await client.get(
+            new URL(
+                `chat/chat-${normalizedRoomId}/participants/user-${normalizedUserId}`,
+                `${DEFAULT_API_ORIGIN}/`
+            ).href,
+            {
+                headers: {
+                    Accept: 'application/json; charset=utf-8',
+                    Origin: process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN,
+                    Referer: `${process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN}/next/chat/room-${normalizedRoomId}/`,
+                    'X-IMVU-Application': process.env.IMVU_X_APPLICATION || 'next_desktop/1',
+                    ...(sauce ? { 'X-IMVU-Sauce': sauce } : {}),
+                },
+                validateStatus: (status) => status >= 200 && status < 500,
+            }
+        );
+        if (response.status < 200 || response.status >= 300) return null;
+        return extractParticipantData(response.data, normalizedRoomId, normalizedUserId);
+    }
+
+    async function ensureChatParticipant(roomId, userId, options = {}) {
         const normalizedRoomId = String(roomId || '').trim().replace(/^room-/i, '');
         const normalizedUserId = String(userId || '').trim();
         if (!/^\d+-\d+$/.test(normalizedRoomId) || !/^\d+$/.test(normalizedUserId)) return false;
 
-        const candidates = [
-            {
-                method: 'post',
-                path: `/chat/chat-${normalizedRoomId}/participants`,
-                data: {},
-            },
-            {
-                method: 'put',
-                path: `/chat/chat-${normalizedRoomId}/participants/user-${normalizedUserId}`,
-                data: {},
-            },
-            {
-                method: 'post',
-                path: `/chat/chat-${normalizedRoomId}/participants/user-${normalizedUserId}`,
-                data: {},
-            },
-        ];
+        const refreshPayload = participantSeatPayload(options.participant);
+        const candidates = refreshPayload
+            ? [
+                  {
+                      method: 'post',
+                      path: `/chat/chat-${normalizedRoomId}/participants/user-${normalizedUserId}`,
+                      data: refreshPayload,
+                  },
+                  {
+                      method: 'put',
+                      path: `/chat/chat-${normalizedRoomId}/participants/user-${normalizedUserId}`,
+                      data: refreshPayload,
+                  },
+                  {
+                      method: 'post',
+                      path: `/chat/chat-${normalizedRoomId}/participants`,
+                      data: {},
+                  },
+                  {
+                      method: 'get',
+                      path: `/chat/chat-${normalizedRoomId}/participants/user-${normalizedUserId}`,
+                  },
+              ]
+            : [
+                  {
+                      method: 'post',
+                      path: `/chat/chat-${normalizedRoomId}/participants`,
+                      data: {},
+                  },
+                  {
+                      method: 'get',
+                      path: `/chat/chat-${normalizedRoomId}/participants/user-${normalizedUserId}`,
+                  },
+                  {
+                      method: 'put',
+                      path: `/chat/chat-${normalizedRoomId}/participants/user-${normalizedUserId}`,
+                      data: {},
+                  },
+                  {
+                      method: 'post',
+                      path: `/chat/chat-${normalizedRoomId}/participants/user-${normalizedUserId}`,
+                      data: {},
+                  },
+              ];
 
         const sauce = await resolveImvuSauce();
         let lastError = '';
@@ -518,17 +582,21 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                     validateStatus: (status) => status >= 200 && status < 500,
                 });
                 if ((response.status >= 200 && response.status < 300) || response.status === 409) {
-                    const participant = extractParticipantData(response.data, normalizedRoomId, normalizedUserId);
-                    if (participant?.legacy_outfit_message) {
-                        bot.imvuLegacyOutfitMessage = participant.legacy_outfit_message;
-                    }
-                    if (participant?.legacy_seat_message) {
-                        bot.imvuLegacySeatMessage = participant.legacy_seat_message;
+                    let participant = extractParticipantData(response.data, normalizedRoomId, normalizedUserId);
+                    if (!participant && candidate.method !== 'get') {
+                        try {
+                            participant = await fetchChatParticipant(normalizedRoomId, normalizedUserId, sauce);
+                        } catch {}
                     }
                     logger.log(
                         `[IMVU-SESSION] Ensured chat participant user-${normalizedUserId} in chat-${normalizedRoomId} via ${candidate.method.toUpperCase()} ${candidate.path} ${response.status}.`
                     );
-                    return true;
+                    return {
+                        participant,
+                        method: candidate.method,
+                        path: candidate.path,
+                        status: response.status,
+                    };
                 }
                 lastError = `${candidate.method.toUpperCase()} ${candidate.path} ${response.status}${summarizeResponseData(response.data)}`;
             } catch (error) {
