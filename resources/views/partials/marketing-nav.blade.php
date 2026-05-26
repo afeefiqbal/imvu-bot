@@ -11,12 +11,13 @@
         >Contact</a>
         @if (Route::has('login'))
             @auth
-                <a class="landing-link" href="{{ url('/admin') }}">Dashboard</a>
+                <a class="landing-link" href="{{ route('dashboard') }}">Dashboard</a>
+                <form action="{{ route('logout') }}" method="POST">
+                    @csrf
+                    <button class="landing-link" type="submit">Log out</button>
+                </form>
             @else
-                <a class="landing-link" href="{{ route('login') }}">Log in</a>
-                @if (Route::has('register'))
-                    <a class="landing-link" href="{{ route('register') }}">Register</a>
-                @endif
+                <a class="landing-link" href="{{ route('login') }}">Login with Discord</a>
             @endauth
         @endif
     </nav>

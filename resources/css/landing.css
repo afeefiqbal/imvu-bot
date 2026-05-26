@@ -175,7 +175,11 @@
 }
 
 .landing-link {
+    border: 0;
+    background: transparent;
     color: var(--landing-muted);
+    cursor: pointer;
+    font: inherit;
     text-decoration: none;
     font-size: 0.875rem;
     font-weight: 500;
@@ -189,6 +193,10 @@
 .landing-link:hover {
     color: #fff;
     background: rgba(255, 255, 255, 0.06);
+}
+
+.landing-nav-links form {
+    margin: 0;
 }
 
 .landing-link--active {

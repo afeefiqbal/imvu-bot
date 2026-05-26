@@ -114,4 +114,19 @@ return [
 
     'password_timeout' => env('AUTH_PASSWORD_TIMEOUT', 10800),
 
+    /*
+    |--------------------------------------------------------------------------
+    | Super Admins
+    |--------------------------------------------------------------------------
+    |
+    | Only these comma-separated email addresses may access the Filament admin
+    | panel with the normal email/password login.
+    |
+    */
+
+    'super_admin_emails' => array_filter(array_map(
+        'trim',
+        explode(',', (string) env('SUPER_ADMIN_EMAILS', '')),
+    )),
+
 ];

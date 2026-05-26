@@ -15,10 +15,10 @@
             </p>
             <div class="landing-cta-row">
                 @auth
-                    <a class="landing-btn landing-btn--primary" href="{{ url('/admin') }}">Open admin</a>
+                    <a class="landing-btn landing-btn--primary" href="{{ route('dashboard') }}">Open dashboard</a>
                 @else
                     @if (Route::has('login'))
-                        <a class="landing-btn landing-btn--primary" href="{{ route('login') }}">Get started</a>
+                        <a class="landing-btn landing-btn--primary" href="{{ route('login') }}">Login with Discord</a>
                     @endif
                     <a class="landing-btn landing-btn--ghost" href="https://laravel.com/docs" target="_blank" rel="noopener">Docs</a>
                 @endauth
