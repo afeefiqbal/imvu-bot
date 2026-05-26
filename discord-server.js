@@ -9,10 +9,10 @@ import dotenv from 'dotenv';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Load env from common local layouts: embedded Laravel parent, sibling Laravel app, then this Node repo.
+dotenv.config({ path: path.join(__dirname, '.env') });
+// Fallbacks for common local layouts: embedded Laravel parent, then sibling Laravel app.
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 dotenv.config({ path: path.join(__dirname, '..', 'imvu-bot-laravel', '.env') });
-dotenv.config({ path: path.join(__dirname, '.env') });
 
 const app = express();
 app.use(bodyParser.json());
@@ -26,6 +26,11 @@ const client = new Client({
 });
 
 const activeRooms = new Set();
+const initializedRooms = new Set();
+function resolveDiscordChannelId(body = {}) {
+    return String(body.discord_channel_id || process.env.DISCORD_CHANNEL_ID || '').trim();
+}
+
 function updatePresence() {
     if (client.user) {
         client.user.setActivity(`Active in ${activeRooms.size} room${activeRooms.size === 1 ? '' : 's'}`, { type: ActivityType.Custom });
@@ -38,7 +43,7 @@ client.once('clientReady', () => {
     updatePresence();
 });
 
-async function getOrCreateRoomChannel(client, requestedId, room_id, room_name) {
+async function getOrCreateRoomChannel(client, requestedId, room_id, room_name, options = {}) {
     if (!requestedId) return null;
     
     if (room_id && !activeRooms.has(room_id)) {
@@ -46,6 +51,12 @@ async function getOrCreateRoomChannel(client, requestedId, room_id, room_name) {
         updatePresence();
     }
     
+    // Room DB channel IDs point directly at the channel created for that IMVU room.
+    if (options.directChannelId) {
+        const directChannel = await client.channels.fetch(requestedId).catch(() => null);
+        if (directChannel?.send) return directChannel;
+    }
+
     // Attempt 1: Try reading it as a direct Server (Guild) ID
     let guild = client.guilds.cache.get(requestedId) || await client.guilds.fetch(requestedId).catch(() => null);
     
@@ -107,19 +118,25 @@ app.post('/api/imvu-chat', async (req, res) => {
     try {
         const { event, direction, username, message, room_id, room_name } = req.body;
         
-        // Use dynamic channel ID if provided by the bot, otherwise fallback to .env default
-        const channelId = req.body.discord_channel_id || process.env.DISCORD_CHANNEL_ID;
+        // Prefer the per-room channel saved in server_rooms; .env is only a fallback.
+        const roomChannelId = String(req.body.discord_channel_id || '').trim();
+        const channelId = resolveDiscordChannelId(req.body);
         if (!channelId) {
-            console.error('[DISCORD] ❌ Missing DISCORD_CHANNEL_ID in .env');
+            console.error('[DISCORD] ❌ Missing Discord channel id from DB and DISCORD_CHANNEL_ID fallback in .env');
             return res.status(400).send('Missing channel config');
         }
 
         // Only process chats (ignore other events for now)
         if (event === 'imvu_chat') {
-            const roomChannel = await getOrCreateRoomChannel(client, channelId, room_id, room_name);
+            const roomChannel = await getOrCreateRoomChannel(client, channelId, room_id, room_name, {
+                directChannelId: Boolean(roomChannelId),
+            });
             if (roomChannel) {
                 const prefix = direction === 'OUT' ? '🤖(Bot)' : '👤';
-                await roomChannel.send(`**${prefix}** \`${username}\`: ${message}`);
+                await roomChannel.send({
+                    content: `**${prefix}** \`${username}\`: ${message}`,
+                    allowedMentions: { parse: [] }
+                });
                 res.status(200).send({ status: 'sent', channel: roomChannel.name });
             } else {
                 console.error(`[DISCORD] ❌ Base Channel ID '${channelId}' not found or lacks permissions to read Guild!`);
@@ -138,12 +155,25 @@ app.post('/api/imvu-chat', async (req, res) => {
 app.post('/api/imvu-init-room', async (req, res) => {
     try {
         const { room_id, room_name } = req.body;
-        const channelId = req.body.discord_channel_id || process.env.DISCORD_CHANNEL_ID;
+        const roomChannelId = String(req.body.discord_channel_id || '').trim();
+        const channelId = resolveDiscordChannelId(req.body);
         
         if (!channelId || !room_id) return res.status(400).send('Missing args');
         
-        const roomChannel = await getOrCreateRoomChannel(client, channelId, room_id, room_name);
+        const roomChannel = await getOrCreateRoomChannel(client, channelId, room_id, room_name, {
+            directChannelId: Boolean(roomChannelId),
+        });
         if (roomChannel) {
+            const key = String(room_id);
+            if (!initializedRooms.has(key)) {
+                initializedRooms.add(key);
+                await roomChannel.send({
+                    content:
+                        `✅ IMVU room active: **${room_name || 'Unknown Room'}** (\`${key}\`)\n` +
+                        `Active rooms now: **${activeRooms.size}**`,
+                    allowedMentions: { parse: [] }
+                }).catch(() => null);
+            }
             res.status(200).send({ status: 'initialized' });
         } else {
             res.status(404).send('Guild not found');

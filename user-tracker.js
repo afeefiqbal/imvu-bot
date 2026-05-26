@@ -408,6 +408,8 @@ export async function startUserTracking(page, roomId, options = {}) {
         welcomeArrivalsEnabled: false,
         participantsRosterSynced: false,
         welcomeArrivalsEnableTimer: null,
+        initialLegacyRosterStarted: false,
+        initialLegacyRosterUntil: 0,
     };
 
     /** One listener per tab; remove on page close to avoid MaxListenersExceeded / leaks. */
@@ -536,11 +538,6 @@ export async function startUserTracking(page, roomId, options = {}) {
         }
         const handleKey = welcomeHandleKey(displayName);
         if (!handleKey) return false;
-        // 🚨 Allow rejoin if user is no longer in room
-        if (!lastUserMap.has(avatarId)) {
-            welcomeTimestamps.delete(avatarId);
-        }
-
         // 🚨 HARD LOCK IMMEDIATELY
         if (activeJoinSessions.has(avatarId)) {
             return false;
@@ -561,7 +558,7 @@ export async function startUserTracking(page, roomId, options = {}) {
                 Date.now() - lastByHandle < WELCOME_HANDLE_COOLDOWN_MS
             ) {
                 activeJoinSessions.delete(avatarId);
-                // Same handle flapping in-room without a leave — suppress. Real leaves clear this map.
+                // Same handle flapping or quickly rejoining — suppress duplicate welcomes.
                 return false;
             }
         }

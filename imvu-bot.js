@@ -17,10 +17,10 @@ import { decodeChatEnvelope, decodeId, roomQueueBelongsToRoom } from './user-tra
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-// Load env from common local layouts: embedded Laravel parent, sibling Laravel app, then this Node repo.
+dotenv.config({ path: path.join(__dirname, '.env') });
+// Fallbacks for common local layouts: embedded Laravel parent, then sibling Laravel app.
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 dotenv.config({ path: path.join(__dirname, '..', 'imvu-bot-laravel', '.env') });
-dotenv.config({ path: path.join(__dirname, '.env') });
 
 if (!global.discordBridge) {
     global.discordBridge = new EventEmitter();
@@ -54,6 +54,16 @@ function envDisabled(key) {
     return v === '0' || v === 'false' || v === 'no' || v === 'off';
 }
 
+function rememberRoomDiscordChannels(data, targetMap) {
+    const channels = data?.room_discord_channels;
+    if (!channels || typeof channels !== 'object' || Array.isArray(channels)) return;
+    for (const [rawRoomId, rawChannelId] of Object.entries(channels)) {
+        const roomId = trackerRoomId(rawRoomId);
+        const channelId = String(rawChannelId || '').trim();
+        if (roomId && channelId) targetMap.set(roomId, channelId);
+    }
+}
+
 function frameShowsSelfRemovedFromRoom(action, roomId, selfUserId) {
     if (!action || typeof action !== 'object' || !selfUserId) return false;
     const self = String(selfUserId);
@@ -65,6 +75,7 @@ function frameShowsSelfRemovedFromRoom(action, roomId, selfUserId) {
         return avatarId != null && String(avatarId) === self;
     }
 
+    if (!envTruthy('IMVU_SELF_REJOIN_ON_PARTICIPANT_DELETE')) return false;
     if (action.record !== 'msg_g2c_send_message') return false;
     if (!String(action.mount || '').toLowerCase().includes('participants')) return false;
 
@@ -126,13 +137,14 @@ async function fetchBotSettings(botName) {
     if (!response.data?.username) {
         throw new Error(`Bot not found or missing username: ${botName}`);
     }
+    const envDiscordChannelId = String(process.env.DISCORD_CHANNEL_ID || '').trim();
     return {
         ...response.data,
         name: response.data.name || botName,
         username: response.data.username,
         password: response.data.password,
         profile: response.data.profile || response.data.name || botName,
-        discordChannelId: response.data.discord_channel_id || null,
+        discordChannelId: envDiscordChannelId || null,
     };
 }
 
@@ -218,6 +230,7 @@ async function main() {
     startDiscordRelayForBot(BOT_NAME);
 
     const roomClients = new Map();
+    const roomDiscordChannelIds = new Map();
     let activeSpamRooms = [];
     const selfRejoinEnabled = !envDisabled('IMVU_SELF_REJOIN');
     const selfRejoinDelayMs = Math.max(
@@ -289,7 +302,7 @@ async function main() {
         await startProtocolUserTracking(client, id, {
             botName: BOT_NAME,
             botUsername: bot.username,
-            discordChannelId: bot.discordChannelId,
+            discordChannelId: roomDiscordChannelIds.get(id) || bot.discordChannelId,
             sessionClient: session,
             roomName: details?.name || '',
         });
@@ -303,6 +316,7 @@ async function main() {
         console.warn(`[${BOT_NAME}] Initial dashboard sync failed: ${error.message}`);
         return {};
     });
+    rememberRoomDiscordChannels(initial, roomDiscordChannelIds);
     const initialTargets = Array.isArray(initial.target_rooms) ? initial.target_rooms : [];
     const firstRooms = initialTargets.length ? initialTargets : [process.env.IMVU_DEFAULT_ROOM || '255338726-5'];
 
@@ -321,6 +335,7 @@ async function main() {
                 console.warn(`[${BOT_NAME}] Dashboard sync failed: ${error.message}`);
                 return;
             }
+            rememberRoomDiscordChannels(data, roomDiscordChannelIds);
 
             activeSpamRooms = Array.isArray(data.spam_targets) ? data.spam_targets.map(trackerRoomId) : [];
             const targets = new Set((Array.isArray(data.target_rooms) ? data.target_rooms : []).map(trackerRoomId));

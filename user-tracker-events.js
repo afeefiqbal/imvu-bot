@@ -12,7 +12,6 @@ import {
     messageMentionsBot,
     normalizeImvuUsername,
     roomQueueBelongsToRoom,
-    welcomeHandleKey,
 } from './user-tracker-utils.js';
 import {
     messageInvokesSivaCharacterAi,
@@ -138,7 +137,31 @@ export const createIncomingMessageHandler = (ctx) => {
         0,
         parseInt(String(process.env.IMVU_WELCOME_GATE_MS || '5000'), 10) || 5000
     );
+    const initialLegacyRosterMs = Math.max(
+        0,
+        parseInt(String(process.env.IMVU_INITIAL_LEGACY_ROSTER_MS || '12000'), 10) || 12000
+    );
     const userLastReply = new Map();
+
+    const isLegacyChatQueue = (queue) => String(queue || '').startsWith('/chat/');
+
+    const touchInitialLegacyRosterReplay = (queue) => {
+        if (!isLegacyChatQueue(queue) || initialLegacyRosterMs <= 0) return;
+        if (ctx.state.initialLegacyRosterStarted) return;
+        ctx.state.initialLegacyRosterStarted = true;
+        ctx.state.initialLegacyRosterUntil = Date.now() + initialLegacyRosterMs;
+    };
+
+    const isInitialLegacyRosterReplay = (queue) =>
+        isLegacyChatQueue(queue) &&
+        Date.now() < (ctx.state.initialLegacyRosterUntil || 0);
+
+    const markExistingDuringInitialReplay = (avatarId, queue) => {
+        if (!avatarId || ctx.isSelfId(avatarId) || !isInitialLegacyRosterReplay(queue)) return false;
+        ctx.skipWelcomeAvatarIds.add(String(avatarId));
+        ctx.joinQueueBackendAnnounced.add(String(avatarId));
+        return true;
+    };
 
     const handleFinalJoin = (avatarId) => {
         if (!avatarId) return;
@@ -182,6 +205,7 @@ export const createIncomingMessageHandler = (ctx) => {
             const props = action.properties || {};
             const queue = action.queue || '';
             const mount = action.mount || '';
+            touchInitialLegacyRosterReplay(queue);
 
             if (record === 'msg_c2g_connect' && action.user_id) {
                 ctx.state.selfUserId = decodeId(action.user_id);
@@ -240,13 +264,6 @@ export const createIncomingMessageHandler = (ctx) => {
                     if (p.state === 'removed') {
                         if (avatarId && ctx.lastUserMap.has(avatarId)) {
                             const username = ctx.lastUserMap.get(avatarId);
-                            ctx.welcomeTimestamps?.delete(avatarId);
-                            if (username != null && String(username).trim() !== '') {
-                                const hk = welcomeHandleKey(
-                                    normalizeImvuUsername(String(username)) || String(username).trim(),
-                                );
-                                if (hk) ctx.welcomeByHandleLastAt?.delete(hk);
-                            }
                             ctx.lastUserMap.delete(avatarId);
                             ctx.skipWelcomeAvatarIds.delete(avatarId);
                             ctx.joinQueueBackendAnnounced.delete(avatarId);
@@ -326,11 +343,12 @@ export const createIncomingMessageHandler = (ctx) => {
 
                 const avatarId = decodeId(action.user_id);
                 const hadUser = avatarId ? ctx.lastUserMap.has(avatarId) : false;
+                const existingReplay = markExistingDuringInitialReplay(avatarId, queue);
 
                 if (avatarId && !ctx.lastUserMap.has(avatarId)) {
                     ctx.lastUserMap.set(avatarId, null);
                     console.log(
-                        `[JOIN][QUEUE] ${ctx.isSelfId(avatarId) ? 'bot' : 'occupant'} · resolving https://api.imvu.com/user/user-${avatarId}`
+                        `[JOIN][QUEUE] ${existingReplay ? 'existing occupant' : ctx.isSelfId(avatarId) ? 'bot' : 'occupant'} · resolving https://api.imvu.com/user/user-${avatarId}`
                     );
                     if (/^\d+$/.test(String(avatarId))) {
                         void ctx.resolveImvuHandleFromNumericId(avatarId).then((name) => {
@@ -357,6 +375,7 @@ export const createIncomingMessageHandler = (ctx) => {
                     !ctx.skipWelcomeAvatarIds.has(avatarId) &&
                     !ctx.joinQueueBackendAnnounced.has(avatarId)
                 ) {
+                    markExistingDuringInitialReplay(avatarId, queue);
                     const cur = ctx.lastUserMap.get(avatarId);
                     if (hasResolvedName(cur)) {
                         handleFinalJoin(avatarId);
@@ -415,13 +434,6 @@ export const createIncomingMessageHandler = (ctx) => {
                         continue;
                     }
                     const username = ctx.lastUserMap.get(avatarId);
-                    ctx.welcomeTimestamps?.delete(avatarId);
-                    if (username != null && String(username).trim() !== '') {
-                        const hk = welcomeHandleKey(
-                            normalizeImvuUsername(String(username)) || String(username).trim(),
-                        );
-                        if (hk) ctx.welcomeByHandleLastAt?.delete(hk);
-                    }
                     ctx.lastUserMap.delete(avatarId);
                     ctx.skipWelcomeAvatarIds.delete(avatarId);
                     ctx.joinQueueBackendAnnounced.delete(avatarId);
@@ -457,6 +469,7 @@ export const createIncomingMessageHandler = (ctx) => {
                     }
 
                     if (deltaAction && deltaAction !== 'created' && deltaAction !== 'added') continue;
+                    markExistingDuringInitialReplay(avatarId, queue);
                     if (!ctx.lastUserMap.has(avatarId)) {
                         ctx.lastUserMap.set(avatarId, null);
                         console.log(
@@ -542,7 +555,8 @@ export const createIncomingMessageHandler = (ctx) => {
 
                 const text = envelope?.message || envelope?.text || envelope?.body || envelope?.chat_message;
                 if (typeof text === 'string' && text.trim()) {
-                    const direction = record === 'msg_c2g_send_message' ? 'OUT' : 'IN';
+                    const direction =
+                        record === 'msg_c2g_send_message' || ctx.isSelfId(senderId) ? 'OUT' : 'IN';
                     const trimmed = text.trim();
                     if (
                         direction === 'IN' &&

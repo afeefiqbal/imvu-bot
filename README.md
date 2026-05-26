@@ -8,12 +8,14 @@ https://github.com/afeefiqbal/imvu-bot-laravel.
 ```bash
 npm install
 npm start
+# or
+npm run local
 ```
 
-Set `BOT_API_BASE_URL` to the Laravel app URL, for example:
+Set `BOT_API_BASE_URL` in `.env` to the Laravel app URL:
 
 ```bash
-BOT_API_BASE_URL=https://your-laravel-service.up.railway.app npm start
+BOT_API_BASE_URL=https://your-laravel-service.up.railway.app
 ```
 
 ## Combined System‑wide VPN + Per‑Bot Proxy Setup
