@@ -1,4 +1,0 @@
-# If Railway builds with Nixpacks only (no root Dockerfile), try to add Node.
-# Prefer the repo-root Dockerfile for PHP + Node — Nixpacks often still omits `node` from PATH.
-[phases.setup]
-nixPkgs = ["...", "nodejs"]

@@ -1,39 +1,30 @@
 {
-    "$schema": "https://www.schemastore.org/package.json",
-    "private": true,
-    "type": "module",
-    "scripts": {
-        "build:filament": "npx tailwindcss@3 --input ./resources/css/filament/admin/theme.css --output ./public/css/filament/admin/theme.css --config ./resources/css/filament/admin/tailwind.config.js --minify",
-        "build": "npm run build:filament && vite build",
-        "dev": "vite",
-        "bot": "node lurkbot-bot/index.js",
-        "local": "bash scripts/run-all.sh",
-        "local:icecast": "bash scripts/run-all.sh --with-icecast"
-    },
-    "devDependencies": {
-        "@tailwindcss/forms": "^0.5.11",
-        "@tailwindcss/typography": "^0.5.19",
-        "@tailwindcss/vite": "^4.0.0",
-        "axios": "^1.13.6",
-        "concurrently": "^9.0.1",
-        "laravel-vite-plugin": "^3.0.0",
-        "tailwindcss": "^4.0.0",
-        "vite": "^8.0.0"
-    },
-    "dependencies": {
-        "body-parser": "^2.2.2",
-        "dotenv": "^17.3.1",
-        "express": "^5.2.1",
-        "puppeteer": "^24.40.0"
-    },
-    "name": "lurkbot-backend",
-    "version": "1.0.0",
-    "description": "<p align=\"center\"><a href=\"https://laravel.com\" target=\"_blank\"><img src=\"https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg\" width=\"400\" alt=\"Laravel Logo\"></a></p>",
-    "main": "index.js",
-    "directories": {
-        "test": "tests"
-    },
-    "keywords": [],
-    "author": "",
-    "license": "ISC"
+  "name": "lurkbot-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "bot": "node multi-launcher.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "axios": "^1.13.6",
+    "axios-cookiejar-support": "^7.0.0",
+    "body-parser": "^2.2.2",
+    "cheerio": "^1.2.0",
+    "discord.js": "^14.26.2",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "http-proxy-agent": "^9.0.0",
+    "https-proxy-agent": "^9.0.0",
+    "imvu.js": "^0.1.0",
+    "play-dl": "^1.9.7",
+    "tough-cookie": "^6.0.1",
+    "ws": "^8.20.0"
+  }
 }

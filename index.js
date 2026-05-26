@@ -1,2 +1,2 @@
-// Run Discord bot from repo root: `node index.js`
-import './lurkbot-bot/index.js';
+// Entry for `node index.js` (repo root) and `npm run bot` — delegates to multi-launcher.
+import './multi-launcher.js';
