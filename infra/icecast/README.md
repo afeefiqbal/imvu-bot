@@ -37,9 +37,11 @@ docker push ghcr.io/afeefiqbal/imvu-icecast:latest
 
 | Variable | Value |
 |----------|--------|
-| `ICECAST_PORT` | `8001` |
+| `ICECAST_PORT` | `8001` (required — set on **icecast** service; must match bot `ICECAST_PORT`) |
 | `ICECAST_SOURCE_PASSWORD` | Strong secret (shared with bot + Laravel) |
 | `ICECAST_ADMIN_PASSWORD` | Admin UI password (optional) |
+
+On Railway, set **`ICECAST_PORT=8001`** and **`PORT=8001`** on the icecast service (or set the public domain **target port** to `8001` in Networking). If the proxy targets `8080` but Icecast listens on `8001`, `curl` returns **502 Application failed to respond**.
 
 Networking: prefer **private** only (no public HTTP needed for source ingest). Bots connect on the private network.
 

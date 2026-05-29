@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
+# Listen port: ICECAST_PORT wins, then Railway PORT, then 8001.
+# Set ICECAST_PORT=8001 and PORT=8001 on Railway so public domain + private DNS match the bot.
 export ICECAST_PORT="${ICECAST_PORT:-${PORT:-8001}}"
 export ICECAST_SOURCE_PASSWORD="${ICECAST_SOURCE_PASSWORD:?Set ICECAST_SOURCE_PASSWORD (must match bot + Laravel)}"
 export ICECAST_ADMIN_PASSWORD="${ICECAST_ADMIN_PASSWORD:-changeme}"
