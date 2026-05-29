@@ -5,6 +5,7 @@ import { notifyImvuMusicState } from './notifyImvuMusicApi.js';
 import { applyRoomMediaStreamUrl } from './imvuRoomMediaDom.js';
 import { spawnYtDlpAudioStdout } from './ytDlpAudioStdout.js';
 import { cacheBustHttpsStreamUrl, withPerPlayStreamMount } from './loadStreamConfig.js';
+import { icecastConnectFamily } from './resolvedIcecastHost.js';
 import { canonicalYoutubeWatchUrl } from './resolvePlay.js';
 import { withIcecastMountEncodeLock } from './icecastMountLock.js';
 import { loadAutoplayTracksFromEnv } from './autoplayPlaylist.js';
@@ -38,6 +39,7 @@ function httpGetStatus(host, port, path) {
             {
                 hostname: host,
                 port: Number(port),
+                family: icecastConnectFamily(host),
                 path: path.startsWith('/') ? path : `/${path}`,
                 method: 'GET',
                 timeout: 2800,
@@ -75,6 +77,7 @@ async function icecastStatusJsonShowsSource(loopHost, port, mount) {
             {
                 hostname: loopHost,
                 port: Number(port),
+                family: icecastConnectFamily(loopHost),
                 path,
                 method: 'GET',
                 timeout: 3200,

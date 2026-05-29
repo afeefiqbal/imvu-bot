@@ -25,3 +25,8 @@ export function resolvedIcecastHost() {
 
     return `${host}${suffix}`;
 }
+
+/** Railway private DNS often resolves to IPv6 first; Icecast listens on IPv4. */
+export function icecastConnectFamily(host) {
+    return String(host || '').endsWith('.railway.internal') ? 4 : undefined;
+}
