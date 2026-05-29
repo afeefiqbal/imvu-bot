@@ -18,10 +18,6 @@ Set `BOT_API_BASE_URL` in `.env` to the Laravel app URL:
 BOT_API_BASE_URL=https://your-laravel-service.up.railway.app
 ```
 
-## Production Icecast
-
-Icecast runs as a **separate** Railway service (not in the bot `Dockerfile`). See [infra/icecast/README.md](infra/icecast/README.md) for deploy steps, env vars, and bot/Laravel wiring.
-
 ## Combined System‑wide VPN + Per‑Bot Proxy Setup
 
 ## 1️⃣ Start your system‑wide VPN
