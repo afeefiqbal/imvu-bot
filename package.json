@@ -27,7 +27,6 @@
     "http-proxy-agent": "^9.0.0",
     "https-proxy-agent": "^9.0.0",
     "imvu.js": "^0.1.0",
-    "play-dl": "^1.9.7",
     "tough-cookie": "^6.0.1",
     "ws": "^8.20.0"
   }

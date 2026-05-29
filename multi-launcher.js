@@ -5,7 +5,6 @@ import axios from 'axios';
 import dotenv from 'dotenv';
 import { bulkPost } from './api-queue.js';
 import { backendApiBaseUrl } from './env-app-url.js';
-import { maybeStartMusicIngressTunnel } from './music/tunnelIngress.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -14,50 +13,6 @@ dotenv.config({ path: path.join(__dirname, '.env') });
 // Fallbacks for common local layouts: embedded Laravel parent, then sibling Laravel app.
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 dotenv.config({ path: path.join(__dirname, '..', 'imvu-bot-laravel', '.env') });
-
-function envTruthy(key) {
-    const v = String(process.env[key] ?? '')
-        .trim()
-        .toLowerCase();
-    return v === '1' || v === 'true' || v === 'yes' || v === 'on';
-}
-
-/** Local dev: drop Railway private DNS. Drop quick-tunnel env only when music is off (copied prod .env otherwise blocks boot ~45s). Opt out: LURKBOT_KEEP_RAILWAY_ENV=1 */
-function normalizeEnvForLocalDev() {
-    const appEnv = String(process.env.APP_ENV || '').toLowerCase();
-    const onRailway = Boolean(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID);
-    if (appEnv !== 'local' || onRailway) return;
-    if (String(process.env.LURKBOT_KEEP_RAILWAY_ENV || '').trim() === '1') return;
-
-    delete process.env.ICECAST_HOST_SUFFIX;
-
-    const musicOn = envTruthy('IMVU_MUSIC_ENABLED') || envTruthy('MUSIC_ENABLED');
-    if (!musicOn) {
-        delete process.env.CLOUDFLARE_TUNNEL_AUTO;
-        delete process.env.NGROK_TUNNEL_AUTO;
-        delete process.env.CLOUDFLARE_TUNNEL_FORCE;
-    }
-}
-
-normalizeEnvForLocalDev();
-
-/** Railway + stable Icecast HTTPS URL: never start ngrok/cloudflared quick tunnels. */
-function normalizeEnvForRailway() {
-    const onRailway = Boolean(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID);
-    if (!onRailway) return;
-
-    const tpl = String(process.env.MUSIC_PUBLIC_STREAM_URL_TEMPLATE || '').trim();
-    const stableHttps =
-        tpl && /^https:\/\//i.test(tpl) && !/\.trycloudflare\.com\b/i.test(tpl);
-    if (!stableHttps) return;
-
-    delete process.env.CLOUDFLARE_TUNNEL_AUTO;
-    delete process.env.CLOUDFLARE_TUNNEL_FORCE;
-    delete process.env.NGROK_TUNNEL_AUTO;
-    delete process.env.NGROK_TUNNEL_FORCE;
-}
-
-normalizeEnvForRailway();
 
 /**
  * Multi-bot orchestration: one `spawn()` = one Node child using the pure WebSocket IMVU runtime.
@@ -508,8 +463,6 @@ async function run() {
         await new Promise((r) => setTimeout(r, pollIntervalMs()));
         bots = await fetchAllBots();
     }
-
-    await maybeStartMusicIngressTunnel();
 
     console.log(`\n[MULTI-LAUNCHER] 🔥 Preparing to launch ${bots.length} active bots!`);
     console.log(`[MULTI-LAUNCHER] 📝 Bots found: ${bots.map((b) => b.name).join(', ')}`);

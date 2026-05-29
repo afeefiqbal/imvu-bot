@@ -945,27 +945,6 @@ export async function startUserTracking(page, roomId, options = {}) {
     };
 
     const resolveImvuHandleFromNumericId = createImvuHandleResolver({ page, sessionClient });
-    let roomChatCommandHandler = null;
-    if (
-        process.env.IMVU_MUSIC_ENABLED === '1' ||
-        process.env.IMVU_MUSIC_ENABLED === 'true'
-    ) {
-        try {
-            const { createMusicRoomChatCommandHandler } = await import('./music/index.js');
-            roomChatCommandHandler = await createMusicRoomChatCommandHandler({
-                page: protocolMode ? null : page,
-                protocolClient,
-                sessionClient,
-                roomId,
-                apiBaseUrl: API_BASE_URL,
-                botName: syncBotName || undefined,
-                sendMessage,
-            });
-            console.log(`${syncLogPrefix} room music commands on (play … / !play / *play / !music · *music)`);
-        } catch (e) {
-            console.warn(`${syncLogPrefix} music init failed:`, e?.message || e);
-        }
-    }
 
     const handleIncomingMessage = createIncomingMessageHandler({
         API_BASE_URL,
@@ -992,7 +971,6 @@ export async function startUserTracking(page, roomId, options = {}) {
         isSuppressedAvatarId,
         roomKickCommandHandler: handleKickCommand,
         autoBootMessageHandler: handleAutoBootMessage,
-        roomChatCommandHandler,
         roomId,
         getRoomChatQueue: () => protocolClient?.chatQueue || '',
         scheduleWelcomeForAvatar,

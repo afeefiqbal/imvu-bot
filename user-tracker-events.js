@@ -231,7 +231,7 @@ export const createIncomingMessageHandler = (ctx) => {
                 ctx.state.selfUserId = decodeId(action.user_id);
                 const sid = ctx.state.selfUserId;
                 // join_queue often arrives before connect; isSelfId was false so we only
-                // bootstrapped into lastUserMap and never set botJoinedChat — welcomes/music stay dead.
+                // bootstrapped into lastUserMap and never set botJoinedChat — welcomes stay dead.
                 if (sid && !ctx.state.botJoinedChat) {
                     if (!ctx.lastUserMap.has(sid)) {
                         ctx.lastUserMap.set(sid, null);
@@ -612,18 +612,6 @@ export const createIncomingMessageHandler = (ctx) => {
                         typeof ctx.roomKickCommandHandler === 'function'
                     ) {
                         const handled = await ctx.roomKickCommandHandler({
-                            text: trimmed,
-                            senderLabel,
-                            senderId,
-                            isSelf: ctx.isSelfId(senderId),
-                        });
-                        if (handled) continue;
-                    }
-                    if (
-                        direction === 'IN' &&
-                        typeof ctx.roomChatCommandHandler === 'function'
-                    ) {
-                        const handled = await ctx.roomChatCommandHandler({
                             text: trimmed,
                             senderLabel,
                             senderId,
