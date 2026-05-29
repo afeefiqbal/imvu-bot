@@ -474,11 +474,21 @@ function startDiscord() {
     });
 }
 
+function pollIntervalMs() {
+    return Math.max(5000, parseInt(process.env.MULTI_LAUNCHER_POLL_MS || '60000', 10) || 60000);
+}
+
 async function run() {
-    const bots = await fetchAllBots();
-    if (bots.length === 0) {
-        console.warn('[MULTI-LAUNCHER] ⚠️ No active bots found! Ensure bots are in the dashboard.');
-        return;
+    let bots = await fetchAllBots();
+    while (bots.length === 0) {
+        const waitSec = Math.round(pollIntervalMs() / 1000);
+        console.warn(
+            '[MULTI-LAUNCHER] ⚠️ No active bots from GET /api/bots (empty []). ' +
+                'In Laravel production: create a bot, mark it active, assign room_ids.',
+        );
+        console.warn(`[MULTI-LAUNCHER] Retrying in ${waitSec}s (${API_BASE_URL}/api/bots)…`);
+        await new Promise((r) => setTimeout(r, pollIntervalMs()));
+        bots = await fetchAllBots();
     }
 
     await maybeStartMusicIngressTunnel();
