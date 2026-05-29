@@ -1,6 +1,13 @@
 import net from 'net';
-import { spawn } from 'child_process';
-import { resolvedIcecastHost } from './resolvedIcecastHost.js';
+import { spawn, spawnSync } from 'child_process';
+import { icecastConnectFamily, resolvedIcecastHost } from './resolvedIcecastHost.js';
+
+/** @returns {boolean} */
+export function cloudflaredAvailable() {
+    const bin = String(process.env.CLOUDFLARED_PATH || 'cloudflared').trim() || 'cloudflared';
+    const r = spawnSync('sh', ['-c', `command -v ${bin}`], { stdio: 'ignore' });
+    return r.status === 0;
+}
 
 function truthy(v) {
     const s = String(v ?? '')
@@ -12,7 +19,7 @@ function truthy(v) {
 /** @returns {Promise<boolean>} */
 function tcpAccepts(host, port, timeoutMs = 2000) {
     return new Promise((resolve) => {
-        const sock = net.createConnection({ host, port }, () => {
+        const sock = net.createConnection({ host, port, family: icecastConnectFamily(host) }, () => {
             sock.destroy();
             resolve(true);
         });
@@ -76,6 +83,24 @@ export async function maybeStartCloudflareTunnelForIcecast() {
     const autoRefreshDead = autoDesired && templateNow && templateLooksLikeTryCloudflare(templateNow);
 
     if (!force && !autoWhenEmpty && !autoRefreshDead) {
+        return false;
+    }
+
+    // Stable Railway (or other) HTTPS URL already configured — no quick tunnel or TCP probe needed.
+    if (
+        !force &&
+        templateNow &&
+        /^https:\/\//i.test(templateNow) &&
+        !templateLooksLikeTryCloudflare(templateNow)
+    ) {
+        return false;
+    }
+
+    if (!cloudflaredAvailable()) {
+        console.warn(
+            '[music/cloudflare] cloudflared not installed — skipping quick tunnel. ' +
+                'Set CLOUDFLARE_TUNNEL_AUTO=0 and MUSIC_PUBLIC_STREAM_URL_TEMPLATE to your Icecast HTTPS URL.',
+        );
         return false;
     }
 

@@ -41,6 +41,24 @@ function normalizeEnvForLocalDev() {
 
 normalizeEnvForLocalDev();
 
+/** Railway + stable Icecast HTTPS URL: never start ngrok/cloudflared quick tunnels. */
+function normalizeEnvForRailway() {
+    const onRailway = Boolean(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID);
+    if (!onRailway) return;
+
+    const tpl = String(process.env.MUSIC_PUBLIC_STREAM_URL_TEMPLATE || '').trim();
+    const stableHttps =
+        tpl && /^https:\/\//i.test(tpl) && !/\.trycloudflare\.com\b/i.test(tpl);
+    if (!stableHttps) return;
+
+    delete process.env.CLOUDFLARE_TUNNEL_AUTO;
+    delete process.env.CLOUDFLARE_TUNNEL_FORCE;
+    delete process.env.NGROK_TUNNEL_AUTO;
+    delete process.env.NGROK_TUNNEL_FORCE;
+}
+
+normalizeEnvForRailway();
+
 /**
  * Multi-bot orchestration: one `spawn()` = one Node child using the pure WebSocket IMVU runtime.
  *

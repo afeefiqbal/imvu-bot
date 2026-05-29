@@ -1,5 +1,5 @@
 import { maybeStartNgrokTunnelForIcecast } from './ngrokIcecastTunnel.js';
-import { maybeStartCloudflareTunnelForIcecast } from './cloudflareIcecastTunnel.js';
+import { cloudflaredAvailable, maybeStartCloudflareTunnelForIcecast } from './cloudflareIcecastTunnel.js';
 import { verifyTunnelImvuCompatible } from './verifyImvuStreamUrl.js';
 
 function truthy(v) {
@@ -55,6 +55,13 @@ export async function maybeStartMusicIngressTunnel() {
     const fallbackCf = truthy(process.env.MUSIC_TUNNEL_FALLBACK_CLOUDFLARE ?? '1');
 
     if (provider === 'cloudflare' || cfAuto) {
+        if (!cloudflaredAvailable()) {
+            console.warn(
+                '[music/tunnel] CLOUDFLARE_TUNNEL_AUTO is on but cloudflared is not in this container — skipped. ' +
+                    'Set CLOUDFLARE_TUNNEL_AUTO=0 and MUSIC_PUBLIC_STREAM_URL_TEMPLATE=https://your-icecast-host/imvu-{room}.mp3',
+            );
+            return false;
+        }
         const cfOk = await maybeStartCloudflareTunnelForIcecast();
         if (cfOk) return true;
         if (truthy(process.env.MUSIC_TUNNEL_FALLBACK_NGROK)) {
