@@ -248,6 +248,18 @@ async function main() {
               logger: console,
           })
         : null;
+    if (accountWs) {
+        accountWs.on('error', (error) => {
+            console.warn(
+                `[${BOT_NAME}] account websocket error (reconnecting): ${error?.message || error}`,
+            );
+        });
+    }
+
+    process.on('unhandledRejection', (reason) => {
+        const msg = reason instanceof Error ? reason.message : String(reason);
+        console.error(`[${BOT_NAME}] unhandledRejection (bot stays up): ${msg}`);
+    });
     const selfRejoinEnabled = !envDisabled('IMVU_SELF_REJOIN');
     const selfRejoinDelayMs = Math.max(1000, envInt('IMVU_SELF_REJOIN_DELAY_MS', 5000));
     const selfRejoinMaxPerRoom = Math.max(0, envInt('IMVU_SELF_REJOIN_MAX_PER_ROOM', 1));

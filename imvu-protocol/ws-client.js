@@ -41,6 +41,8 @@ export class ImvuRoomWebSocketClient extends EventEmitter {
         this.reconnectAttempt = 0;
         this.nextRuntimeOpId = Number(process.env.IMVU_WS_RUNTIME_OP_ID_START || 45);
         this.pingTimer = null;
+        this.mediaPlayerQueue = '';
+        this.mediaPlayerSubscribed = false;
     }
 
     get isOpen() {
@@ -299,6 +301,36 @@ export class ImvuRoomWebSocketClient extends EventEmitter {
             if (process.env.WS_DEBUG === '1' || process.env.WS_DEBUG === 'true') {
                 this.logger.log(`[IMVU-WS][${this.roomId}][visible-prep] ${frame}`);
             }
+        }
+        void this.#subscribeRoomMediaPlayer();
+    }
+
+    async #subscribeRoomMediaPlayer() {
+        if (this.mediaPlayerSubscribed || !this.session?.fetchRoomMediaPlayerUpdateQueue) return;
+        try {
+            const queue = await this.session.fetchRoomMediaPlayerUpdateQueue(this.roomId);
+            if (!queue || !this.isOpen) return;
+            this.mediaPlayerSubscribed = true;
+            this.mediaPlayerQueue = queue;
+            const frame = JSON.stringify({
+                record: 'msg_c2g_subscribe',
+                queues_with_results: [
+                    {
+                        record: 'subscription',
+                        name: queue,
+                        op_id: this.nextRuntimeOpId++,
+                    },
+                ],
+            });
+            this.sendRaw(frame);
+            if (process.env.WS_DEBUG === '1' || process.env.WS_DEBUG === 'true') {
+                this.logger.log(`[IMVU-WS][${this.roomId}] subscribed ${queue}`);
+            }
+        } catch (error) {
+            this.mediaPlayerSubscribed = false;
+            this.logger.warn(
+                `[IMVU-WS][${this.roomId}] media_player subscribe failed: ${error?.message || error}`,
+            );
         }
     }
 

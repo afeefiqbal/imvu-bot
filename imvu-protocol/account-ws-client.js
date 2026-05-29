@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events';
 import WebSocket from 'ws';
-import { roomQueueBelongsToRoom } from '../user-tracker-utils.js';
+import { roomQueueBelongsToRoom, isImvuRoomChatQueue } from '../user-tracker-utils.js';
 
 function parseFrame(raw) {
     const text = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw || '');
@@ -235,8 +235,20 @@ export class ImvuAccountWebSocketClient extends EventEmitter {
             }
         }
 
-        const recipients = targets.length ? targets : [...this.rooms.values()];
-        for (const room of recipients) {
+        if (targets.length > 0) {
+            for (const room of targets) {
+                room._handleFrame(action);
+            }
+            return;
+        }
+
+        const isChatMsg =
+            action.record === 'msg_g2c_send_message' || action.record === 'msg_c2g_send_message';
+        if (queue && isChatMsg && isImvuRoomChatQueue(queue)) {
+            return;
+        }
+
+        for (const room of this.rooms.values()) {
             room._handleFrame(action);
         }
     }
@@ -365,6 +377,8 @@ export class ImvuAccountRoomClient extends EventEmitter {
         this.visibleHeartbeatTimer = null;
         this.forceVisibleRefreshTimer = null;
         this.forceVisibleRefreshRunning = false;
+        this.mediaPlayerQueue = '';
+        this.mediaPlayerSubscribed = false;
     }
 
     get isOpen() {
@@ -398,15 +412,23 @@ export class ImvuAccountRoomClient extends EventEmitter {
         this.visibleRetryTimer = null;
         this.#stopVisibilityHeartbeat();
         this.#stopForceVisibleRefresh();
+        this.mediaPlayerQueue = '';
+        this.mediaPlayerSubscribed = false;
     }
 
     _ownsQueue(queue) {
         const q = String(queue || '');
         if (!q) return false;
+        if (this.mediaPlayerQueue && q === this.mediaPlayerQueue) return true;
         if (this.chatQueue && q === this.chatQueue) return true;
-        if (q.startsWith('/chat/')) return false;
+        if (this.chatQueue && isImvuRoomChatQueue(q) && q !== this.chatQueue) {
+            return roomQueueBelongsToRoom(q, this.roomId, { knownChatQueue: this.chatQueue });
+        }
+        if (q.startsWith('/chat/') || isImvuRoomChatQueue(q)) {
+            return roomQueueBelongsToRoom(q, this.roomId, { knownChatQueue: this.chatQueue });
+        }
         if (q.includes(this.roomId)) return true;
-        return roomQueueBelongsToRoom(q, this.roomId);
+        return roomQueueBelongsToRoom(q, this.roomId, { knownChatQueue: this.chatQueue });
     }
 
     _handleFrame(action) {
@@ -608,6 +630,36 @@ export class ImvuAccountRoomClient extends EventEmitter {
                 ],
             });
             this.account.sendRoomFrame(this, frame, 'visible-prep');
+        }
+        void this.#subscribeRoomMediaPlayer();
+    }
+
+    async #subscribeRoomMediaPlayer() {
+        if (this.mediaPlayerSubscribed || !this.session?.fetchRoomMediaPlayerUpdateQueue) return;
+        try {
+            const queue = await this.session.fetchRoomMediaPlayerUpdateQueue(this.roomId);
+            if (!queue || !this.isOpen) return;
+            this.mediaPlayerSubscribed = true;
+            this.mediaPlayerQueue = queue;
+            const frame = JSON.stringify({
+                record: 'msg_c2g_subscribe',
+                queues_with_results: [
+                    {
+                        record: 'subscription',
+                        name: queue,
+                        op_id: this.account.allocateOpId(this),
+                    },
+                ],
+            });
+            this.account.sendRoomFrame(this, frame, 'media-player');
+            if (process.env.WS_DEBUG === '1' || process.env.WS_DEBUG === 'true') {
+                this.logger.log(`[IMVU-WS][${this.roomId}] subscribed ${queue}`);
+            }
+        } catch (error) {
+            this.mediaPlayerSubscribed = false;
+            this.logger.warn(
+                `[IMVU-WS][${this.roomId}] media_player subscribe failed: ${error?.message || error}`,
+            );
         }
     }
 

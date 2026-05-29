@@ -60,6 +60,42 @@ export function streamConfigFromProcessEnv(roomId) {
  * Append `?_play=…` so browsers/IMVU open a fresh HTTP connection each track (same Icecast mount).
  * Set MUSIC_STREAM_URL_CACHE_BUST=0 to disable. Does not change the Icecast path Icecast matches on.
  */
+/**
+ * Unique Icecast mount + public URL per track so IMVU room radio `station_url` changes for every
+ * listener (same mount path often leaves in-room clients on a stale HTTP connection).
+ * @param {NonNullable<ReturnType<typeof streamConfigFromProcessEnv>>} cfg
+ * @param {string} roomId
+ * @param {number} [playToken]
+ */
+export function withPerPlayStreamMount(cfg, roomId, playToken = Date.now()) {
+    const off = /^(0|false|no|off)$/i.test(String(process.env.MUSIC_PER_PLAY_MOUNT ?? '1').trim());
+    if (off || !cfg) return cfg;
+    const slug = slugForIcecastMount(roomId);
+    const token = String(playToken || Date.now());
+    const mount = `/imvu-${slug}-${token}.mp3`;
+    let publicStreamUrl = String(cfg.publicStreamUrl || '').trim();
+    if (publicStreamUrl) {
+        try {
+            const u = new URL(publicStreamUrl);
+            u.pathname = mount;
+            u.search = '';
+            u.hash = '';
+            publicStreamUrl = u.toString();
+        } catch {
+            publicStreamUrl = '';
+        }
+    }
+    if (!publicStreamUrl) {
+        const pubTpl = String(process.env.MUSIC_PUBLIC_STREAM_URL_TEMPLATE || '').trim();
+        if (pubTpl) {
+            publicStreamUrl = pubTpl.includes('{play}')
+                ? pubTpl.replace(/\{room\}/g, slug).replace(/\{play\}/g, token)
+                : pubTpl.replace(/\{room\}/g, slug).replace(/\.mp3$/i, `-${token}.mp3`);
+        }
+    }
+    return { ...cfg, icecastMount: mount, publicStreamUrl, perPlayMount: true };
+}
+
 export function cacheBustHttpsStreamUrl(url, seed = Date.now()) {
     const u = String(url || '').trim();
     if (!/^https:\/\//i.test(u)) return u;

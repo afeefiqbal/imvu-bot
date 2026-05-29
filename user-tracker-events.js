@@ -143,6 +143,11 @@ export const createIncomingMessageHandler = (ctx) => {
     );
     const userLastReply = new Map();
 
+    const queueForThisRoom = (queue) =>
+        roomQueueBelongsToRoom(queue, ctx.roomId, {
+            knownChatQueue: typeof ctx.getRoomChatQueue === 'function' ? ctx.getRoomChatQueue() : '',
+        });
+
     const isLegacyChatQueue = (queue) => String(queue || '').startsWith('/chat/');
 
     const touchInitialLegacyRosterReplay = (queue) => {
@@ -185,6 +190,21 @@ export const createIncomingMessageHandler = (ctx) => {
             participantAvatarId: String(avatarId),
         });
         if (!scheduled) ctx.processedJoins.delete(avatarId);
+    };
+
+    const maybeBootFreshJoin = async (avatarId, label) => {
+        if (typeof ctx.maybeAutobootFreshAccount !== 'function') return false;
+        try {
+            return await ctx.maybeAutobootFreshAccount(avatarId, label);
+        } catch (e) {
+            console.warn(`[AUTOBOOT] fresh account check failed for ${avatarId}:`, e?.message || e);
+            return false;
+        }
+    };
+
+    const startFreshJoinBootCheck = (avatarId, label = null) => {
+        if (!avatarId || ctx.isSelfId(avatarId) || typeof ctx.maybeAutobootFreshAccount !== 'function') return;
+        void maybeBootFreshJoin(avatarId, label);
     };
 
     return async (msg) => {
@@ -268,6 +288,7 @@ export const createIncomingMessageHandler = (ctx) => {
                             ctx.skipWelcomeAvatarIds.delete(avatarId);
                             ctx.joinQueueBackendAnnounced.delete(avatarId);
                             ctx.activeJoinSessions.delete(avatarId);
+                            ctx.cancelPendingWelcome?.(avatarId);
                             ctx.processedJoins.delete(avatarId);
                             if (username && typeof ctx.onLeave === 'function') ctx.onLeave(username);
                         }
@@ -335,6 +356,7 @@ export const createIncomingMessageHandler = (ctx) => {
                         ctx.triggerCountUpdate();
                     } else if (avatarId && !ctx.lastUserMap.has(avatarId)) {
                         ctx.lastUserMap.set(avatarId, null);
+                        startFreshJoinBootCheck(avatarId);
                         console.log(`[JOIN][QUEUE][BOOTSTRAP] silently tracking ${avatarId}`);
                         ctx.triggerCountUpdate();
                     }
@@ -347,11 +369,12 @@ export const createIncomingMessageHandler = (ctx) => {
 
                 if (avatarId && !ctx.lastUserMap.has(avatarId)) {
                     ctx.lastUserMap.set(avatarId, null);
+                    startFreshJoinBootCheck(avatarId);
                     console.log(
                         `[JOIN][QUEUE] ${existingReplay ? 'existing occupant' : ctx.isSelfId(avatarId) ? 'bot' : 'occupant'} · resolving https://api.imvu.com/user/user-${avatarId}`
                     );
                     if (/^\d+$/.test(String(avatarId))) {
-                        void ctx.resolveImvuHandleFromNumericId(avatarId).then((name) => {
+                        void ctx.resolveImvuHandleFromNumericId(avatarId).then(async (name) => {
                             if (!name || !ctx.lastUserMap.has(avatarId)) return;
                             const cur = ctx.lastUserMap.get(avatarId);
                             if (hasResolvedName(cur)) {
@@ -362,6 +385,10 @@ export const createIncomingMessageHandler = (ctx) => {
                             const label = ctx.isSelfId(avatarId) ? ctx.BOT_USERNAME : name;
                             ctx.lastUserMap.set(avatarId, label);
                             console.log(`[JOIN][QUEUE] ${label} · profile API`);
+                            if (await maybeBootFreshJoin(avatarId, label)) {
+                                ctx.triggerCountUpdate();
+                                return;
+                            }
                             handleFinalJoin(avatarId);
                             ctx.triggerCountUpdate();
                         }).catch(e => console.error(`[JOIN][QUEUE] Error resolving avatar ${avatarId}:`, e.message));
@@ -378,13 +405,14 @@ export const createIncomingMessageHandler = (ctx) => {
                     markExistingDuringInitialReplay(avatarId, queue);
                     const cur = ctx.lastUserMap.get(avatarId);
                     if (hasResolvedName(cur)) {
+                        startFreshJoinBootCheck(avatarId, cur);
                         handleFinalJoin(avatarId);
                         ctx.triggerCountUpdate();
                     } else if (/^\d+$/.test(String(avatarId))) {
                         console.log(
                             `[JOIN][QUEUE] occupant · resolving https://api.imvu.com/user/user-${avatarId}`
                         );
-                        void ctx.resolveImvuHandleFromNumericId(avatarId).then((name) => {
+                        void ctx.resolveImvuHandleFromNumericId(avatarId).then(async (name) => {
                             if (!name || !ctx.lastUserMap.has(avatarId)) return;
                             const inner = ctx.lastUserMap.get(avatarId);
                             if (hasResolvedName(inner)) {
@@ -394,6 +422,10 @@ export const createIncomingMessageHandler = (ctx) => {
                             }
                             ctx.lastUserMap.set(avatarId, name);
                             console.log(`[JOIN][QUEUE] ${name} · profile API`);
+                            if (await maybeBootFreshJoin(avatarId, name)) {
+                                ctx.triggerCountUpdate();
+                                return;
+                            }
                             handleFinalJoin(avatarId);
                             ctx.triggerCountUpdate();
                         }).catch(e => console.error(`[JOIN][QUEUE] Error resolving occupant ${avatarId}:`, e.message));
@@ -428,6 +460,7 @@ export const createIncomingMessageHandler = (ctx) => {
                         ctx.skipWelcomeAvatarIds.delete(avatarId);
                         ctx.joinQueueBackendAnnounced.delete(avatarId);
                         ctx.activeJoinSessions.delete(avatarId);
+                        ctx.cancelPendingWelcome?.(avatarId);
                         ctx.welcomeTimestamps.delete(avatarId);
                         ctx.processedJoins.delete(avatarId);
                         ctx.triggerCountUpdate();
@@ -438,6 +471,7 @@ export const createIncomingMessageHandler = (ctx) => {
                     ctx.skipWelcomeAvatarIds.delete(avatarId);
                     ctx.joinQueueBackendAnnounced.delete(avatarId);
                     ctx.activeJoinSessions.delete(avatarId);
+                    ctx.cancelPendingWelcome?.(avatarId);
                     ctx.processedJoins.delete(avatarId);
                     if (username) ctx.onLeave(username);
                     ctx.triggerCountUpdate();
@@ -450,7 +484,7 @@ export const createIncomingMessageHandler = (ctx) => {
                 isImvuRoomChatQueue(queue) &&
                 String(mount || '').toLowerCase().endsWith(':participants')
             ) {
-                if (!roomQueueBelongsToRoom(queue, ctx.roomId)) continue;
+                if (!queueForThisRoom(queue)) continue;
                 const envelope = decodeChatEnvelope(action.message);
                 const avatarIds = participantDeltaAvatarIds(envelope);
                 if (!avatarIds.length) continue;
@@ -463,6 +497,7 @@ export const createIncomingMessageHandler = (ctx) => {
                         ctx.skipWelcomeAvatarIds.delete(avatarId);
                         ctx.joinQueueBackendAnnounced.delete(avatarId);
                         ctx.activeJoinSessions.delete(avatarId);
+                        ctx.cancelPendingWelcome?.(avatarId);
                         ctx.processedJoins.delete(avatarId);
                         if (username && !ctx.isSelfId(avatarId)) ctx.onLeave(username);
                         continue;
@@ -472,18 +507,24 @@ export const createIncomingMessageHandler = (ctx) => {
                     markExistingDuringInitialReplay(avatarId, queue);
                     if (!ctx.lastUserMap.has(avatarId)) {
                         ctx.lastUserMap.set(avatarId, null);
+                        startFreshJoinBootCheck(avatarId);
                         console.log(
                             `[JOIN][PARTICIPANTS] occupant · resolving https://api.imvu.com/user/user-${avatarId}`
                         );
                     }
                     if (/^\d+$/.test(String(avatarId))) {
-                        void ctx.resolveImvuHandleFromNumericId(avatarId).then((name) => {
+                        void ctx.resolveImvuHandleFromNumericId(avatarId).then(async (name) => {
                             if (!name || !ctx.lastUserMap.has(avatarId)) return;
                             const cur = ctx.lastUserMap.get(avatarId);
                             if (!hasResolvedName(cur)) {
                                 const label = ctx.isSelfId(avatarId) ? ctx.BOT_USERNAME : name;
                                 ctx.lastUserMap.set(avatarId, label);
                                 console.log(`[JOIN][PARTICIPANTS] ${label} · profile API`);
+                            }
+                            const label = ctx.lastUserMap.get(avatarId) || name;
+                            if (await maybeBootFreshJoin(avatarId, label)) {
+                                ctx.triggerCountUpdate();
+                                return;
                             }
                             handleFinalJoin(avatarId);
                             ctx.triggerCountUpdate();
@@ -499,7 +540,7 @@ export const createIncomingMessageHandler = (ctx) => {
                 isImvuRoomChatQueue(queue) &&
                 isImvuMessagesMount(mount)
             ) {
-                if (!roomQueueBelongsToRoom(queue, ctx.roomId)) {
+                if (!queueForThisRoom(queue)) {
                     if (
                         process.env.IMVU_CHAT_QUEUE_DEBUG === '1' ||
                         process.env.IMVU_CHAT_QUEUE_DEBUG === 'true'
@@ -515,6 +556,14 @@ export const createIncomingMessageHandler = (ctx) => {
                 const rawSender =
                     action.user_id ?? envelope?.userId ?? envelope?.user_id ?? envelope?.userID;
                 const senderId = decodeId(rawSender != null ? String(rawSender) : null);
+                if (
+                    senderId &&
+                    !ctx.isSelfId(senderId) &&
+                    typeof ctx.isSuppressedAvatarId === 'function' &&
+                    ctx.isSuppressedAvatarId(senderId)
+                ) {
+                    continue;
+                }
                 if (senderId && ctx.isSelfId(senderId)) ctx.lastUserMap.set(senderId, ctx.BOT_USERNAME);
 
                 const wireName = normalizeImvuUsername(
@@ -560,6 +609,18 @@ export const createIncomingMessageHandler = (ctx) => {
                     const trimmed = text.trim();
                     if (
                         direction === 'IN' &&
+                        typeof ctx.roomKickCommandHandler === 'function'
+                    ) {
+                        const handled = await ctx.roomKickCommandHandler({
+                            text: trimmed,
+                            senderLabel,
+                            senderId,
+                            isSelf: ctx.isSelfId(senderId),
+                        });
+                        if (handled) continue;
+                    }
+                    if (
+                        direction === 'IN' &&
                         typeof ctx.roomChatCommandHandler === 'function'
                     ) {
                         const handled = await ctx.roomChatCommandHandler({
@@ -595,6 +656,19 @@ export const createIncomingMessageHandler = (ctx) => {
                             const detail = e.response?.data || e.message;
                             console.log(`[DISCORD-API] Error sending to bot server:`, detail);
                         });
+                    }
+
+                    if (
+                        direction === 'IN' &&
+                        typeof ctx.autoBootMessageHandler === 'function'
+                    ) {
+                        const handled = await ctx.autoBootMessageHandler({
+                            text: trimmed,
+                            senderLabel,
+                            senderId,
+                            isSelf: ctx.isSelfId(senderId),
+                        });
+                        if (handled) continue;
                     }
 
                     const sivaHitIn = messageInvokesSivaCharacterAi(trimmed);

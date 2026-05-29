@@ -1,4 +1,5 @@
 import { spawn } from 'child_process';
+import { isYoutubeBotBlockMessage, ytDlpExtraArgs } from './ytDlpArgs.js';
 
 /**
  * Raw audio/video bytes from yt-dlp stdout → FFmpeg stdin (`-i pipe:0`).
@@ -26,16 +27,28 @@ export function spawnYtDlpAudioStdout(watchUrl) {
             '--no-warnings',
             ...(verbose ? [] : ['--quiet']),
             '--no-cache-dir',
+            ...ytDlpExtraArgs(),
             String(watchUrl || '').trim(),
         ],
         { stdio: ['ignore', 'pipe', verbose ? 'inherit' : 'pipe'] },
     );
+    /** @type {Error | null} */
+    let spawnError = null;
     if (!verbose && proc.stderr) {
         proc.stderr.on('data', (buf) => {
             const s = String(buf || '').trim();
-            if (s) console.warn('[music] yt-dlp:', s.slice(0, 500));
+            if (!s) return;
+            console.warn('[music] yt-dlp:', s.slice(0, 500));
+            if (isYoutubeBotBlockMessage(s)) {
+                spawnError = new Error('youtube-bot-block');
+            }
         });
     }
+    proc.on('close', (code) => {
+        if (code !== 0 && spawnError) {
+            proc.emit('error', spawnError);
+        }
+    });
     proc.on('error', (err) => {
         console.error('[music] yt-dlp spawn:', err.message);
     });

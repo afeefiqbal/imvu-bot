@@ -56,27 +56,38 @@ export const isImvuRoomChatQueue = (queue) => {
 };
 
 /**
- * When multiple IMVU room tabs attach CDP, some builds deliver the same WS frames to every session.
+ * When multiple IMVU room tabs share one account WebSocket, the same chat frame can reach every tracker.
  * Only handle chat (music, mentions, logs) if this frame's queue names our room (e.g. chat-261755692-875-…).
  * @param {string} queue
  * @param {string} roomId dashboard slug e.g. 261755692-875 or room-261755692-875
- * @returns {boolean} false when the queue clearly targets a different room
+ * @param {{ knownChatQueue?: string } | string} [opts] this room's subscribed legacy chat queue, when known
+ * @returns {boolean} false when the queue clearly targets a different room or cannot be routed safely
  */
-export const roomQueueBelongsToRoom = (queue, roomId) => {
+export const roomQueueBelongsToRoom = (queue, roomId, opts = null) => {
+    const knownChatQueue =
+        typeof opts === 'string' ? opts : String(opts?.knownChatQueue || '').trim();
     const key = String(roomId || '')
         .trim()
         .replace(/^room-/i, '')
         .replace(/[^0-9-]/g, '');
-    if (!key || !/^\d+-\d+$/.test(key)) return true;
     const q = String(queue || '');
-    if (!q || !isImvuRoomChatQueue(q)) return true;
+    if (!q) return false;
+
+    if (knownChatQueue) {
+        if (q === knownChatQueue) return true;
+        if (isImvuRoomChatQueue(q)) return false;
+    }
+
+    if (!key || !/^\d+-\d+$/.test(key)) return true;
+    if (!isImvuRoomChatQueue(q)) return true;
+
     const found = [];
     const re = /(?:chat|room)-(\d+-\d+)/gi;
     let m;
     while ((m = re.exec(q)) !== null) {
         found.push(m[1]);
     }
-    if (found.length === 0) return true;
+    if (found.length === 0) return false;
     return found.includes(key);
 };
 

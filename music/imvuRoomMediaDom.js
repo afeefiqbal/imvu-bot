@@ -2,13 +2,31 @@ import { normalizeRoomApiSlug } from '../user-tracker-utils.js';
 
 /**
  * Best-effort: push a stream URL into IMVU Next room media / URL fields (layout-dependent).
- * @param {{ isClosed?: () => boolean } | null} page
- * @param {string} publicUrl
- * @returns {Promise<boolean>}
+ * Falls back to authenticated IMVU REST API when no browser page is available (pure WebSocket mode).
+ * @returns {Promise<{ ok: boolean, reason?: string, detail?: string }>}
  */
-export async function applyRoomMediaStreamUrl(page, publicUrl) {
+export async function applyRoomMediaStreamUrl(page, publicUrl, opts = null) {
     const url = String(publicUrl || '').trim();
-    if (!page || page.isClosed() || !url || !/^https:\/\//i.test(url)) return false;
+    if (!url || !/^https:\/\//i.test(url)) return { ok: false, reason: 'invalid-url' };
+
+    const sessionClient = opts?.sessionClient;
+    const roomId = opts?.roomId;
+    if ((!page || page.isClosed()) && sessionClient?.setRoomRadioStreamUrl && roomId) {
+        const result = await sessionClient.setRoomRadioStreamUrl(roomId, url, {
+            stationName: String(opts?.stationName || '').trim(),
+        });
+        if (result?.ok) return { ok: true, reason: result.reason || 'api' };
+        console.warn(
+            `[music/api] room media URL not updated for ${roomId}: ${result?.reason || 'unknown'}${result?.detail ? ` (${result.detail})` : ''}`,
+        );
+        return {
+            ok: false,
+            reason: result?.reason || 'api-failed',
+            detail: result?.detail || '',
+        };
+    }
+
+    if (!page || page.isClosed()) return { ok: false, reason: 'page-unavailable' };
 
     const wait = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -145,9 +163,9 @@ export async function applyRoomMediaStreamUrl(page, publicUrl) {
         if (!anyHit) {
             console.warn(`[music/dom] no frame accepted media URL update (${page.frames().length} frames scanned).`);
         }
-        return anyHit;
+        return anyHit ? { ok: true, reason: 'dom' } : { ok: false, reason: 'dom-miss' };
     } catch {
-        return false;
+        return { ok: false, reason: 'dom-error' };
     }
 }
 
@@ -174,7 +192,7 @@ function imvuStreamUrlsMatch(stationUrl, expectedUrl) {
 /**
  * Poll IMVU media_player state and confirm expected URL is playing.
  * @param {{ isClosed?: () => boolean } | null} page
- * @param {{ roomId: string, expectedUrl: string, timeoutMs?: number, intervalMs?: number }} opts
+ * @param {{ roomId: string, expectedUrl: string, timeoutMs?: number, intervalMs?: number, sessionClient?: { fetchRoomMediaPlaybackState?: (roomId: string) => Promise<{ ok?: boolean, status?: string, stationUrl?: string, reason?: string }> } }} opts
  * @returns {Promise<{ ok: boolean, status?: string, stationUrl?: string, reason?: string }>}
  */
 export async function waitForRoomMediaPlayback(page, opts) {
@@ -182,8 +200,31 @@ export async function waitForRoomMediaPlayback(page, opts) {
     const expectedUrl = String(opts?.expectedUrl || '').trim();
     const timeoutMs = Math.max(3000, Number(opts?.timeoutMs || 18000));
     const intervalMs = Math.max(400, Number(opts?.intervalMs || 1500));
-    if (!page || page.isClosed()) return { ok: false, reason: 'page-unavailable' };
+    const sessionClient = opts?.sessionClient;
     if (!roomId || !expectedUrl) return { ok: false, reason: 'invalid-args' };
+
+    if ((!page || page.isClosed()) && sessionClient?.fetchRoomMediaPlaybackState) {
+        const endAt = Date.now() + timeoutMs;
+        let last = { ok: false, reason: 'no-state' };
+        while (Date.now() < endAt) {
+            const state = await sessionClient.fetchRoomMediaPlaybackState(roomId);
+            last = state || { ok: false, reason: 'state-empty' };
+            const status = String(last.status || '').toLowerCase();
+            const stationUrl = String(last.stationUrl || '').trim();
+            if (imvuStreamUrlsMatch(stationUrl, expectedUrl) && status === 'playing') {
+                return { ok: true, status, stationUrl };
+            }
+            await new Promise((r) => setTimeout(r, intervalMs));
+        }
+        return {
+            ok: false,
+            reason: last.reason || 'timeout',
+            status: last.status,
+            stationUrl: last.stationUrl,
+        };
+    }
+
+    if (!page || page.isClosed()) return { ok: false, reason: 'page-unavailable' };
 
     const roomSlug = normalizeRoomApiSlug(roomId);
     if (!roomSlug) return { ok: false, reason: 'invalid-room-id' };

@@ -1,6 +1,6 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import play from 'play-dl';
+import { ytDlpExtraArgs } from './ytDlpArgs.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -99,50 +99,12 @@ function youtubeVideoIdFromEntry(ent) {
     return null;
 }
 
-/** Prefer canonical watch URLs — play.stream handles these reliably. */
+/** Prefer canonical watch URLs for yt-dlp streaming. */
 function toYoutubeWatchUrl(url, hintId) {
     const id = hintId || extractYoutubeId(url);
     if (id && /^[\w-]{11}$/.test(id)) return `https://www.youtube.com/watch?v=${id}`;
     const u = String(url || '').trim();
     return /^https?:\/\//i.test(u) ? u : '';
-}
-
-/** yt-dlp JSON for a watch URL — used to skip premieres / not-yet-live. */
-async function ytDlpDumpWatchJson(watchUrl) {
-    const bin = String(process.env.YTDLP_PATH || 'yt-dlp').trim() || 'yt-dlp';
-    const url = String(watchUrl || '').trim();
-    if (!url) throw new Error('empty url');
-    const { stdout } = await execFileAsync(
-        bin,
-        [url, '--dump-single-json', '--no-download', '--no-warnings'],
-        { maxBuffer: 14 * 1024 * 1024, timeout: 90000, encoding: 'utf8' },
-    );
-    return JSON.parse(stdout);
-}
-
-/**
- * play-dl search can return upcoming premieres that yt-dlp cannot stream yet.
- * @param {{ title: string, url: string }} candidate
- * @returns {Promise<boolean>}
- */
-async function isYoutubeCandidateStreamable(candidate) {
-    const url = String(candidate?.url || '').trim();
-    if (!url) return false;
-    try {
-        const j = await ytDlpDumpWatchJson(url);
-        if (j.live_status === 'is_upcoming') return false;
-        return true;
-    } catch (e) {
-        const msg = String(e?.stderr || e?.message || '');
-        if (
-            /live event will begin|not currently live|premiere|is upcoming|upcoming live/i.test(
-                msg,
-            )
-        ) {
-            return false;
-        }
-        return true;
-    }
 }
 
 /**
@@ -182,7 +144,7 @@ async function resolveViaYtDlp(queryOrUrl) {
         try {
             const { stdout } = await execFileAsync(
                 bin,
-                [raw, '--dump-single-json', '--no-download', '--no-warnings'],
+                [raw, ...ytDlpExtraArgs(), '--dump-single-json', '--no-download', '--no-warnings'],
                 { maxBuffer: 14 * 1024 * 1024, timeout: 90000, encoding: 'utf8' },
             );
             const j = JSON.parse(stdout);
@@ -200,7 +162,7 @@ async function resolveViaYtDlp(queryOrUrl) {
         try {
             const { stdout } = await execFileAsync(
                 bin,
-                [arg, ...commonArgs, '--dump-single-json'],
+                [arg, ...ytDlpExtraArgs(), ...commonArgs, '--dump-single-json'],
                 { maxBuffer: 14 * 1024 * 1024, timeout: 90000, encoding: 'utf8' },
             );
             const j = JSON.parse(stdout);
@@ -216,7 +178,7 @@ async function resolveViaYtDlp(queryOrUrl) {
         try {
             const { stdout } = await execFileAsync(
                 bin,
-                [arg, ...commonArgs, '--playlist-items', '1', '--print', '%(id)s\t%(title)s'],
+                [arg, ...ytDlpExtraArgs(), ...commonArgs, '--playlist-items', '1', '--print', '%(id)s\t%(title)s'],
                 { maxBuffer: 256 * 1024, timeout: 90000, encoding: 'utf8' },
             );
             const line = String(stdout || '')
@@ -248,44 +210,11 @@ export async function resolveYoutubePlayable(queryOrUrl) {
     if (fromWeb) raw = fromWeb;
     else if (fromMusic) raw = fromMusic;
 
-    // yt-dlp first — play-dl search often breaks (browseId) and streaming can throw Invalid URL.
     const viaYtdlp = await resolveViaYtDlp(raw);
     if (viaYtdlp) {
         return { ...viaYtdlp, url: canonicalYoutubeWatchUrl(viaYtdlp.url) };
     }
 
-    /** @type {{ title: string, url: string } | null} */
-    let candidate = null;
-    try {
-        const vKind = play.yt_validate(raw);
-        if (vKind === 'video') {
-            const info = await play.video_basic_info(raw);
-            const vd = info?.video_details;
-            const id = vd?.videoId || vd?.id || extractYoutubeId(raw);
-            const url = toYoutubeWatchUrl(raw, id);
-            if (url) {
-                candidate = { title: vd?.title || 'YouTube', url };
-            }
-        } else {
-            const results = await play.search(raw, { limit: 12 });
-            for (const hit of results || []) {
-                const id = hit?.id || extractYoutubeId(hit?.url || '');
-                const url = toYoutubeWatchUrl(hit?.url || '', id);
-                if (!url) continue;
-                const one = { title: String(hit.title || raw).slice(0, 500), url };
-                if (await isYoutubeCandidateStreamable(one)) {
-                    return { ...one, url: canonicalYoutubeWatchUrl(one.url) };
-                }
-            }
-        }
-    } catch (e) {
-        console.warn('[music] resolve (play-dl):', e.message);
-    }
-
-    if (!candidate) return null;
-    if (!(await isYoutubeCandidateStreamable(candidate))) {
-        console.warn('[music] skipping upcoming / not-yet-streamable:', candidate.url);
-        return null;
-    }
-    return { ...candidate, url: canonicalYoutubeWatchUrl(candidate.url) };
+    console.warn('[music] yt-dlp could not resolve:', raw.slice(0, 120));
+    return null;
 }

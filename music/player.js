@@ -1,14 +1,35 @@
 import http from 'http';
-import play from 'play-dl';
 import { createTrackQueue } from './queue.js';
 import { createFfmpegIcecastPipe } from './ffmpegIcecast.js';
 import { notifyImvuMusicState } from './notifyImvuMusicApi.js';
 import { applyRoomMediaStreamUrl } from './imvuRoomMediaDom.js';
 import { spawnYtDlpAudioStdout } from './ytDlpAudioStdout.js';
-import { cacheBustHttpsStreamUrl } from './loadStreamConfig.js';
+import { cacheBustHttpsStreamUrl, withPerPlayStreamMount } from './loadStreamConfig.js';
 import { canonicalYoutubeWatchUrl } from './resolvePlay.js';
 import { withIcecastMountEncodeLock } from './icecastMountLock.js';
 import { loadAutoplayTracksFromEnv } from './autoplayPlaylist.js';
+import { probePublicStreamForImvu, isImvuBlockingStreamProbe } from './verifyImvuStreamUrl.js';
+
+/**
+ * @param {string} trackUrl
+ * @param {() => boolean} isStale
+ * @param {(proc: import('child_process').ChildProcess) => void} [onSpawn]
+ * @returns {Promise<{ audioIn: import('stream').Readable, decoder: string, ytdlpProc: import('child_process').ChildProcess }>}
+ */
+async function openYoutubeAudioStream(trackUrl, isStale, onSpawn) {
+    const { proc: yp, stdout } = spawnYtDlpAudioStdout(trackUrl);
+    onSpawn?.(yp);
+    if (isStale()) {
+        try {
+            yp.kill('SIGKILL');
+        } catch {}
+        try {
+            stdout.destroy?.();
+        } catch {}
+        throw new Error('play replaced');
+    }
+    return { audioIn: stdout, decoder: 'yt-dlp', ytdlpProc: yp };
+}
 
 /** @returns {Promise<number>} HTTP status (0 on failure). */
 function httpGetStatus(host, port, path) {
@@ -119,36 +140,29 @@ async function icecastStatusJsonShowsSource(loopHost, port, mount) {
     });
 }
 
+
 /**
- * After local Icecast shows a source, optional check that the public HTTPS URL answers (tunnel origin correct).
+ * After local Icecast shows a source, check public HTTPS URL is reachable AND IMVU-compatible.
+ * Bot-only ngrok bypass header is not enough — IMVU's audio element cannot send it.
  * @param {string} pubUrl
  * @param {number} timeoutMs
  */
 async function waitForPublicHttpsStream(pubUrl, timeoutMs) {
     const deadline = Date.now() + Math.max(2000, timeoutMs);
+    let warnedNgrok = false;
     while (Date.now() < deadline) {
-        try {
-            const ac = AbortSignal.timeout(4500);
-            const res = await fetch(pubUrl, {
-                method: 'GET',
-                signal: ac,
-                redirect: 'follow',
-                headers: {
-                    'User-Agent': 'lurkbot-stream-check/1',
-                    Accept: '*/*',
-                    'Icy-Metadata': '1',
-                    'ngrok-skip-browser-warning': 'true',
-                },
-            });
-            const code = res.status;
-            const ct = String(res.headers.get('content-type') || '');
-            try {
-                await res.body?.cancel();
-            } catch {}
-            // ngrok free tier can return 200 + text/html interstitial without this header — not a live Icecast mount.
-            if (code === 200 && /text\/html/i.test(ct)) continue;
-            if (code === 200) return true;
-        } catch {}
+        const imvu = await probePublicStreamForImvu(pubUrl, 4500);
+        if (imvu.ok && imvu.reason !== 'mount-empty') return true;
+        if (isImvuBlockingStreamProbe(imvu, pubUrl)) {
+            if (!warnedNgrok) {
+                warnedNgrok = true;
+                console.error(
+                    '[music] Public stream URL blocked for IMVU browser clients (ngrok interstitial). URL:',
+                    String(pubUrl).slice(0, 120),
+                );
+            }
+            return false;
+        }
         await new Promise((r) => setTimeout(r, 900));
     }
     return false;
@@ -174,8 +188,8 @@ async function waitForIcecastMountLive(cfg, timeoutMs) {
                 const httpsOk = await waitForPublicHttpsStream(pub, 22000);
                 if (!httpsOk) {
                     console.warn(
-                        '[music] Icecast source is up locally, but HTTPS stream URL still not HTTP 200. ' +
-                            'Check ngrok (or MUSIC_PUBLIC_STREAM_URL_TEMPLATE) targets the same ICECAST_PORT (e.g. host 8001 for Docker). URL:',
+                        '[music] Icecast source is up locally, but HTTPS stream URL still not returning audio. ' +
+                            'Tunnel may still be warming up after a track change — retry !play in a few seconds. URL:',
                         pub.slice(0, 120),
                     );
                     return false;
@@ -231,11 +245,12 @@ function logPlaybackUrls(next, cfg) {
  *   apiBaseUrl: string,
  *   botName?: string,
  *   page: { isClosed?: () => boolean } | null,
+ *   sessionClient?: { setRoomRadioStreamUrl?: Function } | null,
  *   loadConfig: () => Promise<object | null>,
  * }} opts
  */
 export function createRoomPlayer(opts) {
-    const { roomId, apiBaseUrl, botName, page, loadConfig } = opts;
+    const { roomId, apiBaseUrl, botName, page, sessionClient, loadConfig } = opts;
     const queue = createTrackQueue();
     /** @type {{ title: string, url: string }[]} */
     let autoplayTracks = [];
@@ -243,6 +258,19 @@ export function createRoomPlayer(opts) {
     let autoplayLoadPromise = null;
     /** Next index into autoplayTracks for idle playback (0-based). */
     let nextAutoplayIndex = 0;
+
+    /** When commandHandler already synced room media for this track, skip the delayed player push. */
+    let skipMountDomPush = false;
+    /** @type {ReturnType<typeof setTimeout> | null} */
+    let domPushTimer = null;
+
+    const notifyRoomMediaSynced = () => {
+        skipMountDomPush = true;
+        if (domPushTimer) {
+            clearTimeout(domPushTimer);
+            domPushTimer = null;
+        }
+    };
 
     const bumpAutoplayAfterTrack = (t) => {
         if (t && typeof t.autoplaySlot === 'number' && autoplayTracks.length > 0) {
@@ -274,7 +302,12 @@ export function createRoomPlayer(opts) {
     let ffProc = null;
     /** @type {import('child_process').ChildProcess | null} */
     let ytdlpProc = null;
+    /** yt-dlp started in openYoutubeAudioStream before playOne assigns ytdlpProc */
+    /** @type {import('child_process').ChildProcess | null} */
+    let setupYtdlpProc = null;
     let drainLock = false;
+    /** Bumped on every playNow — in-flight playOne aborts when this changes. */
+    let playEpoch = 0;
     let stopFlag = false;
     /** When true, drain loop will not start the next track (after !pause). */
     let paused = false;
@@ -283,6 +316,8 @@ export function createRoomPlayer(opts) {
     let pausedTrack = null;
     /** @type {Awaited<ReturnType<typeof loadConfig>> | null} */
     let cachedConfig = null;
+    /** @type {ReturnType<typeof withPerPlayStreamMount> | null} */
+    let activeStreamCfg = null;
 
     /** When the queue is empty, enqueue the next autoplay slot if configured. */
     const maybeEnqueueAutoplayTrack = async () => {
@@ -302,6 +337,16 @@ export function createRoomPlayer(opts) {
     };
 
     const killFf = () => {
+        if (domPushTimer) {
+            clearTimeout(domPushTimer);
+            domPushTimer = null;
+        }
+        if (setupYtdlpProc) {
+            try {
+                setupYtdlpProc.kill('SIGKILL');
+            } catch {}
+            setupYtdlpProc = null;
+        }
         if (ytdlpProc) {
             try {
                 ytdlpProc.kill('SIGKILL');
@@ -315,16 +360,39 @@ export function createRoomPlayer(opts) {
         ffProc = null;
     };
 
+    /** @param {number} committedEpoch @param {import('stream').Readable | null} [audioIn] */
+    const abortIfStale = (committedEpoch, audioIn = null) => {
+        if (playEpoch === committedEpoch) return false;
+        try {
+            audioIn?.destroy?.();
+        } catch {}
+        killFf();
+        queue.setCurrent(null);
+        return true;
+    };
+
     const pushDomUrl = async (cfg) => {
-        if (cfg?.publicStreamUrl && page && !page.isClosed()) {
-            await applyRoomMediaStreamUrl(page, cacheBustHttpsStreamUrl(cfg.publicStreamUrl));
-        }
+        if (!cfg?.publicStreamUrl) return;
+        const cur = queue.getCurrent();
+        const url = cfg?.perPlayMount
+            ? String(cfg.publicStreamUrl)
+            : cacheBustHttpsStreamUrl(cfg.publicStreamUrl);
+        await applyRoomMediaStreamUrl(page, url, {
+            sessionClient,
+            roomId,
+            stationName: String(cur?.title || '').trim(),
+        });
     };
 
     const playOne = async () => {
-        const cfg = await loadConfig();
-        cachedConfig = cfg;
-        if (!cfg?.enabled) return;
+        skipMountDomPush = false;
+        const baseCfg = cachedConfig || (await loadConfig());
+        cachedConfig = baseCfg;
+        if (!baseCfg?.enabled) return;
+        if (!activeStreamCfg?.perPlayMount) {
+            activeStreamCfg = withPerPlayStreamMount(baseCfg, roomId, Date.now());
+        }
+        const cfg = activeStreamCfg;
 
         let next = queue.dequeue();
         if (!next) {
@@ -338,6 +406,8 @@ export function createRoomPlayer(opts) {
             });
             return;
         }
+
+        const committedEpoch = playEpoch;
 
         const track = {
             ...next,
@@ -357,25 +427,27 @@ export function createRoomPlayer(opts) {
         /** @type {import('stream').Readable | null} */
         let audioIn = null;
         try {
-            const ytStream = await play.stream(track.url, { seek: 0 });
-            audioIn = ytStream.stream;
-            console.log('[music] decoder: play-dl → FFmpeg → Icecast');
-        } catch (e) {
-            console.warn(
-                `[music] play.stream failed (${e.message}); using yt-dlp stdout → FFmpeg`,
+            const opened = await openYoutubeAudioStream(
+                track.url,
+                () => playEpoch !== committedEpoch,
+                (proc) => {
+                    setupYtdlpProc = proc;
+                },
             );
-            try {
-                const { proc: yp, stdout } = spawnYtDlpAudioStdout(track.url);
-                ytdlpProc = yp;
-                audioIn = stdout;
-                console.log('[music] decoder: yt-dlp → FFmpeg → Icecast');
-            } catch (e2) {
-                console.error('[music] yt-dlp pipe setup failed:', e2.message);
-                bumpAutoplayAfterTrack(track);
-                queue.setCurrent(null);
-                return;
-            }
+            setupYtdlpProc = null;
+            if (abortIfStale(committedEpoch)) return;
+            audioIn = opened.audioIn;
+            ytdlpProc = opened.ytdlpProc;
+            console.log(`[music] decoder: ${opened.decoder} → FFmpeg → Icecast`);
+        } catch (e) {
+            if (String(e?.message || e) === 'play replaced' || abortIfStale(committedEpoch)) return;
+            console.error('[music] audio stream setup failed:', e?.message || e);
+            bumpAutoplayAfterTrack(track);
+            queue.setCurrent(null);
+            return;
         }
+
+        if (abortIfStale(committedEpoch, audioIn)) return;
 
         if (paused) {
             try {
@@ -431,8 +503,11 @@ export function createRoomPlayer(opts) {
             }, 5000);
 
             const ms = Math.max(500, parseInt(String(process.env.MUSIC_DOM_STREAM_DELAY_MS || '2500'), 10) || 2500);
-            setTimeout(() => {
-                void pushDomUrl(cfg);
+            domPushTimer = setTimeout(() => {
+                domPushTimer = null;
+                if (!skipMountDomPush) {
+                    void pushDomUrl(cfg);
+                }
                 console.log('[music] Mount should be live — listeners can use HTTPS stream URL (reload if you saw 404).');
             }, ms);
 
@@ -446,6 +521,7 @@ export function createRoomPlayer(opts) {
             });
             killFf();
         });
+        if (abortIfStale(committedEpoch, audioIn)) return;
         bumpAutoplayAfterTrack(track);
         queue.setCurrent(null);
     };
@@ -457,11 +533,36 @@ export function createRoomPlayer(opts) {
             while (!stopFlag && !paused) {
                 await maybeEnqueueAutoplayTrack();
                 if (!queue.peek()) break;
-                await playOne();
+                try {
+                    await playOne();
+                } catch (e) {
+                    console.error('[music] playOne failed:', e?.message || e);
+                    queue.setCurrent(null);
+                    killFf();
+                }
             }
         } finally {
             drainLock = false;
         }
+    };
+
+    const prepareStreamForNextTrack = async () => {
+        const baseCfg = cachedConfig || (await loadConfig());
+        cachedConfig = baseCfg;
+        if (!baseCfg?.enabled) return null;
+        activeStreamCfg = withPerPlayStreamMount(baseCfg, roomId, Date.now());
+        return activeStreamCfg;
+    };
+
+    const playNow = (track) => {
+        playEpoch += 1;
+        stopFlag = false;
+        paused = false;
+        pausedTrack = null;
+        queue.clearAll();
+        queue.enqueue(track);
+        killFf();
+        void ensureDrain();
     };
 
     return {
@@ -470,27 +571,29 @@ export function createRoomPlayer(opts) {
             cachedConfig = await loadConfig();
         },
 
+        /** Config for the current/last started track (unique mount when MUSIC_PER_PLAY_MOUNT=1). */
+        getActiveStreamConfig: () => activeStreamCfg || cachedConfig,
+
+        prepareStreamForNextTrack,
+
         enqueue: (track) => {
+            const active =
+                ffProc != null ||
+                ytdlpProc != null ||
+                setupYtdlpProc != null ||
+                queue.getCurrent() != null ||
+                drainLock;
+            if (active) {
+                playNow(track);
+                return;
+            }
             stopFlag = false;
             queue.enqueue(track);
             void ensureDrain();
         },
 
-        /**
-         * Drop the queue, stop the current encode, and play this track next.
-         * (Plain enqueue() does nothing while FFmpeg is running — use this for !play / skip-replace.)
-         */
-        playNow: (track) => {
-            stopFlag = false;
-            paused = false;
-            pausedTrack = null;
-            queue.clearPending();
-            queue.enqueue(track);
-            if (ffProc || ytdlpProc) {
-                killFf();
-            }
-            void ensureDrain();
-        },
+        /** Drop the queue, stop the current encode, and play this track immediately. */
+        playNow,
 
         /** Skip current song; play next in queue if any. */
         skip: () => {
@@ -579,5 +682,8 @@ export function createRoomPlayer(opts) {
          * @returns {Promise<boolean>}
          */
         waitForMountLive: (cfg, timeoutMs) => waitForIcecastMountLive(cfg, timeoutMs),
+
+        /** Skip the delayed mount-time room media push (commandHandler already synced). */
+        notifyRoomMediaSynced,
     };
 }

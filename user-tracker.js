@@ -13,10 +13,35 @@ import {
     normalizeRoomApiSlug,
     welcomeHandleKey,
 } from './user-tracker-utils.js';
+import {
+    findRosterEntryByHandle,
+    parseDiscordKickLine,
+    roomBootOwnerIdFromRoomId,
+} from './imvu-discord-kick.js';
 import { backendApiBaseUrl } from './env-app-url.js';
 
 const getDefaultWelcomeMessage = (name, roomName = 'the room') =>
     `Hey ${name || 'there'} 👋 welcome to ${roomName}!`;
+
+const envFlag = (name, defaultValue = false) => {
+    const raw = process.env[name];
+    if (raw == null || String(raw).trim() === '') return defaultValue;
+    const v = String(raw).trim().toLowerCase();
+    return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+};
+
+const envList = (name, fallback = '') =>
+    String(process.env[name] ?? fallback)
+        .split(',')
+        .map((v) => v.trim())
+        .filter(Boolean);
+
+const envNumber = (name, defaultValue = 0) => {
+    const n = Number(process.env[name]);
+    return Number.isFinite(n) ? n : defaultValue;
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * IMVU User Tracker Module.
@@ -154,6 +179,8 @@ export async function startUserTracking(page, roomId, options = {}) {
     const processedJoins = new Set();
     /** Track active join sessions to prevent duplicate welcomes before leave */
     const activeJoinSessions = new Set();
+    /** Delayed welcome timers keyed by avatar id, cancelled when a user leaves/is kicked. */
+    const pendingWelcomeTimers = new Map();
     /** Cooldown timestamps to avoid rapid re‑welcome on same join */
     const welcomeTimestamps = new Map();
     const WELCOME_COOLDOWN_MS = 15000; // 15 s per avatar (rapid duplicate join_queue)
@@ -163,6 +190,8 @@ export async function startUserTracking(page, roomId, options = {}) {
     const joinQueueBackendAnnounced = new Set();
     const mentionReplyDedupe = new Set();
     const MENTION_REPLY_DEDUPE_CAP = 400;
+    /** Recently kicked/autobooted IDs whose queued chat frames should be ignored. */
+    const suppressedAvatarIds = new Map();
     /** Avatar ids already in room at sync / bot join — no welcome DM */
     const skipWelcomeAvatarIds = new Set();
     /** Avoid opening the welcome gate while IMVU has not reported anyone yet (empty roster → false "new" joins). */
@@ -503,6 +532,303 @@ export async function startUserTracking(page, roomId, options = {}) {
         state.selfUserId != null &&
         String(id) === String(state.selfUserId);
 
+    const rosterHasUserId = (id) => lastUserMap.has(String(id));
+    const waitUntilRosterAbsent = async (targetId, timeoutMs = 8000) => {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            if (!rosterHasUserId(targetId)) return true;
+            await sleep(350);
+        }
+        return !rosterHasUserId(targetId);
+    };
+
+    const kickCommandsEnabled = envFlag('IMVU_KICK_ENABLED', true);
+    const kickAllowAll = envFlag('IMVU_KICK_ALLOW_ALL', false);
+    const kickAllowRoomOwner = envFlag('IMVU_KICK_ALLOW_ROOM_OWNER', true);
+    const kickAllowRoomMods = envFlag('IMVU_KICK_ALLOW_ROOM_MODS', true);
+    const kickRestFirst = envFlag('IMVU_KICK_REST_FIRST', true);
+    const kickCommanderIds = new Set(envList('IMVU_KICK_COMMANDER_IDS').filter((v) => /^\d+$/.test(v)));
+    const kickCommanderHandles = new Set(
+        envList('IMVU_KICK_COMMANDER_HANDLES')
+            .map((v) => welcomeHandleKey(v))
+            .filter(Boolean)
+    );
+    const autobootEnabled = envFlag('IMVU_AUTOBOOT_ENABLED', false);
+    const autobootAvatarIds = new Set(envList('IMVU_AUTOBOOT_AVATAR_IDS').filter((v) => /^\d+$/.test(v)));
+    const autobootAvatarIdPrefixes = envList('IMVU_AUTOBOOT_AVATAR_ID_PREFIXES')
+        .filter((v) => /^\d+$/.test(v));
+    const autobootAvatarIdRanges = envList('IMVU_AUTOBOOT_AVATAR_ID_RANGES')
+        .map((raw) => {
+            const match = String(raw).match(/^(\d+)\s*-\s*(\d+)$/);
+            if (!match) return null;
+            const start = Number(match[1]);
+            const end = Number(match[2]);
+            if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) return null;
+            return start <= end ? { start, end } : { start: end, end: start };
+        })
+        .filter(Boolean);
+    const autobootHandles = new Set(
+        envList('IMVU_AUTOBOOT_HANDLES')
+            .map((v) => welcomeHandleKey(v))
+            .filter(Boolean)
+    );
+    const autobootPatterns = envList('IMVU_AUTOBOOT_PATTERNS')
+        .map((v) => v.toLowerCase())
+        .filter(Boolean);
+    const autobootAccountMaxAgeHours = Math.max(
+        0,
+        envNumber('IMVU_AUTOBOOT_ACCOUNT_MAX_AGE_HOURS', 0)
+    );
+    const kickInflight = new Set();
+    const freshAccountChecks = new Map();
+    let cachedRoomOwnerId = null;
+    let cachedRoomModeratorIds = null;
+
+    const getRoomOwnerId = async () => {
+        if (cachedRoomOwnerId !== null) return cachedRoomOwnerId;
+        cachedRoomOwnerId =
+            (await sessionClient?.fetchRoomOwnerId?.(roomId)) ||
+            roomBootOwnerIdFromRoomId(roomId) ||
+            '';
+        return cachedRoomOwnerId;
+    };
+
+    const getRoomModeratorIds = async () => {
+        if (cachedRoomModeratorIds) return cachedRoomModeratorIds;
+        cachedRoomModeratorIds = new Set((await sessionClient?.fetchRoomModeratorIds?.(roomId)) || []);
+        return cachedRoomModeratorIds;
+    };
+
+    const canUseKickCommand = async ({ senderId, senderLabel }) => {
+        if (!kickCommandsEnabled) return false;
+        if (kickAllowAll) return true;
+
+        const sid = senderId != null ? String(senderId) : '';
+        if (sid && kickCommanderIds.has(sid)) return true;
+
+        const handleKey = welcomeHandleKey(senderLabel);
+        if (handleKey && kickCommanderHandles.has(handleKey)) return true;
+
+        if (sid && kickAllowRoomOwner && sid === String(await getRoomOwnerId())) return true;
+        if (sid && kickAllowRoomMods && (await getRoomModeratorIds()).has(sid)) return true;
+
+        return false;
+    };
+
+    const cancelPendingWelcome = (avatarId) => {
+        const id = String(avatarId || '');
+        const timer = pendingWelcomeTimers.get(id);
+        if (timer) clearTimeout(timer);
+        pendingWelcomeTimers.delete(id);
+    };
+
+    const suppressAvatarChat = (avatarId, ttlMs = 5 * 60 * 1000) => {
+        const id = String(avatarId || '');
+        if (!/^\d+$/.test(id)) return;
+        suppressedAvatarIds.set(id, Date.now() + ttlMs);
+    };
+
+    const isSuppressedAvatarId = (avatarId) => {
+        const id = String(avatarId || '');
+        const until = suppressedAvatarIds.get(id);
+        if (!until) return false;
+        if (Date.now() > until) {
+            suppressedAvatarIds.delete(id);
+            return false;
+        }
+        return true;
+    };
+
+    const markUserRemovedLocally = (target) => {
+        const avatarId = String(target?.avatarId || '');
+        if (!avatarId) return;
+        const label = target?.label ? String(target.label) : '';
+        suppressAvatarChat(avatarId);
+        cancelPendingWelcome(avatarId);
+        lastUserMap.delete(avatarId);
+        skipWelcomeAvatarIds.delete(avatarId);
+        joinQueueBackendAnnounced.delete(avatarId);
+        activeJoinSessions.delete(avatarId);
+        processedJoins.delete(avatarId);
+        if (label && !isSelfId(avatarId)) void onLeave(label);
+        triggerCountUpdate();
+    };
+
+    const bootAvatar = async (target, reason, { reply = false } = {}) => {
+        const avatarId = String(target?.avatarId || '');
+        const label = String(target?.label || avatarId || 'user');
+        const logPrefix = reason === 'autoboot' ? '[AUTOBOOT]' : '[KICK]';
+        if (!/^\d+$/.test(avatarId)) return false;
+        if (isSelfId(avatarId)) {
+            if (reply) await sendMessage('(bot) Cannot kick myself.');
+            return true;
+        }
+        suppressAvatarChat(avatarId);
+        cancelPendingWelcome(avatarId);
+        if (kickInflight.has(avatarId)) return true;
+        kickInflight.add(avatarId);
+
+        try {
+            let removed = false;
+            let restAttempts = [];
+
+            if (kickRestFirst && typeof sessionClient?.removeChatParticipant === 'function') {
+                const rest = await sessionClient.removeChatParticipant(roomId, avatarId);
+                restAttempts = rest.attempts || [];
+                removed = Boolean(rest.ok);
+                if (removed) {
+                    markUserRemovedLocally(target);
+                    console.log(`${logPrefix} removed ${label} (${avatarId}) via REST participant DELETE`);
+                } else if (restAttempts.length) {
+                    console.log(`${logPrefix} REST participant DELETE failed: ${JSON.stringify(restAttempts)}`);
+                }
+            }
+
+            const ownerId = await getRoomOwnerId();
+            if (!removed && ownerId) {
+                await sendMessage(`*boot ${ownerId} ${avatarId}`);
+                removed = await waitUntilRosterAbsent(avatarId, 10000);
+                if (!removed) {
+                    await sendMessage(`*imvu:txnBoot ${avatarId}`);
+                    removed = await waitUntilRosterAbsent(avatarId, 10000);
+                }
+                if (removed) {
+                    markUserRemovedLocally(target);
+                    console.log(`${logPrefix} removed ${label} (${avatarId}) via legacy boot fallback`);
+                }
+            }
+
+            if (reply) {
+                await sendMessage(
+                    removed
+                        ? `(bot) Removed ${label}.`
+                        : `(bot) Kick failed for ${label}; IMVU did not remove them.`
+                );
+            }
+            if (!removed) {
+                console.log(`${logPrefix} failed for ${label} (${avatarId}) reason=${reason}`);
+            }
+            return removed;
+        } finally {
+            kickInflight.delete(avatarId);
+        }
+    };
+
+    const autobootTargetFromIdentity = (avatarId, label) => {
+        if (!autobootEnabled) return null;
+        const id = String(avatarId || '');
+        const handleKey = welcomeHandleKey(label);
+        if (id && autobootAvatarIds.has(id)) return { avatarId: id, label: String(label || id) };
+        if (id && autobootAvatarIdPrefixes.some((prefix) => id.startsWith(prefix))) {
+            return { avatarId: id, label: String(label || id) };
+        }
+        const numericId = Number(id);
+        if (
+            Number.isSafeInteger(numericId) &&
+            autobootAvatarIdRanges.some((range) => numericId >= range.start && numericId <= range.end)
+        ) {
+            return { avatarId: id, label: String(label || id) };
+        }
+        if (handleKey && autobootHandles.has(handleKey) && id) return { avatarId: id, label: String(label || id) };
+        return null;
+    };
+
+    const maybeAutobootJoin = (avatarId, label) => {
+        const target = autobootTargetFromIdentity(avatarId, label);
+        if (!target) return false;
+        void bootAvatar(target, 'autoboot', { reply: false });
+        return true;
+    };
+
+    const profileCreatedAtMs = (profile) => {
+        if (!profile || typeof profile !== 'object') return null;
+        if (profile.created) {
+            const parsed = Date.parse(profile.created);
+            if (Number.isFinite(parsed)) return parsed;
+        }
+        const registered = Number(profile.registered);
+        if (Number.isFinite(registered) && registered > 0) {
+            return registered > 9999999999 ? registered : registered * 1000;
+        }
+        return null;
+    };
+
+    const maybeAutobootFreshAccount = async (avatarId, label) => {
+        const id = String(avatarId || '');
+        if (maybeAutobootJoin(id, label)) {
+            return true;
+        }
+        if (
+            !autobootEnabled ||
+            autobootAccountMaxAgeHours <= 0 ||
+            !/^\d+$/.test(id) ||
+            isSelfId(id) ||
+            typeof sessionClient?.fetchUserProfile !== 'function'
+        ) {
+            return false;
+        }
+
+        const existing = freshAccountChecks.get(id);
+        if (existing) return existing;
+
+        const promise = (async () => {
+            const profile = await sessionClient.fetchUserProfile(id);
+            const createdAtMs = profileCreatedAtMs(profile);
+            if (!createdAtMs) return false;
+
+            const ageMs = Date.now() - createdAtMs;
+            const maxAgeMs = autobootAccountMaxAgeHours * 60 * 60 * 1000;
+            if (ageMs < 0 || ageMs > maxAgeMs) return false;
+
+            const ageHours = Math.max(0, ageMs / (60 * 60 * 1000));
+            const name = profile?.username || label || id;
+            await bootAvatar(
+                { avatarId: id, label: name },
+                `autoboot fresh account ${ageHours.toFixed(1)}h old`,
+                { reply: false }
+            );
+            return true;
+        })().finally(() => {
+            freshAccountChecks.delete(id);
+        });
+
+        freshAccountChecks.set(id, promise);
+        return promise;
+    };
+
+    const handleAutoBootMessage = async ({ text, senderId, senderLabel }) => {
+        if (!autobootEnabled || !senderId || isSelfId(senderId)) return false;
+        const lower = String(text || '').toLowerCase();
+        const matched = autobootPatterns.find((pattern) => pattern && lower.includes(pattern));
+        if (!matched) return false;
+        await bootAvatar(
+            { avatarId: String(senderId), label: senderLabel || String(senderId) },
+            `autoboot pattern "${matched}"`,
+            { reply: false }
+        );
+        return true;
+    };
+
+    const handleKickCommand = async ({ text, senderId, senderLabel }) => {
+        const parsed = parseDiscordKickLine(text);
+        if (!parsed) return false;
+
+        if (!(await canUseKickCommand({ senderId, senderLabel }))) {
+            console.log(`[KICK] refused command from ${senderLabel || senderId || 'unknown'} in room ${roomId}`);
+            await sendMessage('(bot) Kick command refused; only configured commanders, room owner, or room mods can use it.');
+            return true;
+        }
+
+        const target = findRosterEntryByHandle(lastUserMap, parsed.handle);
+        if (!target) {
+            await sendMessage(`(bot) No one in this room matches "${parsed.handle}".`);
+            return true;
+        }
+
+        await bootAvatar(target, `command by ${senderLabel || senderId || 'unknown'}`, { reply: true });
+        return true;
+    };
+
     const announceJoinQueuePresence = (avatarId, label) => {
         if (!avatarId || isSelfId(avatarId)) return;
 
@@ -537,6 +863,9 @@ export async function startUserTracking(page, roomId, options = {}) {
             return true;
         }
         if (options.visibilityEnabled === false) {
+            return true;
+        }
+        if (maybeAutobootJoin(avatarId, displayName)) {
             return true;
         }
         const handleKey = welcomeHandleKey(displayName);
@@ -577,10 +906,17 @@ export async function startUserTracking(page, roomId, options = {}) {
         if (welcomeByHandleLastAt.size > 400) {
             welcomeByHandleLastAt.clear();
         }
-        setTimeout(async () => {
+        cancelPendingWelcome(avatarId);
+        const welcomeTimer = setTimeout(async () => {
             try {
+                if (!lastUserMap.has(String(avatarId))) {
+                    return;
+                }
                 if (ROOM_NAME === 'this room') {
                     await refreshRoomName();
+                }
+                if (!lastUserMap.has(String(avatarId))) {
+                    return;
                 }
 
                 await sendMessage(getDefaultWelcomeMessage(displayName, ROOM_NAME), convMeta);
@@ -588,8 +924,10 @@ export async function startUserTracking(page, roomId, options = {}) {
             } finally {
                 // 🔓 ALWAYS release lock after welcome
                 activeJoinSessions.delete(avatarId);
+                pendingWelcomeTimers.delete(String(avatarId));
             }
         }, 1500);
+        pendingWelcomeTimers.set(String(avatarId), welcomeTimer);
         return true;
     };
 
@@ -617,6 +955,7 @@ export async function startUserTracking(page, roomId, options = {}) {
             roomChatCommandHandler = await createMusicRoomChatCommandHandler({
                 page: protocolMode ? null : page,
                 protocolClient,
+                sessionClient,
                 roomId,
                 apiBaseUrl: API_BASE_URL,
                 botName: syncBotName || undefined,
@@ -648,8 +987,14 @@ export async function startUserTracking(page, roomId, options = {}) {
         processedJoins,
         refreshRoomName,
         resolveImvuHandleFromNumericId,
+        maybeAutobootFreshAccount,
+        cancelPendingWelcome,
+        isSuppressedAvatarId,
+        roomKickCommandHandler: handleKickCommand,
+        autoBootMessageHandler: handleAutoBootMessage,
         roomChatCommandHandler,
         roomId,
+        getRoomChatQueue: () => protocolClient?.chatQueue || '',
         scheduleWelcomeForAvatar,
         sendMessage,
         skipWelcomeAvatarIds,
@@ -694,6 +1039,9 @@ export async function startUserTracking(page, roomId, options = {}) {
         if (mentionReplyDedupe.size > 500) mentionReplyDedupe.clear();
         if (welcomeTimestamps.size > 500) welcomeTimestamps.clear();
         if (welcomeByHandleLastAt.size > 500) welcomeByHandleLastAt.clear();
+        for (const [id, until] of suppressedAvatarIds.entries()) {
+            if (Date.now() > until) suppressedAvatarIds.delete(id);
+        }
     }, 60000);
 
     const cleanupTracker = () => {
@@ -705,6 +1053,8 @@ export async function startUserTracking(page, roomId, options = {}) {
         clearInterval(cleanupIntervalId);
         if (dashboardSyncTimer) clearTimeout(dashboardSyncTimer);
         if (countTimer) clearTimeout(countTimer);
+        for (const timer of pendingWelcomeTimers.values()) clearTimeout(timer);
+        pendingWelcomeTimers.clear();
         if (state.welcomeArrivalsEnableTimer) clearTimeout(state.welcomeArrivalsEnableTimer);
     };
 
