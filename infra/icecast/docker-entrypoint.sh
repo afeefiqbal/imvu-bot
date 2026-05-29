@@ -6,7 +6,9 @@ export ICECAST_SOURCE_PASSWORD="${ICECAST_SOURCE_PASSWORD:?Set ICECAST_SOURCE_PA
 export ICECAST_ADMIN_PASSWORD="${ICECAST_ADMIN_PASSWORD:-changeme}"
 
 mkdir -p /var/log/icecast2
-chown -R icecast:icecast /var/log/icecast2
+if getent passwd icecast >/dev/null 2>&1; then
+    chown -R icecast:icecast /var/log/icecast2
+fi
 
 envsubst '${ICECAST_PORT} ${ICECAST_SOURCE_PASSWORD} ${ICECAST_ADMIN_PASSWORD}' \
     < /opt/icecast/icecast.production.xml > /etc/icecast2/icecast.xml

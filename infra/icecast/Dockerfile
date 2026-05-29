@@ -14,6 +14,9 @@ RUN apt-get update \
         ca-certificates \
         curl \
     && rm -rf /var/lib/apt/lists/* \
+    && (getent group icecast >/dev/null || groupadd -r icecast) \
+    && (getent passwd icecast >/dev/null \
+        || useradd -r -g icecast -d /usr/share/icecast2 -s /usr/sbin/nologin icecast) \
     && mkdir -p /var/log/icecast2 \
     && chown icecast:icecast /var/log/icecast2
 
