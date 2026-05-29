@@ -11,6 +11,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         icecast2 \
         gettext-base \
+        media-types \
         ca-certificates \
         curl \
     && rm -rf /var/lib/apt/lists/* \
