@@ -4,20 +4,46 @@ Separate Icecast service for the IMVU bot workers. The bot image (`/Dockerfile` 
 
 ## Railway deploy
 
-1. In the same Railway project as the bot, **New Service** → **GitHub Repo** → this repository.
-2. Set **Root Directory** to `infra/icecast`.
-3. Name the service **`icecast`** (slug used for private DNS: `icecast.railway.internal`).
-4. Variables on the Icecast service:
+Use the **same Railway project** as the bot so private DNS works (`icecast.railway.internal`). Two ways to run the container:
 
-   | Variable | Value |
-   |----------|--------|
-   | `ICECAST_PORT` | `8001` |
-   | `ICECAST_SOURCE_PASSWORD` | Strong secret (shared with bot + Laravel) |
-   | `ICECAST_ADMIN_PASSWORD` | Admin UI password (optional) |
+### Option A — Docker image (recommended)
 
-5. Networking: prefer **private** only (no public HTTP needed for source ingest). Bots connect on the private network.
+Builds run in GitHub Actions; Railway only pulls the image (no Railpack/Dockerfile build on Railway).
 
-6. On the **bot** service, set (same `ICECAST_SOURCE_PASSWORD`):
+1. Push this repo to `main`. Workflow [`.github/workflows/icecast-image.yml`](../../.github/workflows/icecast-image.yml) publishes:
+   - `ghcr.io/afeefiqbal/imvu-icecast:latest`
+2. On GitHub: **Packages** → `imvu-icecast` → **Package settings** → set visibility to **Public** (simplest), *or* keep private and add GHCR credentials on Railway (Pro).
+3. In your **existing** bot Railway project: **+ New** → **Docker Image**.
+4. Image: `ghcr.io/afeefiqbal/imvu-icecast:latest`
+5. Rename the service to **`icecast`** (Settings → name). Slug must be `icecast` for `icecast.railway.internal`.
+6. Set variables (see **Variables** below). **Redeploy** after each new image push.
+
+If the package is **private**, on the Icecast service → **Settings** → **Registry credentials**: username = your GitHub username, password = GitHub PAT with `read:packages`.
+
+Manual build/push (optional):
+
+```bash
+cd infra/icecast
+docker build -t ghcr.io/afeefiqbal/imvu-icecast:latest .
+docker push ghcr.io/afeefiqbal/imvu-icecast:latest
+```
+
+### Option B — Build on Railway from GitHub
+
+1. **New Service** → **GitHub Repo** → this repository.
+2. **Root Directory** `infra/icecast` (uses `Dockerfile` + `railway.toml`).
+
+### Variables (both options)
+
+| Variable | Value |
+|----------|--------|
+| `ICECAST_PORT` | `8001` |
+| `ICECAST_SOURCE_PASSWORD` | Strong secret (shared with bot + Laravel) |
+| `ICECAST_ADMIN_PASSWORD` | Admin UI password (optional) |
+
+Networking: prefer **private** only (no public HTTP needed for source ingest). Bots connect on the private network.
+
+On the **bot** service, set (same `ICECAST_SOURCE_PASSWORD`):
 
    ```bash
    ICECAST_HOST=icecast
@@ -32,7 +58,7 @@ Separate Icecast service for the IMVU bot workers. The bot image (`/Dockerfile` 
    MUSIC_PUBLIC_STREAM_URL_TEMPLATE=https://your-stable-https-host/imvu-{room}.mp3
    ```
 
-7. Mirror Icecast settings in Laravel `config/music.php` (or via `/api/stream-audio-config`) so mounts and passwords stay in sync.
+Mirror Icecast settings in Laravel `config/music.php` (or via `/api/stream-audio-config`) so mounts and passwords stay in sync.
 
 ## Local build / smoke test
 
