@@ -12,11 +12,13 @@ npm start
 npm run local
 ```
 
-Set `BOT_API_BASE_URL` in `.env` to the Laravel app URL:
+Set `BOT_API_BASE_URL` to the Laravel app URL (required when Laravel is a **separate** Railway service):
 
 ```bash
-BOT_API_BASE_URL=https://your-laravel-service.up.railway.app
+BOT_API_BASE_URL=https://imvu-bot-laravel-production.up.railway.app
 ```
+
+On Railway, the bot service may also auto-detect `RAILWAY_SERVICE_*_LARAVEL*_URL` if set in the same project. Do **not** rely on `http://127.0.0.1:8080` unless Laravel runs in the same container (`LARAVEL_SAME_CONTAINER=1`).
 
 ## Combined System‑wide VPN + Per‑Bot Proxy Setup
 
