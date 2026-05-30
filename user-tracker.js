@@ -25,6 +25,8 @@ import {
     isLurkEnabledForRoom,
     maybeWarnMinAgeOnJoin,
 } from './room-commands/index.js';
+import { getRoomSettings } from './room-settings/store.js';
+import { registerRoomRuntime, unregisterRoomRuntime } from './room-runtime-registry.js';
 
 const envFlag = (name, defaultValue = false) => {
     const raw = process.env[name];
@@ -386,6 +388,7 @@ export async function startUserTracking(page, roomId, options = {}) {
                         displayName && displayName !== 'this room'
                             ? displayName
                             : 'Unknown',
+                    description: apiDetails?.description || '',
                     image_url: imageUrl || '',
                     visitors,
                     population,
@@ -866,6 +869,9 @@ export async function startUserTracking(page, roomId, options = {}) {
             return false;
         }
         if (skipWelcomeAvatarIds.has(String(avatarId))) {
+            console.log(
+                `${syncLogPrefix} welcome skipped for ${displayName || avatarId} (already in room when bot joined)`
+            );
             return true;
         }
         if (options.visibilityEnabled === false) {
@@ -886,6 +892,9 @@ export async function startUserTracking(page, roomId, options = {}) {
         const lastWelcome = welcomeTimestamps.get(avatarId);
         if (lastWelcome && (Date.now() - lastWelcome) < WELCOME_COOLDOWN_MS) {
             activeJoinSessions.delete(avatarId); // release lock
+            console.log(
+                `${syncLogPrefix} welcome skipped for ${displayName || avatarId} (avatar cooldown ${Math.round((WELCOME_COOLDOWN_MS - (Date.now() - lastWelcome)) / 1000)}s left)`
+            );
             return false;
         }
 
@@ -896,7 +905,9 @@ export async function startUserTracking(page, roomId, options = {}) {
                 Date.now() - lastByHandle < WELCOME_HANDLE_COOLDOWN_MS
             ) {
                 activeJoinSessions.delete(avatarId);
-                // Same handle flapping or quickly rejoining — suppress duplicate welcomes.
+                console.log(
+                    `${syncLogPrefix} welcome skipped for ${displayName || avatarId} (handle cooldown ${Math.round((WELCOME_HANDLE_COOLDOWN_MS - (Date.now() - lastByHandle)) / 60000)}m left)`
+                );
                 return false;
             }
         }
@@ -915,6 +926,9 @@ export async function startUserTracking(page, roomId, options = {}) {
         cancelPendingWelcome(avatarId);
         const settingsForWelcome = buildWelcomeText(roomId, displayName, ROOM_NAME);
         if (!settingsForWelcome) {
+            const settings = getRoomSettings(roomId);
+            const reason = settings.auto_greet ? 'empty greeting' : 'auto_greet off — use !autogreet on';
+            console.log(`${syncLogPrefix} welcome skipped for ${displayName || avatarId} (${reason})`);
             activeJoinSessions.delete(avatarId);
             void maybeWarnMinAgeOnJoin({
                 roomId,
@@ -1075,6 +1089,7 @@ export async function startUserTracking(page, roomId, options = {}) {
     }, 60000);
 
     const cleanupTracker = () => {
+        unregisterRoomRuntime(roomId);
         if (roomChatCommandHandler?.stopScaleInterval) {
             roomChatCommandHandler.stopScaleInterval();
         }
@@ -1110,4 +1125,16 @@ export async function startUserTracking(page, roomId, options = {}) {
         const runDOMFallback = createDomFallback({ page, lastUserMap, triggerCountUpdate });
         setTimeout(runDOMFallback, 5000);
     }
+
+    registerRoomRuntime(roomId, {
+        roomId,
+        sendMessage: (text) => sendMessage(String(text || '').slice(0, 500)),
+        kickByUsername: async (username, opts = {}) => {
+            const target = findRosterEntryByHandle(lastUserMap, username);
+            if (!target) return { ok: false, reason: 'not-in-room' };
+            const removed = await bootAvatar(target, opts.reason || 'dashboard-kick', { reply: false });
+            return { ok: Boolean(removed), reason: removed ? undefined : 'kick-failed' };
+        },
+        getVisitors: () => getVisitorListForSync(lastUserMap),
+    });
 }

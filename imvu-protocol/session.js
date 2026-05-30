@@ -477,6 +477,11 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
             return {
                 name: typeof data.name === 'string' ? data.name.trim() : '',
                 image_url: typeof image === 'string' ? image.trim() : '',
+                description: typeof data.description === 'string' ? data.description.trim() : '',
+                occupancy: Number.isFinite(Number(data.occupancy)) ? Number(data.occupancy) : null,
+                capacity: Number.isFinite(Number(data.capacity)) ? Number(data.capacity) : null,
+                owner_avatarname:
+                    typeof data.owner_avatarname === 'string' ? data.owner_avatarname.trim() : '',
             };
         } catch {
             return null;
@@ -541,6 +546,45 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
             }
         }
         return [...ids];
+    }
+
+    /**
+     * Moderator roster from IMVU REST (see api.imvu.com/room/room-{id}/moderators).
+     * @returns {Promise<Array<{ username: string, display_name: string, legacy_cid: number|null }>>}
+     */
+    async function fetchRoomModerators(roomId) {
+        const slug = normalizeRoomApiSlug(roomId);
+        if (!slug) return [];
+        const suffix = slug.replace(/^room-/i, '');
+        const urls = [`/room/${slug}/moderators`, `/chat/chat-${suffix}/moderators`];
+        const byUsername = new Map();
+
+        for (const url of urls) {
+            try {
+                const json = await apiGet(url);
+                const denorm = json?.denormalized || {};
+                for (const [key, entry] of Object.entries(denorm)) {
+                    if (!String(key).includes('/user/user-')) continue;
+                    const data = entry?.data;
+                    if (!data || typeof data !== 'object') continue;
+                    const username = firstString(data.username, data.display_name);
+                    const displayName = firstString(data.display_name, data.username);
+                    if (!username && !displayName) continue;
+                    const label = username || displayName;
+                    byUsername.set(label, {
+                        username: username || displayName,
+                        display_name: displayName || username,
+                        legacy_cid: Number.isFinite(Number(data.legacy_cid))
+                            ? Number(data.legacy_cid)
+                            : null,
+                    });
+                }
+            } catch {
+                /* optional */
+            }
+        }
+
+        return [...byUsername.values()];
     }
 
     async function fetchUserName(userId) {
@@ -1043,6 +1087,58 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         return last;
     }
 
+    async function stopRoomRadioStream(roomId) {
+        const normalizedRoomId = String(roomId || '').trim();
+        const inflight = radioUpdateInflight.get(normalizedRoomId);
+        if (inflight) return inflight;
+
+        const work = (async () => {
+            const mediaInfo = await fetchRoomRadioMediaInfo(roomId);
+            const playerUrl = mediaInfo?.url || null;
+            if (!playerUrl) return { ok: false, reason: 'radio-player-not-found' };
+
+            try {
+                const identity = await resolveImqIdentity();
+                if (identity.userId) {
+                    await ensureChatParticipant(roomId, identity.userId);
+                }
+
+                const getRes = await client.get(playerUrl, {
+                    headers: { Accept: 'application/json; charset=utf-8' },
+                    validateStatus: (status) => status >= 200 && status < 500,
+                    timeout: Number(process.env.IMVU_MEDIA_PLAYER_TIMEOUT_MS || 20000),
+                });
+                if (getRes.status < 200 || getRes.status >= 300) {
+                    return { ok: false, reason: `player-get-${getRes.status}` };
+                }
+
+                let etag =
+                    getRes.headers?.etag || getRes.data?.http?.[playerUrl]?.headers?.etag || '';
+                const stopRes = await postMediaPlayerAction(
+                    roomId,
+                    playerUrl,
+                    { action: 'stop_radio' },
+                    etag,
+                );
+                if (!stopRes.ok) {
+                    return { ok: false, reason: `post-${stopRes.status}` };
+                }
+                logger.log(`[IMVU-SESSION] Stopped room ${roomId} radio.`);
+                return { ok: true, reason: 'stopped' };
+            } catch (error) {
+                logger.warn(`[IMVU-SESSION] Room radio stop failed for ${roomId}: ${error.message}`);
+                return { ok: false, reason: error.message || 'stop-failed' };
+            }
+        })();
+
+        radioUpdateInflight.set(normalizedRoomId, work);
+        try {
+            return await work;
+        } finally {
+            radioUpdateInflight.delete(normalizedRoomId);
+        }
+    }
+
     async function setRoomRadioStreamUrl(roomId, publicUrl, options = {}) {
         const url = String(publicUrl || '').trim();
         if (!/^https:\/\//i.test(url)) return { ok: false, reason: 'invalid-url' };
@@ -1224,6 +1320,7 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         fetchRoomDetails,
         fetchRoomOwnerId,
         fetchRoomModeratorIds,
+        fetchRoomModerators,
         fetchChatParticipant,
         updateChatParticipantSeat,
         fetchUserProfile,
@@ -1235,5 +1332,6 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         fetchRoomMediaPlaybackState,
         fetchRoomMediaPlayerUpdateQueue,
         setRoomRadioStreamUrl,
+        stopRoomRadioStream,
     };
 }

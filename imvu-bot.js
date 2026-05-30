@@ -13,8 +13,10 @@ import { createImvuSessionClient } from './imvu-protocol/session.js';
 import { ImvuAccountWebSocketClient } from './imvu-protocol/account-ws-client.js';
 import { ImvuRoomWebSocketClient } from './imvu-protocol/ws-client.js';
 import { startProtocolUserTracking } from './user-tracker.js';
-import { applySyncRoomSettings, setGlobalLurkDefault } from './room-settings/store.js';
+import { applySyncRoomSettings, patchRoomSettingsLocal, setGlobalLurkDefault } from './room-settings/store.js';
 import { decodeChatEnvelope, decodeId, roomQueueBelongsToRoom } from './user-tracker-utils.js';
+import { allRoomRuntimes, trackerRoomKey } from './room-runtime-registry.js';
+import { processSyncActions } from './sync-actions.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -39,11 +41,26 @@ function delay(ms) {
 }
 
 function trackerRoomId(raw) {
-    const s = String(raw ?? '').trim();
-    const m = s.match(/room-([\d-]+)/i);
-    if (m) return m[1];
-    const m2 = s.match(/(\d+-\d+)/);
-    return m2 ? m2[1] : s.replace(/[^\d-]/g, '') || s;
+    return trackerRoomKey(raw);
+}
+
+function applyMutedRooms(mutedRooms) {
+    if (!Array.isArray(mutedRooms)) return;
+    for (const raw of mutedRooms) {
+        const roomId = trackerRoomId(raw);
+        if (!roomId) continue;
+        patchRoomSettingsLocal(roomId, { lurk_enabled: false });
+    }
+}
+
+function applyBotAiEnabled(data) {
+    if (data?.bot_ai_enabled == null) return;
+    const on =
+        data.bot_ai_enabled === true ||
+        data.bot_ai_enabled === 1 ||
+        String(data.bot_ai_enabled).trim().toLowerCase() === 'true' ||
+        String(data.bot_ai_enabled).trim() === '1';
+    setGlobalLurkDefault(on && !envDisabled('IMVU_LURK_ENABLED'));
 }
 
 function envTruthy(key) {
@@ -165,18 +182,29 @@ async function fetchBotSettings(botName) {
 
 async function syncDashboardRooms({ roomClients, session, bot }) {
     const rooms = [];
+    const runtimes = allRoomRuntimes();
     for (const [roomId, entry] of roomClients) {
         let details = entry.details;
         if (!details) {
             details = await session.fetchRoomDetails(roomId);
             entry.details = details;
         }
+        const runtime = runtimes.get(roomId);
+        const visitors = runtime?.getVisitors?.() || [];
+        let moderators = entry.moderators;
+        if (!moderators && session.fetchRoomModerators) {
+            moderators = await session.fetchRoomModerators(roomId);
+            entry.moderators = moderators;
+        }
         rooms.push({
             id: roomId,
             name: details?.name || `Room ${roomId}`,
+            description: details?.description || '',
             image_url: details?.image_url || '',
-            visitors: [],
-            population: 0,
+            visitors,
+            moderators: moderators || [],
+            population: visitors.length || details?.occupancy || 0,
+            capacity: details?.capacity ?? null,
         });
     }
 
@@ -392,6 +420,8 @@ async function main() {
         return {};
     });
     applySyncRoomSettings(initial.room_settings);
+    applyMutedRooms(initial.muted_rooms);
+    applyBotAiEnabled(initial);
     rememberRoomDiscordChannels(initial, roomDiscordChannelIds);
     const initialTargets = Array.isArray(initial.target_rooms) ? initial.target_rooms : [];
     const firstRooms = initialTargets.length ? initialTargets : [process.env.IMVU_DEFAULT_ROOM || '255338726-5'];
@@ -401,6 +431,10 @@ async function main() {
             console.error(`[${BOT_NAME}] Failed to start room ${trackerRoomId(roomId)}: ${error.message}`);
         });
     }
+
+    const syncBaseMs = Math.max(5000, envInt('IMVU_SYNC_INTERVAL_MS', 25000));
+    const syncJitterMs = Math.max(0, envInt('IMVU_SYNC_JITTER_MS', 10000));
+    const syncIntervalMs = syncBaseMs + Math.floor(Math.random() * syncJitterMs);
 
     setInterval(() => {
         void (async () => {
@@ -412,6 +446,8 @@ async function main() {
                 return;
             }
             applySyncRoomSettings(data.room_settings);
+            applyMutedRooms(data.muted_rooms);
+            applyBotAiEnabled(data);
             rememberRoomDiscordChannels(data, roomDiscordChannelIds);
 
             activeSpamRooms = Array.isArray(data.spam_targets) ? data.spam_targets.map(trackerRoomId) : [];
@@ -424,17 +460,15 @@ async function main() {
                 });
             }
 
-            if (Array.isArray(data.pending_messages)) {
-                for (const msg of data.pending_messages) {
-                    const roomId = trackerRoomId(msg.room_id);
-                    const entry = roomClients.get(roomId);
-                    if (!entry || !msg.pending_message) continue;
-                    await delay(3000 + Math.random() * 7000);
-                    await entry.client.sendMessage(String(msg.pending_message));
-                }
-            }
+            await processSyncActions(data, {
+                roomClients,
+                session,
+                stopRoom,
+                botName: BOT_NAME,
+                logger: console,
+            });
         })();
-    }, 25000 + Math.random() * 10000);
+    }, syncIntervalMs);
 
     const spamLibrary = [
         'Hey everyone!',

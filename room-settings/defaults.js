@@ -7,6 +7,9 @@
  * @property {number | null} min_age
  * @property {number | null} max_occupancy
  * @property {boolean} lurk_enabled
+ * @property {string | null} description
+ * @property {string | null} music_url
+ * @property {boolean} autoboot_on_kick
  */
 
 /** @returns {RoomSettings} */
@@ -19,6 +22,9 @@ export function defaultRoomSettings() {
         min_age: null,
         max_occupancy: null,
         lurk_enabled: true,
+        description: null,
+        music_url: null,
+        autoboot_on_kick: false,
     };
 }
 
@@ -51,6 +57,15 @@ export function normalizeRoomSettings(raw) {
         if (Number.isFinite(n) && n > 0) base.max_occupancy = Math.min(100, Math.round(n));
     }
     if (o.lurk_enabled != null) base.lurk_enabled = Boolean(o.lurk_enabled);
+    if (o.description != null) {
+        const d = String(o.description).trim();
+        base.description = d.length ? d.slice(0, 500) : null;
+    }
+    if (o.music_url != null) {
+        const u = String(o.music_url).trim();
+        base.music_url = u.length ? u.slice(0, 2048) : null;
+    }
+    if (o.autoboot_on_kick != null) base.autoboot_on_kick = Boolean(o.autoboot_on_kick);
 
     return base;
 }
