@@ -607,6 +607,21 @@ export const createIncomingMessageHandler = (ctx) => {
                     const direction =
                         record === 'msg_c2g_send_message' || ctx.isSelfId(senderId) ? 'OUT' : 'IN';
                     const trimmed = text.trim();
+                    if (direction === 'IN' && senderId != null && !ctx.isSelfId(senderId)) {
+                        ctx.lastSpokeAt?.set(String(senderId), Date.now());
+                    }
+                    if (
+                        direction === 'IN' &&
+                        typeof ctx.roomChatCommandHandler === 'function'
+                    ) {
+                        const handled = await ctx.roomChatCommandHandler({
+                            text: trimmed,
+                            senderLabel,
+                            senderId,
+                            isSelf: ctx.isSelfId(senderId),
+                        });
+                        if (handled) continue;
+                    }
                     if (
                         direction === 'IN' &&
                         typeof ctx.roomKickCommandHandler === 'function'
@@ -669,7 +684,8 @@ export const createIncomingMessageHandler = (ctx) => {
                         direction === 'IN' &&
                         senderId != null &&
                         !ctx.isSelfId(senderId) &&
-                        (sivaHitIn || mentionHit)
+                        (sivaHitIn || mentionHit) &&
+                        (typeof ctx.isLurkEnabled !== 'function' || ctx.isLurkEnabled())
                     ) {
                         const now = Date.now();
                         if (now - (userLastReply.get(senderId) || 0) < 15000) {

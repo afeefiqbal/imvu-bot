@@ -19,9 +19,12 @@ import {
     roomBootOwnerIdFromRoomId,
 } from './imvu-discord-kick.js';
 import { backendApiBaseUrl } from './env-app-url.js';
-
-const getDefaultWelcomeMessage = (name, roomName = 'the room') =>
-    `Hey ${name || 'there'} 👋 welcome to ${roomName}!`;
+import {
+    buildWelcomeText,
+    createRoomChatCommandHandler,
+    isLurkEnabledForRoom,
+    maybeWarnMinAgeOnJoin,
+} from './room-commands/index.js';
 
 const envFlag = (name, defaultValue = false) => {
     const raw = process.env[name];
@@ -581,6 +584,9 @@ export async function startUserTracking(page, roomId, options = {}) {
     );
     const kickInflight = new Set();
     const freshAccountChecks = new Map();
+    const lastSpokeAt = new Map();
+    const minAgeWarned = new Set();
+    const roomCommandsEnabled = envFlag('IMVU_ROOM_COMMANDS_ENABLED', true);
     let cachedRoomOwnerId = null;
     let cachedRoomModeratorIds = null;
 
@@ -907,6 +913,19 @@ export async function startUserTracking(page, roomId, options = {}) {
             welcomeByHandleLastAt.clear();
         }
         cancelPendingWelcome(avatarId);
+        const settingsForWelcome = buildWelcomeText(roomId, displayName, ROOM_NAME);
+        if (!settingsForWelcome) {
+            activeJoinSessions.delete(avatarId);
+            void maybeWarnMinAgeOnJoin({
+                roomId,
+                avatarId,
+                displayName,
+                sessionClient,
+                minAgeWarned,
+                sendMessage,
+            });
+            return true;
+        }
         const welcomeTimer = setTimeout(async () => {
             try {
                 if (!lastUserMap.has(String(avatarId))) {
@@ -919,7 +938,17 @@ export async function startUserTracking(page, roomId, options = {}) {
                     return;
                 }
 
-                await sendMessage(getDefaultWelcomeMessage(displayName, ROOM_NAME), convMeta);
+                const welcomeText =
+                    buildWelcomeText(roomId, displayName, ROOM_NAME) || settingsForWelcome;
+                await sendMessage(welcomeText, convMeta);
+                void maybeWarnMinAgeOnJoin({
+                    roomId,
+                    avatarId,
+                    displayName,
+                    sessionClient,
+                    minAgeWarned,
+                    sendMessage,
+                });
 
             } finally {
                 // 🔓 ALWAYS release lock after welcome
@@ -946,6 +975,24 @@ export async function startUserTracking(page, roomId, options = {}) {
 
     const resolveImvuHandleFromNumericId = createImvuHandleResolver({ page, sessionClient });
 
+    let roomChatCommandHandler = null;
+    if (roomCommandsEnabled) {
+        roomChatCommandHandler = createRoomChatCommandHandler({
+            roomId,
+            botName: syncBotName,
+            apiBaseUrl: API_BASE_URL,
+            sendMessage,
+            getRoomName: () => ROOM_NAME,
+            getSelfUserId: () => (state.selfUserId != null ? String(state.selfUserId) : null),
+            canUseRoomCommand: canUseKickCommand,
+            sessionClient,
+            lastUserMap,
+            lastSpokeAt,
+            minAgeWarned,
+        });
+        console.log(`${syncLogPrefix} room commands on (!move !newgreeting !autogreet !scale !roomcheck !nolurk …)`);
+    }
+
     const handleIncomingMessage = createIncomingMessageHandler({
         API_BASE_URL,
         BOT_DISPLAY_NAME,
@@ -969,8 +1016,11 @@ export async function startUserTracking(page, roomId, options = {}) {
         maybeAutobootFreshAccount,
         cancelPendingWelcome,
         isSuppressedAvatarId,
+        roomChatCommandHandler,
+        isLurkEnabled: () => isLurkEnabledForRoom(roomId),
         roomKickCommandHandler: handleKickCommand,
         autoBootMessageHandler: handleAutoBootMessage,
+        lastSpokeAt,
         roomId,
         getRoomChatQueue: () => protocolClient?.chatQueue || '',
         scheduleWelcomeForAvatar,
@@ -1023,6 +1073,9 @@ export async function startUserTracking(page, roomId, options = {}) {
     }, 60000);
 
     const cleanupTracker = () => {
+        if (roomChatCommandHandler?.stopScaleInterval) {
+            roomChatCommandHandler.stopScaleInterval();
+        }
         if (onDiscordRelayChat && global.discordBridge) {
             global.discordBridge.off('chat', onDiscordRelayChat);
         }

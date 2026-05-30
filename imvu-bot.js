@@ -13,6 +13,7 @@ import { createImvuSessionClient } from './imvu-protocol/session.js';
 import { ImvuAccountWebSocketClient } from './imvu-protocol/account-ws-client.js';
 import { ImvuRoomWebSocketClient } from './imvu-protocol/ws-client.js';
 import { startProtocolUserTracking } from './user-tracker.js';
+import { applySyncRoomSettings, setGlobalLurkDefault } from './room-settings/store.js';
 import { decodeChatEnvelope, decodeId, roomQueueBelongsToRoom } from './user-tracker-utils.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -184,6 +185,14 @@ async function main() {
     console.log(`[${BOT_NAME}] Pure WebSocket runtime starting; Chromium/Puppeteer is not used.`);
 
     const bot = await fetchBotSettings(BOT_NAME);
+    const aiEnabledRaw = bot.ai_enabled;
+    const aiGloballyOn =
+        aiEnabledRaw == null ||
+        aiEnabledRaw === true ||
+        aiEnabledRaw === 1 ||
+        String(aiEnabledRaw).trim().toLowerCase() === 'true' ||
+        String(aiEnabledRaw).trim() === '1';
+    setGlobalLurkDefault(aiGloballyOn && !envDisabled('IMVU_LURK_ENABLED'));
     const parsedProxy = parseProxyFromProcessEnv({ fallbackRaw: bot.proxy });
     const agents = createProxyAgents(parsedProxy);
     const session = createImvuSessionClient({ bot, agents });
@@ -373,6 +382,7 @@ async function main() {
         console.warn(`[${BOT_NAME}] Initial dashboard sync failed: ${error.message}`);
         return {};
     });
+    applySyncRoomSettings(initial.room_settings);
     rememberRoomDiscordChannels(initial, roomDiscordChannelIds);
     const initialTargets = Array.isArray(initial.target_rooms) ? initial.target_rooms : [];
     const firstRooms = initialTargets.length ? initialTargets : [process.env.IMVU_DEFAULT_ROOM || '255338726-5'];
@@ -392,6 +402,7 @@ async function main() {
                 console.warn(`[${BOT_NAME}] Dashboard sync failed: ${error.message}`);
                 return;
             }
+            applySyncRoomSettings(data.room_settings);
             rememberRoomDiscordChannels(data, roomDiscordChannelIds);
 
             activeSpamRooms = Array.isArray(data.spam_targets) ? data.spam_targets.map(trackerRoomId) : [];

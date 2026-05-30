@@ -556,6 +556,54 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         }
     }
 
+    function extractProfileAge(data) {
+        if (!data || typeof data !== 'object') return null;
+        for (const key of ['age', 'user_age', 'profile_age', 'display_age', 'years_old']) {
+            const n = Number(data[key]);
+            if (Number.isFinite(n) && n >= 0 && n <= 120) return Math.round(n);
+        }
+        return null;
+    }
+
+    function collectWearableNameStrings(value, out, seen = new Set()) {
+        if (value == null) return;
+        if (typeof value === 'string') {
+            const t = value.trim();
+            if (t.length >= 3 && t.length <= 200) out.add(t);
+            return;
+        }
+        if (typeof value !== 'object' || seen.has(value)) return;
+        seen.add(value);
+        if (Array.isArray(value)) {
+            for (const item of value) collectWearableNameStrings(item, out, seen);
+            return;
+        }
+        const o = /** @type {Record<string, unknown>} */ (value);
+        for (const key of ['name', 'product_name', 'display_name', 'title', 'label']) {
+            if (typeof o[key] === 'string') out.add(String(o[key]).trim());
+        }
+        for (const child of Object.values(o)) collectWearableNameStrings(child, out, seen);
+    }
+
+    async function apiGetWearableNames(userId) {
+        const id = String(userId || '').trim();
+        if (!/^\d+$/.test(id)) return [];
+        const names = new Set();
+        try {
+            collectWearableNameStrings(await apiGet(`/user/user-${id}`), names);
+        } catch {
+            /* optional */
+        }
+        for (const path of [`/inventory/outfit-${id}-1`, `/inventory/outfit-${id}-2`]) {
+            try {
+                collectWearableNameStrings(await apiGet(path), names);
+            } catch {
+                /* optional */
+            }
+        }
+        return [...names].filter(Boolean);
+    }
+
     async function fetchUserProfile(userId) {
         const id = String(userId || '').trim();
         if (!/^\d+$/.test(id)) return null;
@@ -568,6 +616,7 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                 created: firstString(data.created),
                 registered: data.registered ?? null,
                 display_name: firstString(data.display_name),
+                profile_age: extractProfileAge(data),
                 is_guest: Boolean(
                     data.is_guest ||
                         data.persona_type === 0 ||
@@ -1120,7 +1169,9 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         fetchRoomDetails,
         fetchRoomOwnerId,
         fetchRoomModeratorIds,
+        fetchChatParticipant,
         fetchUserProfile,
+        apiGetWearableNames,
         fetchUserName,
         fetchLegacyChatQueue,
         ensureChatParticipant,
