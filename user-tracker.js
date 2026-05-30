@@ -997,7 +997,8 @@ export async function startUserTracking(page, roomId, options = {}) {
         API_BASE_URL,
         BOT_DISPLAY_NAME,
         BOT_USERNAME,
-        discordChannelId: options.discordChannelId,
+        discordGuildId: options.discordGuildId || options.discordChannelId,
+        discordRoomChannelId: options.discordRoomChannelId || null,
         MENTION_REPLY_DEDUPE_CAP,
         activeJoinSessions,
         announceJoinQueuePresence,
@@ -1047,7 +1048,8 @@ export async function startUserTracking(page, roomId, options = {}) {
                 axios.post(process.env.DISCORD_BOT_API_URL.replace('imvu-chat', 'imvu-init-room'), {
                     room_id: String(roomId),
                     room_name: state.roomName || 'Unknown Room',
-                    discord_channel_id: options.discordChannelId
+                    discord_channel_id: options.discordGuildId || options.discordChannelId,
+                    discord_room_channel_id: options.discordRoomChannelId || undefined,
                 }).catch(()=>null);
             } else {
                 // Manually trigger a refresh if it hasn't happened yet

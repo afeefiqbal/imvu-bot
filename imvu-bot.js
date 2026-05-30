@@ -144,14 +144,22 @@ async function fetchBotSettings(botName) {
     if (!response.data?.username) {
         throw new Error(`Bot not found or missing username: ${botName}`);
     }
-    const envDiscordChannelId = String(process.env.DISCORD_CHANNEL_ID || '').trim();
+    const fromApi = String(
+        response.data.discord_channel_id ||
+            response.data.discord_guild_id ||
+            response.data.discord_channel ||
+            ''
+    ).trim();
+    const fromEnv = String(
+        process.env.DISCORD_GUILD_ID || process.env.DISCORD_CHANNEL_ID || ''
+    ).trim();
     return {
         ...response.data,
         name: response.data.name || botName,
         username: response.data.username,
         password: response.data.password,
         profile: response.data.profile || response.data.name || botName,
-        discordChannelId: envDiscordChannelId || null,
+        discordChannelId: fromApi || fromEnv || null,
     };
 }
 
@@ -361,7 +369,8 @@ async function main() {
         await startProtocolUserTracking(client, id, {
             botName: BOT_NAME,
             botUsername: bot.username,
-            discordChannelId: roomDiscordChannelIds.get(id) || bot.discordChannelId,
+            discordGuildId: bot.discordChannelId,
+            discordRoomChannelId: roomDiscordChannelIds.get(id) || null,
             sessionClient: session,
             roomName: details?.name || '',
         });

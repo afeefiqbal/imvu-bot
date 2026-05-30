@@ -669,6 +669,61 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         return extractParticipantData(response.data, normalizedRoomId, normalizedUserId);
     }
 
+    async function updateChatParticipantSeat(roomId, userId, seat) {
+        const normalizedRoomId = String(roomId || '').trim().replace(/^room-/i, '');
+        const normalizedUserId = String(userId || '').trim();
+        if (!/^\d+-\d+$/.test(normalizedRoomId) || !/^\d+$/.test(normalizedUserId)) return null;
+
+        const seatNumber = Number(seat?.seatNumber ?? seat?.seat_number);
+        if (!Number.isFinite(seatNumber) || seatNumber <= 0) return null;
+        const seatFurniId = Number(seat?.seatFurniId ?? seat?.seat_furni_id);
+        const furni = Number.isFinite(seatFurniId) ? seatFurniId : 0;
+        const payload = {
+            seat_furni_id: String(furni),
+            seat_number: seatNumber,
+        };
+
+        const sauce = await resolveImvuSauce();
+        const participantUrl = new URL(
+            `chat/chat-${normalizedRoomId}/participants/user-${normalizedUserId}`,
+            `${DEFAULT_API_ORIGIN}/`
+        ).href;
+        const headers = {
+            Accept: 'application/json; charset=utf-8',
+            'Content-Type': 'application/json; charset=UTF-8',
+            Origin: process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN,
+            Referer: `${process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN}/next/chat/room-${normalizedRoomId}/`,
+            'X-IMVU-Application': process.env.IMVU_X_APPLICATION || 'next_desktop/1',
+            ...(sauce ? { 'X-IMVU-Sauce': sauce } : {}),
+        };
+
+        try {
+            const response = await client.request({
+                method: 'post',
+                url: participantUrl,
+                data: payload,
+                headers,
+                validateStatus: (status) => status >= 200 && status < 500,
+            });
+            if (response.status < 200 || response.status >= 300) {
+                logger.warn(
+                    `[IMVU-SESSION] updateChatParticipantSeat user-${normalizedUserId} chat-${normalizedRoomId} ${response.status}${summarizeResponseData(response.data)}`
+                );
+                return null;
+            }
+            const participant = extractParticipantData(response.data, normalizedRoomId, normalizedUserId);
+            logger.log(
+                `[IMVU-SESSION] Updated seat for user-${normalizedUserId} in chat-${normalizedRoomId} -> seat ${seatNumber} furni ${furni}.`
+            );
+            return participant;
+        } catch (error) {
+            logger.warn(
+                `[IMVU-SESSION] updateChatParticipantSeat user-${normalizedUserId} chat-${normalizedRoomId}: ${error.message}`
+            );
+            return null;
+        }
+    }
+
     async function ensureChatParticipant(roomId, userId, options = {}) {
         const normalizedRoomId = String(roomId || '').trim().replace(/^room-/i, '');
         const normalizedUserId = String(userId || '').trim();
@@ -1170,6 +1225,7 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         fetchRoomOwnerId,
         fetchRoomModeratorIds,
         fetchChatParticipant,
+        updateChatParticipantSeat,
         fetchUserProfile,
         apiGetWearableNames,
         fetchUserName,

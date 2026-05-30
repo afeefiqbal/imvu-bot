@@ -27,7 +27,7 @@ const SCALE_CHECK_INTERVAL_MS = Math.max(
  * @param {() => string} [opts.getRoomName]
  * @param {() => string | null} [opts.getSelfUserId]
  * @param {(p: { senderId?: string, senderLabel?: string }) => Promise<boolean>} opts.canUseRoomCommand
- * @param {{ fetchChatParticipant?: Function, fetchUserProfile?: Function, apiGetWearableNames?: Function } | null} [opts.sessionClient]
+ * @param {{ fetchChatParticipant?: Function, updateChatParticipantSeat?: Function, fetchUserProfile?: Function, apiGetWearableNames?: Function } | null} [opts.sessionClient]
  * @param {Map<string, string>} opts.lastUserMap
  * @param {Map<string, number>} opts.lastSpokeAt
  * @param {Set<string>} opts.minAgeWarned
@@ -108,6 +108,8 @@ export function createRoomChatCommandHandler(opts) {
 
     startScaleInterval();
 
+    const moveInflight = new Set();
+
     /**
      * @param {{ text: string, senderId?: string, senderLabel?: string }} msg
      * @returns {Promise<boolean>}
@@ -119,7 +121,19 @@ export function createRoomChatCommandHandler(opts) {
         const { cmd, args } = parsed;
         const settings = getRoomSettings(roomId);
 
+        if (cmd === 'newgreeting' && !args.trim()) {
+            await reply('(bot) Usage: !newgreeting Welcome to {room}, {user}!');
+            return true;
+        }
+
         if (cmd === 'move') {
+            const moveKey = senderId != null ? String(senderId) : 'anon';
+            if (moveInflight.has(moveKey)) {
+                await reply('(bot) Move already in progress — wait a few seconds.');
+                return true;
+            }
+            moveInflight.add(moveKey);
+            setTimeout(() => moveInflight.delete(moveKey), MOVE_DELAY_MS + 3000);
             const selfId = getSelfUserId();
             const targetId = senderId != null ? String(senderId) : '';
             if (!selfId || !/^\d+$/.test(selfId)) {
@@ -149,16 +163,24 @@ export function createRoomChatCommandHandler(opts) {
                         );
                         return;
                     }
-                    const line = buildSeatAssignmentMessage({
-                        botUserId: selfId,
-                        seatNumber: seat.seatNumber,
-                        seatFurniId: seat.seatFurniId,
-                    });
-                    if (!line) {
-                        await reply('(bot) Move failed — invalid seat data.');
-                        return;
+                    let moved = false;
+                    if (typeof sessionClient.updateChatParticipantSeat === 'function') {
+                        moved = Boolean(
+                            await sessionClient.updateChatParticipantSeat(roomId, selfId, seat)
+                        );
                     }
-                    await sendMessage(line);
+                    if (!moved) {
+                        const line = buildSeatAssignmentMessage({
+                            botUserId: selfId,
+                            seatNumber: seat.seatNumber,
+                            seatFurniId: seat.seatFurniId,
+                        });
+                        if (!line) {
+                            await reply('(bot) Move failed — invalid seat data.');
+                            return;
+                        }
+                        await sendMessage(line);
+                    }
                     await reply('(bot) Moving to your spot...');
                 } catch (e) {
                     console.warn('[room-cmd] move:', e?.message || e);
@@ -209,7 +231,11 @@ export function createRoomChatCommandHandler(opts) {
             const toggle = parseOnOff(args);
             const next = toggle ?? !settings.auto_greet;
             await persist({ auto_greet: next });
-            await reply(`(bot) Auto greet is now ${next ? 'ON' : 'OFF'}.`);
+            await reply(
+                next
+                    ? '(bot) Auto greet is ON — I will welcome new joiners.'
+                    : '(bot) Auto greet is OFF — I will not welcome new joiners.'
+            );
             return true;
         }
 

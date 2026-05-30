@@ -184,6 +184,9 @@ export const createIncomingMessageHandler = (ctx) => {
             : normalizeImvuUsername(String(name));
 
         ctx.announceJoinQueuePresence(avatarId, label);
+        if (ctx.lastSpokeAt && !ctx.isSelfId(avatarId)) {
+            ctx.lastSpokeAt.set(String(avatarId), Date.now());
+        }
 
         const scheduled = ctx.scheduleWelcomeForAvatar(avatarId, label, {
             participantUsername: label,
@@ -654,10 +657,16 @@ export const createIncomingMessageHandler = (ctx) => {
                             message: trimmed,
                             room_id: String(ctx.roomId),
                             room_name: ctx.state.roomName,
-                            discord_channel_id: ctx.discordChannelId
-                        }).catch(e => {
-                            const detail = e.response?.data || e.message;
-                            console.log(`[DISCORD-API] Error sending to bot server:`, detail);
+                            discord_channel_id: ctx.discordGuildId || ctx.discordChannelId,
+                            discord_room_channel_id: ctx.discordRoomChannelId || undefined,
+                        }).catch((e) => {
+                            if (!ctx._discordMirrorWarned) {
+                                ctx._discordMirrorWarned = true;
+                                const detail = e.response?.data || e.message;
+                                console.warn(
+                                    `[DISCORD-API] Chat mirror failed (further errors suppressed for this room): ${detail}`
+                                );
+                            }
                         });
                     }
 

@@ -1,3 +1,21 @@
+/** LurkBot-style aliases and common typos → canonical command name. */
+const COMMAND_ALIASES = {
+    newgreetings: 'newgreeting',
+    newgreeting: 'newgreeting',
+    autogreeet: 'autogreet',
+    autgreet: 'autogreet',
+    roomcheck: 'roomcheck',
+    maxscaler: 'maxscaler',
+    maxoccupancy: 'maxoccupancy',
+    minage: 'minage',
+    nolurk: 'nolurk',
+    command: 'help',
+    commands: 'help',
+    help: 'help',
+    settings: 'settings',
+    greeting: 'settings',
+};
+
 /**
  * Parse `!command` / `*command` room chat lines (case-insensitive command word).
  * @param {string} text
@@ -7,8 +25,10 @@ export function parseRoomCommand(text) {
     const raw = String(text || '').trim();
     const m = raw.match(/^[!*](\w+)(?:\s+(.*))?$/is);
     if (!m) return null;
+    const word = m[1].toLowerCase();
+    const cmd = COMMAND_ALIASES[word] || word;
     return {
-        cmd: m[1].toLowerCase(),
+        cmd,
         args: (m[2] || '').trim(),
         raw,
     };
