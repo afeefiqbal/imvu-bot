@@ -16,7 +16,8 @@ import { startProtocolUserTracking } from './user-tracker.js';
 import { applySyncRoomSettings, patchRoomSettingsLocal, setGlobalLurkDefault } from './room-settings/store.js';
 import { decodeChatEnvelope, decodeId, roomQueueBelongsToRoom } from './user-tracker-utils.js';
 import { allRoomRuntimes, trackerRoomKey } from './room-runtime-registry.js';
-import { processSyncActions } from './sync-actions.js';
+import { processSyncActions, runBotSocialSync, isSocialSyncEnabled } from './sync-actions.js';
+import { resolveBotImvuProfile } from './imvu-profile-sync.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -42,6 +43,13 @@ function delay(ms) {
 
 function trackerRoomId(raw) {
     return trackerRoomKey(raw);
+}
+
+function parseRoomIds(roomString) {
+    return String(roomString || '')
+        .split(',')
+        .map((entry) => trackerRoomId(entry.trim()))
+        .filter(Boolean);
 }
 
 function applyMutedRooms(mutedRooms) {
@@ -71,6 +79,10 @@ function envTruthy(key) {
 function envDisabled(key) {
     const v = String(process.env[key] ?? '').trim().toLowerCase();
     return v === '0' || v === 'false' || v === 'no' || v === 'off';
+}
+
+function isDmJoinEnabled() {
+    return envTruthy('IMVU_DM_JOIN_ENABLED');
 }
 
 function envInt(key, fallback) {
@@ -162,13 +174,16 @@ async function fetchBotSettings(botName) {
         throw new Error(`Bot not found or missing username: ${botName}`);
     }
     const fromApi = String(
-        response.data.discord_channel_id ||
-            response.data.discord_guild_id ||
+        response.data.discord_guild_id ||
+            response.data.discord_channel_id ||
             response.data.discord_channel ||
             ''
     ).trim();
     const fromEnv = String(
-        process.env.DISCORD_GUILD_ID || process.env.DISCORD_CHANNEL_ID || ''
+        process.env.DISCORD_GUILD_ID ||
+            process.env.DISCORD_SHARED_GUILD_ID ||
+            process.env.DISCORD_CHANNEL_ID ||
+            ''
     ).trim();
     return {
         ...response.data,
@@ -180,7 +195,7 @@ async function fetchBotSettings(botName) {
     };
 }
 
-async function syncDashboardRooms({ roomClients, session, bot }) {
+async function syncDashboardRooms({ roomClients, session, bot, botImvuUserId = null }) {
     const rooms = [];
     const runtimes = allRoomRuntimes();
     for (const [roomId, entry] of roomClients) {
@@ -208,11 +223,19 @@ async function syncDashboardRooms({ roomClients, session, bot }) {
         });
     }
 
+    const botProfile = await resolveBotImvuProfile(session, bot, botImvuUserId);
+
     const response = await axios.post(`${BACKEND_URL}/api/rooms/sync`, {
         rooms,
         bot_name: BOT_NAME,
         bot_username: bot.username,
         heartbeat_only: rooms.length === 0,
+        ...(botProfile.userId && botProfile.profile
+            ? {
+                  bot_imvu_user_id: botProfile.userId,
+                  bot_imvu_profile: botProfile.profile,
+              }
+            : {}),
     });
     return response.data || {};
 }
@@ -280,8 +303,29 @@ async function main() {
 
     startDiscordRelayForBot(BOT_NAME);
 
+    let configuredRoomIds = [...new Set(parseRoomIds(bot.room_ids))];
+
+    try {
+        const resume = await axios.post(
+            `${BACKEND_URL}/api/bots/${encodeURIComponent(BOT_NAME)}/resume-rooms`
+        );
+        const resumed = Array.isArray(resume.data?.target_rooms) ? resume.data.target_rooms : [];
+        if (resumed.length) {
+            console.log(
+                `[${BOT_NAME}] Dashboard has ${resumed.length} room(s) to join: ${resumed.join(', ')}`
+            );
+        }
+        configuredRoomIds = [
+            ...new Set([...configuredRoomIds, ...resumed.map((roomId) => trackerRoomId(roomId))]),
+        ];
+    } catch (error) {
+        console.warn(`[${BOT_NAME}] resume-rooms failed: ${error?.message || error}`);
+    }
+
     const roomClients = new Map();
     const roomDiscordChannelIds = new Map();
+    /** Rooms paused on dashboard — do not auto-rejoin from sync until unpaused. */
+    const locallyPausedRooms = new Set();
     let activeSpamRooms = [];
     const accountLevelWsEnabled = !envDisabled('IMVU_ACCOUNT_LEVEL_WS');
     const accountWs = accountLevelWsEnabled
@@ -311,28 +355,74 @@ async function main() {
     const selfRejoinWindowMs = Math.max(10000, envInt('IMVU_SELF_REJOIN_WINDOW_MS', 10 * 60 * 1000));
     const selfRejoinCooldownMs = Math.max(10000, envInt('IMVU_SELF_REJOIN_COOLDOWN_MS', 15 * 60 * 1000));
 
+    let triggerSocialSync = () => {};
+
     const stopRoom = async (roomId) => {
         const id = trackerRoomId(roomId);
         const entry = roomClients.get(id);
-        if (!entry) return;
+        if (!entry || entry.leaving) return;
+        entry.leaving = true;
+        locallyPausedRooms.add(id);
         console.log(`[${BOT_NAME}] Leaving room ${id}`);
         if (entry.selfRejoinTimer) clearTimeout(entry.selfRejoinTimer);
+        entry.selfRejoinTimer = null;
+        // Prevent self-rejoin / force-refresh from undoing an intentional leave.
+        entry.visibleRejoinPausedUntil = Date.now() + 365 * 24 * 60 * 60 * 1000;
+        entry.client.closedByUser = true;
+        entry.client.close();
+
+        const botUserId = bot.imqUserId != null ? String(bot.imqUserId) : '';
+        if (/^\d+$/.test(botUserId) && typeof session.removeChatParticipant === 'function') {
+            const removed = await session.removeChatParticipant(id, botUserId);
+            if (!removed?.ok) {
+                console.warn(`[${BOT_NAME}] REST leave failed for ${id}; trying websocket leave only`);
+            }
+        }
         try {
             await entry.client.leave();
         } catch {}
-        entry.client.close();
         roomClients.delete(id);
+        if (typeof session.watchRoomDmContacts === 'function' && isDmJoinEnabled()) {
+            await session.watchRoomDmContacts(id).catch(() => {});
+        }
+        triggerSocialSync();
     };
 
-    const startRoom = async (roomId) => {
+    /** Close websocket only — keep IMVU participant so the avatar stays in-room after dev restart. */
+    const disconnectRoom = (roomId) => {
         const id = trackerRoomId(roomId);
-        if (!id || roomClients.has(id)) return roomClients.get(id);
+        const entry = roomClients.get(id);
+        if (!entry || entry.leaving) return;
+        entry.leaving = true;
+        entry.client.closedByUser = true;
+        try {
+            entry.client.close();
+        } catch {
+            /* optional */
+        }
+        roomClients.delete(id);
+        console.log(`[${BOT_NAME}] Room ${id} websocket closed — avatar stays in IMVU room.`);
+    };
+
+    const startRoom = async (roomId, { force = false } = {}) => {
+        const id = trackerRoomId(roomId);
+        if (!id || roomClients.has(id)) return roomClients.get(id) || null;
+        if (!force && locallyPausedRooms.has(id)) {
+            console.log(
+                `[${BOT_NAME}] Skipping join to ${id} (paused on dashboard).`
+            );
+            return null;
+        }
+        if (force) locallyPausedRooms.delete(id);
         if (roomClients.size >= MAX_ROOMS) {
             console.warn(`[${BOT_NAME}] Max room count ${MAX_ROOMS} reached; skipping ${id}.`);
             return null;
         }
 
         const details = await session.fetchRoomDetails(id);
+        if (typeof session.watchRoomDmContacts === 'function' && isDmJoinEnabled()) {
+            await session.watchRoomDmContacts(id).catch(() => {});
+        }
         const client = accountWs
             ? accountWs.createRoomClient(id)
             : new ImvuRoomWebSocketClient({
@@ -415,7 +505,12 @@ async function main() {
         return entry;
     };
 
-    const initial = await syncDashboardRooms({ roomClients, session, bot }).catch((error) => {
+    const initial = await syncDashboardRooms({
+        roomClients,
+        session,
+        bot,
+        botImvuUserId: bot.imqUserId,
+    }).catch((error) => {
         console.warn(`[${BOT_NAME}] Initial dashboard sync failed: ${error.message}`);
         return {};
     });
@@ -423,8 +518,36 @@ async function main() {
     applyMutedRooms(initial.muted_rooms);
     applyBotAiEnabled(initial);
     rememberRoomDiscordChannels(initial, roomDiscordChannelIds);
+    if (Array.isArray(initial.paused_room_ids)) {
+        for (const raw of initial.paused_room_ids) {
+            const pausedId = trackerRoomId(raw);
+            if (pausedId) locallyPausedRooms.add(pausedId);
+        }
+    }
+    configuredRoomIds = [
+        ...new Set([
+            ...configuredRoomIds,
+            ...(Array.isArray(initial.configured_room_ids)
+                ? initial.configured_room_ids.map((roomId) => trackerRoomId(roomId))
+                : []),
+            ...(Array.isArray(initial.paused_room_ids)
+                ? initial.paused_room_ids.map((roomId) => trackerRoomId(roomId))
+                : []),
+        ]),
+    ];
     const initialTargets = Array.isArray(initial.target_rooms) ? initial.target_rooms : [];
-    const firstRooms = initialTargets.length ? initialTargets : [process.env.IMVU_DEFAULT_ROOM || '255338726-5'];
+    const defaultRoom = String(process.env.IMVU_DEFAULT_ROOM || '').trim();
+    const firstRooms = initialTargets.length
+        ? initialTargets
+        : defaultRoom
+          ? [defaultRoom]
+          : [];
+
+    if (!firstRooms.length) {
+        console.log(
+            `[${BOT_NAME}] No active rooms to join — idle mode (add or unpause rooms on the dashboard).`
+        );
+    }
 
     for (const roomId of firstRooms) {
         await startRoom(roomId).catch((error) => {
@@ -435,12 +558,54 @@ async function main() {
     const syncBaseMs = Math.max(5000, envInt('IMVU_SYNC_INTERVAL_MS', 25000));
     const syncJitterMs = Math.max(0, envInt('IMVU_SYNC_JITTER_MS', 10000));
     const syncIntervalMs = syncBaseMs + Math.floor(Math.random() * syncJitterMs);
+    const socialPollMs = Math.max(3000, envInt('IMVU_SOCIAL_SYNC_INTERVAL_MS', envInt('IMVU_DM_POLL_INTERVAL_MS', 4000)));
+
+    const startRoomForced = (roomId) => startRoom(roomId, { force: true });
+
+    const socialSyncCtx = {
+        session,
+        stopRoom,
+        startRoom: startRoomForced,
+        botName: BOT_NAME,
+        logger: console,
+        get configuredRoomIds() {
+            return configuredRoomIds;
+        },
+        getPausedRoomIds() {
+            return [...locallyPausedRooms];
+        },
+        isRoomConnected(roomId) {
+            return roomClients.has(trackerRoomId(roomId));
+        },
+    };
+
+    triggerSocialSync = () => {
+        if (!isSocialSyncEnabled()) return;
+        void runBotSocialSync(socialSyncCtx);
+    };
+
+    if (isSocialSyncEnabled()) {
+        void runBotSocialSync(socialSyncCtx);
+
+        setInterval(() => {
+            void runBotSocialSync(socialSyncCtx);
+        }, socialPollMs);
+    } else {
+        console.log(
+            `[${BOT_NAME}] IMVU social sync off (invites/DM/friend polling disabled). Set IMVU_SOCIAL_SYNC_ENABLED=1 to enable.`
+        );
+    }
 
     setInterval(() => {
         void (async () => {
             let data = {};
             try {
-                data = await syncDashboardRooms({ roomClients, session, bot });
+                data = await syncDashboardRooms({
+                    roomClients,
+                    session,
+                    bot,
+                    botImvuUserId: bot.imqUserId,
+                });
             } catch (error) {
                 console.warn(`[${BOT_NAME}] Dashboard sync failed: ${error.message}`);
                 return;
@@ -451,22 +616,62 @@ async function main() {
             rememberRoomDiscordChannels(data, roomDiscordChannelIds);
 
             activeSpamRooms = Array.isArray(data.spam_targets) ? data.spam_targets.map(trackerRoomId) : [];
-            const targets = new Set((Array.isArray(data.target_rooms) ? data.target_rooms : []).map(trackerRoomId));
 
-            for (const target of targets) {
-                if (!target || roomClients.has(target)) continue;
-                await startRoom(target).catch((error) => {
-                    console.error(`[${BOT_NAME}] Failed to start room ${target}: ${error.message}`);
-                });
+            if (Array.isArray(data.paused_room_ids)) {
+                for (const raw of data.paused_room_ids) {
+                    const pausedId = trackerRoomId(raw);
+                    if (pausedId) locallyPausedRooms.add(pausedId);
+                }
+            }
+            if (Array.isArray(data.pending_leave_rooms)) {
+                for (const raw of data.pending_leave_rooms) {
+                    const pendingLeaveId = trackerRoomId(raw);
+                    if (pendingLeaveId) locallyPausedRooms.add(pendingLeaveId);
+                }
+            }
+
+            const targets = new Set((Array.isArray(data.target_rooms) ? data.target_rooms : []).map(trackerRoomId));
+            configuredRoomIds = [
+                ...new Set([
+                    ...configuredRoomIds,
+                    ...(Array.isArray(data.configured_room_ids)
+                        ? data.configured_room_ids.map((roomId) => trackerRoomId(roomId))
+                        : []),
+                    ...(Array.isArray(data.paused_room_ids)
+                        ? data.paused_room_ids.map((roomId) => trackerRoomId(roomId))
+                        : []),
+                    ...[...targets],
+                ]),
+            ];
+
+            if (typeof session.watchRoomDmContacts === 'function' && isDmJoinEnabled()) {
+                const watchRoomIds = new Set([
+                    ...configuredRoomIds,
+                    ...(Array.isArray(data.paused_room_ids)
+                        ? data.paused_room_ids.map((roomId) => trackerRoomId(roomId))
+                        : []),
+                ]);
+                for (const target of watchRoomIds) {
+                    if (!target) continue;
+                    await session.watchRoomDmContacts(target).catch(() => {});
+                }
             }
 
             await processSyncActions(data, {
                 roomClients,
                 session,
                 stopRoom,
+                startRoom: startRoomForced,
                 botName: BOT_NAME,
                 logger: console,
             });
+
+            for (const target of targets) {
+                if (!target || roomClients.has(target) || locallyPausedRooms.has(target)) continue;
+                await startRoom(target).catch((error) => {
+                    console.error(`[${BOT_NAME}] Failed to start room ${target}: ${error.message}`);
+                });
+            }
         })();
     }, syncIntervalMs);
 
@@ -491,10 +696,31 @@ async function main() {
         })();
     }, 45000 + Math.random() * 50000);
 
+    let shuttingDown = false;
+
     const shutdown = async () => {
-        console.log(`[${BOT_NAME}] Shutting down ${roomClients.size} room client(s).`);
+        if (shuttingDown) return;
+        shuttingDown = true;
+        const leaveRooms = envTruthy('IMVU_LEAVE_ROOMS_ON_SHUTDOWN');
+        console.log(
+            `[${BOT_NAME}] Shutting down ${roomClients.size} room client(s)` +
+                (leaveRooms
+                    ? ' — leaving IMVU rooms (IMVU_LEAVE_ROOMS_ON_SHUTDOWN=1).'
+                    : ' — keeping avatar in room (websocket only). Set IMVU_LEAVE_ROOMS_ON_SHUTDOWN=1 to leave on exit.')
+        );
         for (const roomId of [...roomClients.keys()]) {
-            await stopRoom(roomId);
+            if (leaveRooms) {
+                await stopRoom(roomId);
+            } else {
+                disconnectRoom(roomId);
+            }
+        }
+        if (accountWs) {
+            try {
+                accountWs.close();
+            } catch {
+                /* optional */
+            }
         }
         process.exit(0);
     };

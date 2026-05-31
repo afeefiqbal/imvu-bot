@@ -4,10 +4,12 @@ import {
 } from '../room-settings/defaults.js';
 import { getRoomSettings, isLurkEnabledForRoom, patchRoomSettingsLocal } from '../room-settings/store.js';
 import { patchRoomSettingsRemote } from './api.js';
+import { buildHelpMessages, buildInfoMessage } from './help.js';
+import { getMaxKbsForRoom, runFunCommand, setMaxKbsForRoom } from './fun.js';
 import { buildSeatAssignmentMessage, seatFromParticipant } from './move.js';
 import { parseOnOff, parseRoomCommand } from './parseCommand.js';
 import { listQuietUsers } from './quietTracker.js';
-import { fetchWearableNameHints, findOverScaler } from './scaleCheck.js';
+import { fetchScalerScan, findOverScaler } from './scaleCheck.js';
 
 const MOVE_DELAY_MS = Math.max(
     1000,
@@ -27,10 +29,13 @@ const SCALE_CHECK_INTERVAL_MS = Math.max(
  * @param {() => string} [opts.getRoomName]
  * @param {() => string | null} [opts.getSelfUserId]
  * @param {(p: { senderId?: string, senderLabel?: string }) => Promise<boolean>} opts.canUseRoomCommand
+ * @param {(userId: string) => void} [opts.watchDirectMessageUser]
  * @param {{ fetchChatParticipant?: Function, updateChatParticipantSeat?: Function, fetchUserProfile?: Function, apiGetWearableNames?: Function } | null} [opts.sessionClient]
  * @param {Map<string, string>} opts.lastUserMap
  * @param {Map<string, number>} opts.lastSpokeAt
  * @param {Set<string>} opts.minAgeWarned
+ * @param {Map<string, number>} [opts.scalerWarnedAt]
+ * @param {() => Promise<Array<{ username?: string, avatarname?: string, display_name?: string, legacy_cid?: number }>>} [opts.getRoomModerators]
  */
 export function createRoomChatCommandHandler(opts) {
     const {
@@ -41,10 +46,13 @@ export function createRoomChatCommandHandler(opts) {
         getRoomName = () => 'the room',
         getSelfUserId = () => null,
         canUseRoomCommand,
+        watchDirectMessageUser,
         sessionClient = null,
         lastUserMap,
         lastSpokeAt,
         minAgeWarned,
+        scalerWarnedAt: scalerWarnedAtOpt,
+        getRoomModerators,
     } = opts;
 
     const persist = async (patch) => {
@@ -66,31 +74,45 @@ export function createRoomChatCommandHandler(opts) {
     };
 
     const requireMod = async (senderId, senderLabel) => {
-        if (await canUseRoomCommand({ senderId, senderLabel })) return true;
-        await reply('(bot) That command is for room owner or mods only.');
+        if (await canUseRoomCommand({ senderId, senderLabel })) {
+            if (senderId && typeof watchDirectMessageUser === 'function') {
+                watchDirectMessageUser(String(senderId));
+            }
+            return true;
+        }
+        await reply('That command is for room owner or mods only.');
         return false;
     };
 
     let scaleTimer = null;
-    const scalerWarnedAt = new Map();
+    const scalerWarnedAt = scalerWarnedAtOpt || new Map();
+
+    const warnScalerIfOver = async (avatarId, label) => {
+        const settings = getRoomSettings(roomId);
+        if (!settings.auto_scale_check) return;
+
+        const id = String(avatarId || '');
+        if (!/^\d+$/.test(id)) return;
+
+        const scan = await fetchScalerScan(sessionClient, id);
+        const over = findOverScaler(scan.names, settings.max_scaler, scan.scalePercents);
+        if (!over) return;
+
+        const lastWarn = scalerWarnedAt.get(id) || 0;
+        if (Date.now() - lastWarn < SCALE_CHECK_INTERVAL_MS - 2000) return;
+        scalerWarnedAt.set(id, Date.now());
+
+        await reply(
+            `${label || id}: your avatar scaler looks like ${over.pct}% (room limit ${settings.max_scaler}%). Please lower it.`
+        );
+    };
 
     const runScalePass = async () => {
         const settings = getRoomSettings(roomId);
         if (!settings.auto_scale_check) return;
 
         for (const [avatarId, label] of lastUserMap) {
-            if (!/^\d+$/.test(String(avatarId))) continue;
-            const names = await fetchWearableNameHints(sessionClient, String(avatarId));
-            const over = findOverScaler(names, settings.max_scaler);
-            if (!over) continue;
-
-            const lastWarn = scalerWarnedAt.get(String(avatarId)) || 0;
-            if (Date.now() - lastWarn < SCALE_CHECK_INTERVAL_MS - 2000) continue;
-            scalerWarnedAt.set(String(avatarId), Date.now());
-
-            await reply(
-                `(bot) ${label || avatarId}: your avatar scaler looks like ${over.pct}% (room limit ${settings.max_scaler}%). Please lower it.`
-            );
+            await warnScalerIfOver(avatarId, label);
         }
     };
 
@@ -122,14 +144,19 @@ export function createRoomChatCommandHandler(opts) {
         const settings = getRoomSettings(roomId);
 
         if (cmd === 'newgreeting' && !args.trim()) {
-            await reply('(bot) Usage: !newgreeting Welcome to {room}, {user}!');
+            await reply('Usage: !newgreeting Welcome to {room}, {user}!');
+            return true;
+        }
+
+        if (cmd === 'roomid') {
+            await reply(`Room ID: ${roomId}`);
             return true;
         }
 
         if (cmd === 'move') {
             const moveKey = senderId != null ? String(senderId) : 'anon';
             if (moveInflight.has(moveKey)) {
-                await reply('(bot) Move already in progress — wait a few seconds.');
+                await reply('Move already in progress — wait a few seconds.');
                 return true;
             }
             moveInflight.add(moveKey);
@@ -137,54 +164,59 @@ export function createRoomChatCommandHandler(opts) {
             const selfId = getSelfUserId();
             const targetId = senderId != null ? String(senderId) : '';
             if (!selfId || !/^\d+$/.test(selfId)) {
-                await reply('(bot) Cannot move yet — bot session id not ready.');
+                await reply('Cannot move yet — bot session id not ready.');
                 return true;
             }
             if (!targetId || !/^\d+$/.test(targetId)) {
-                await reply('(bot) Could not identify your avatar for move.');
+                await reply('Could not identify your avatar for move.');
                 return true;
             }
             if (typeof sessionClient?.fetchChatParticipant !== 'function') {
-                await reply('(bot) Move is not available in this runtime.');
+                await reply('Move is not available in this runtime.');
+                return true;
+            }
+
+            let capturedSeat = null;
+            try {
+                const participant = await sessionClient.fetchChatParticipant(roomId, targetId);
+                capturedSeat = seatFromParticipant(participant);
+            } catch (e) {
+                console.warn('[room-cmd] move seat lookup:', e?.message || e);
+            }
+
+            if (!capturedSeat) {
+                await reply('Could not find your seat. Stand on a seat or spot in the room and try !move again.');
                 return true;
             }
 
             await reply(
-                `(bot) Moving to your spot in ~${Math.round(MOVE_DELAY_MS / 1000)}s — move away so the seat frees up.`
+                `Moving to your spot in ~${Math.round(MOVE_DELAY_MS / 1000)}s — move away so the seat frees up.`
             );
 
             setTimeout(async () => {
                 try {
-                    const participant = await sessionClient.fetchChatParticipant(roomId, targetId);
-                    const seat = seatFromParticipant(participant);
-                    if (!seat) {
-                        await reply(
-                            '(bot) Could not find your seat. Move around the room and try !move again.'
-                        );
-                        return;
-                    }
                     let moved = false;
                     if (typeof sessionClient.updateChatParticipantSeat === 'function') {
                         moved = Boolean(
-                            await sessionClient.updateChatParticipantSeat(roomId, selfId, seat)
+                            await sessionClient.updateChatParticipantSeat(roomId, selfId, capturedSeat)
                         );
                     }
                     if (!moved) {
                         const line = buildSeatAssignmentMessage({
                             botUserId: selfId,
-                            seatNumber: seat.seatNumber,
-                            seatFurniId: seat.seatFurniId,
+                            seatNumber: capturedSeat.seatNumber,
+                            seatFurniId: capturedSeat.seatFurniId,
                         });
                         if (!line) {
-                            await reply('(bot) Move failed — invalid seat data.');
+                            await reply('Move failed — invalid seat data.');
                             return;
                         }
                         await sendMessage(line);
                     }
-                    await reply('(bot) Moving to your spot...');
+                    await reply('Moving to your spot...');
                 } catch (e) {
                     console.warn('[room-cmd] move:', e?.message || e);
-                    await reply('(bot) Move failed. Try moving in the room and use !move again.');
+                    await reply('Move failed. Try moving in the room and use !move again.');
                 }
             }, MOVE_DELAY_MS);
 
@@ -192,16 +224,17 @@ export function createRoomChatCommandHandler(opts) {
         }
 
         if (cmd === 'roomcheck') {
+            if (!(await requireMod(senderId, senderLabel))) return true;
             const minutes = args ? Math.max(1, parseInt(args, 10) || 10) : 10;
             const quiet = listQuietUsers(lastUserMap, lastSpokeAt, minutes);
             if (!quiet.length) {
-                await reply(`(bot) No one has been quiet longer than ${minutes} minutes.`);
+                await reply(`No one has been quiet longer than ${minutes} minutes.`);
                 return true;
             }
             const lines = quiet
                 .slice(0, 15)
                 .map((u) => `• ${u.label} — ~${u.quietMinutes}m`);
-            await reply(`(bot) Quiet over ${minutes}m:\n${lines.join('\n')}`);
+            await reply(`Quiet over ${minutes}m:\n${lines.join('\n')}`);
             return true;
         }
 
@@ -213,17 +246,104 @@ export function createRoomChatCommandHandler(opts) {
             'minage',
             'maxoccupancy',
             'nolurk',
+            'maxkbs',
+            'outfit',
+            'seat',
         ]);
         if (modOnly.has(cmd) && !(await requireMod(senderId, senderLabel))) return true;
+
+        if (cmd === 'help') {
+            for (const line of buildHelpMessages({ botName: botName || 'Bot' })) {
+                await reply(line);
+            }
+            return true;
+        }
+
+        if (cmd === 'info') {
+            await reply(buildInfoMessage(args));
+            return true;
+        }
+
+        const funHandled = await runFunCommand(cmd, args, {
+            roomId,
+            senderId,
+            senderLabel,
+            reply,
+            lastUserMap,
+            lastSpokeAt,
+            sessionClient,
+            getRoomName,
+            getRoomModerators,
+            botName,
+        });
+        if (funHandled) return true;
+
+        if (cmd === 'roomsettings') {
+            const s = getRoomSettings(roomId);
+            const maxKbs = getMaxKbsForRoom(roomId);
+            await reply(
+                `greeting=${s.greeting ? `"${s.greeting.slice(0, 80)}${s.greeting.length > 80 ? '…' : ''}"` : '(default)'} | auto_greet=${s.auto_greet} | scale=${s.auto_scale_check}@${s.max_scaler}% | min_age=${s.min_age ?? 'off'} | lurk=${s.lurk_enabled} | max_occ=${s.max_occupancy ?? '—'} | max_kbs=${maxKbs ?? '—'}`
+            );
+            return true;
+        }
+
+        if (cmd === 'maxkbs') {
+            const n = parseInt(args, 10);
+            if (!Number.isFinite(n) || n < 1) {
+                await reply('Usage: !maxkbs 500');
+                return true;
+            }
+            setMaxKbsForRoom(roomId, n);
+            await reply(`Max outfit size threshold set to ${n} KB.`);
+            return true;
+        }
+
+        if (cmd === 'outfit') {
+            const target = String(args || senderLabel || '').trim();
+            if (!target) {
+                await reply('Usage: !outfit username');
+                return true;
+            }
+            const limit = getMaxKbsForRoom(roomId);
+            await reply(
+                limit
+                    ? `Outfit check for ${target}: size API not available — threshold is ${limit} KB.`
+                    : `Outfit check for ${target}: set a threshold with !maxkbs first.`
+            );
+            return true;
+        }
+
+        if (cmd === 'seat') {
+            const seatNumber = parseInt(args, 10);
+            if (!Number.isFinite(seatNumber) || seatNumber <= 0) {
+                await reply('Usage: !seat 2');
+                return true;
+            }
+            const selfId = getSelfUserId();
+            if (!selfId || !/^\d+$/.test(String(selfId))) {
+                await reply('Bot session not ready for !seat.');
+                return true;
+            }
+            if (typeof sessionClient?.updateChatParticipantSeat !== 'function') {
+                await reply('Seat command is not available in this runtime.');
+                return true;
+            }
+            const moved = await sessionClient.updateChatParticipantSeat(roomId, selfId, {
+                seatNumber,
+                seatFurniId: 0,
+            });
+            await reply(moved ? `Moved to seat ${seatNumber}.` : `Could not move to seat ${seatNumber}.`);
+            return true;
+        }
 
         if (cmd === 'newgreeting') {
             const g = args.trim();
             if (!g || g.length > 300) {
-                await reply('(bot) Greeting must be 1–300 characters. Example: !newgreeting Welcome to {room}, {user}!');
+                await reply('Greeting must be 1–300 characters. Example: !newgreeting Welcome to {room}, {user}!');
                 return true;
             }
             await persist({ greeting: g });
-            await reply('(bot) Greeting updated. Use {room} and {user} as placeholders.');
+            await reply('Greeting updated. Use {room} and {user} as placeholders.');
             return true;
         }
 
@@ -233,8 +353,8 @@ export function createRoomChatCommandHandler(opts) {
             await persist({ auto_greet: next });
             await reply(
                 next
-                    ? '(bot) Auto greet is ON — I will welcome new joiners.'
-                    : '(bot) Auto greet is OFF — I will not welcome new joiners.'
+                    ? 'Auto greet is ON — I will welcome new joiners.'
+                    : 'Auto greet is OFF — I will not welcome new joiners.'
             );
             return true;
         }
@@ -242,42 +362,44 @@ export function createRoomChatCommandHandler(opts) {
         if (cmd === 'scale') {
             const toggle = parseOnOff(args);
             const next = toggle ?? !settings.auto_scale_check;
+            if (next) scalerWarnedAt.clear();
             await persist({ auto_scale_check: next });
-            await reply(`(bot) Scaler warnings are now ${next ? 'ON' : 'OFF'}.`);
+            await reply(`Scaler warnings are now ${next ? 'ON' : 'OFF'}.`);
             return true;
         }
 
         if (cmd === 'maxscaler') {
             const n = parseInt(args, 10);
             if (!Number.isFinite(n) || n < 1 || n > 500) {
-                await reply('(bot) Usage: !maxscaler 120');
+                await reply('Usage: !maxscaler 120');
                 return true;
             }
-            await persist({ max_scaler: n });
-            await reply(`(bot) Max scaler set to ${n}%.`);
+            scalerWarnedAt.clear();
+            await persist({ max_scaler: n, auto_scale_check: true });
+            await reply(`Max scaler set to ${n}%. Scaler warnings are ON.`);
             return true;
         }
 
         if (cmd === 'minage') {
             const n = parseInt(args, 10);
             if (!Number.isFinite(n) || n < 0 || n > 120) {
-                await reply('(bot) Usage: !minage 18');
+                await reply('Usage: !minage 18');
                 return true;
             }
             await persist({ min_age: n });
             minAgeWarned.clear();
-            await reply(`(bot) Minimum age check set to ${n}.`);
+            await reply(`Minimum age check set to ${n}.`);
             return true;
         }
 
         if (cmd === 'maxoccupancy') {
             const n = parseInt(args, 10);
             if (!Number.isFinite(n) || n < 1 || n > 100) {
-                await reply('(bot) Usage: !maxoccupancy 12');
+                await reply('Usage: !maxoccupancy 12');
                 return true;
             }
             await persist({ max_occupancy: n });
-            await reply(`(bot) Max occupancy for invites set to ${n}.`);
+            await reply(`Max occupancy for invites set to ${n}.`);
             return true;
         }
 
@@ -286,22 +408,7 @@ export function createRoomChatCommandHandler(opts) {
             const next = toggle ?? !settings.lurk_enabled;
             await persist({ lurk_enabled: next });
             await reply(
-                `(bot) Lurk/AI replies are now ${next ? 'ON' : 'OFF'} in this room (resets when bot restarts unless saved in backend).`
-            );
-            return true;
-        }
-
-        if (cmd === 'help' || cmd === 'commands') {
-            await reply(
-                '(bot) Commands: !move · !roomcheck [min] · !settings · Mod: !newgreeting · !autogreet · !scale · !maxscaler · !minage · !maxoccupancy · !nolurk'
-            );
-            return true;
-        }
-
-        if (cmd === 'greeting' || cmd === 'settings') {
-            const s = getRoomSettings(roomId);
-            await reply(
-                `(bot) greeting=${s.greeting ? `"${s.greeting.slice(0, 80)}${s.greeting.length > 80 ? '…' : ''}"` : '(default)'} | auto_greet=${s.auto_greet} | scale=${s.auto_scale_check}@${s.max_scaler}% | min_age=${s.min_age ?? 'off'} | lurk=${s.lurk_enabled} | max_occ=${s.max_occupancy ?? '—'}`
+                `Lurk/AI replies are now ${next ? 'ON' : 'OFF'} in this room (resets when bot restarts unless saved in backend).`
             );
             return true;
         }
@@ -353,10 +460,43 @@ export async function maybeWarnMinAgeOnJoin({
         if (age >= settings.min_age) return;
         minAgeWarned.add(id);
         await sendMessage(
-            `(bot) ${displayName || id}: your profile age (${age}) is below this room minimum (${settings.min_age}).`
+            `${displayName || id}: your profile age (${age}) is below this room minimum (${settings.min_age}).`
         );
     } catch (e) {
         console.warn('[room-cmd] min age check:', e?.message || e);
+    }
+}
+
+/**
+ * One-shot scaler warning on join (when auto_scale_check is on).
+ */
+export async function maybeWarnScalerOnJoin({
+    roomId,
+    avatarId,
+    displayName,
+    sessionClient,
+    scalerWarnedAt,
+    sendMessage,
+}) {
+    const settings = getRoomSettings(roomId);
+    if (!settings.auto_scale_check) return;
+    const id = String(avatarId || '');
+    if (!/^\d+$/.test(id)) return;
+
+    const warnedAt = scalerWarnedAt || new Map();
+    const lastWarn = warnedAt.get(id) || 0;
+    if (Date.now() - lastWarn < SCALE_CHECK_INTERVAL_MS - 2000) return;
+
+    try {
+        const scan = await fetchScalerScan(sessionClient, id);
+        const over = findOverScaler(scan.names, settings.max_scaler, scan.scalePercents);
+        if (!over) return;
+        warnedAt.set(id, Date.now());
+        await sendMessage(
+            `${displayName || id}: your avatar scaler looks like ${over.pct}% (room limit ${settings.max_scaler}%). Please lower it.`
+        );
+    } catch (e) {
+        console.warn('[room-cmd] scaler check:', e?.message || e);
     }
 }
 

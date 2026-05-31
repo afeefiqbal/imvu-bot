@@ -35,9 +35,37 @@ function resolveDiscordGuildOrParentId(body = {}) {
         body.discord_guild_id ||
             body.discord_channel_id ||
             process.env.DISCORD_GUILD_ID ||
+            process.env.DISCORD_SHARED_GUILD_ID ||
             process.env.DISCORD_CHANNEL_ID ||
             ''
     ).trim();
+}
+
+function backendApiBaseUrl() {
+    return String(process.env.BOT_API_BASE_URL || process.env.APP_URL || '')
+        .trim()
+        .replace(/\/$/, '');
+}
+
+async function registerRoomChannelWithBackend(room_id, room_name, roomChannel) {
+    const base = backendApiBaseUrl();
+    if (!base || !roomChannel?.id) return;
+
+    if (!global.registeredBackendChannels) global.registeredBackendChannels = new Set();
+    const key = `${room_id}:${roomChannel.id}`;
+    if (global.registeredBackendChannels.has(key)) return;
+    global.registeredBackendChannels.add(key);
+
+    try {
+        await axios.post(`${base}/api/rooms/${encodeURIComponent(room_id)}/discord-channel`, {
+            discord_channel_id: roomChannel.id,
+            discord_channel_name: roomChannel.name,
+            room_name: room_name || null,
+        });
+    } catch (error) {
+        global.registeredBackendChannels.delete(key);
+        console.warn(`[DISCORD] Could not register channel with backend: ${error.message}`);
+    }
 }
 
 /** Per-room text channel from Laravel `room_discord_channels` (optional). */
@@ -148,6 +176,9 @@ async function getOrCreateRoomChannel(client, parentId, room_id, room_name, opti
             console.log(`[DISCORD] 🔄 Renaming channel ${roomChannel.name} to ${targetChannelName}`);
             roomChannel.setName(targetChannelName).catch(()=>null);
         }
+    }
+    if (roomChannel && room_id) {
+        void registerRoomChannelWithBackend(room_id, room_name, roomChannel);
     }
     return roomChannel;
 }

@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events';
 import WebSocket from 'ws';
-import { roomQueueBelongsToRoom, isImvuRoomChatQueue } from '../user-tracker-utils.js';
+import { roomQueueBelongsToRoom, isImvuRoomChatQueue, narrowChatFrameTargets } from '../user-tracker-utils.js';
 
 function parseFrame(raw) {
     const text = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw || '');
@@ -228,11 +228,17 @@ export class ImvuAccountWebSocketClient extends EventEmitter {
         }
 
         const queue = String(action.queue || '');
-        const targets = [];
+        const isChatMsg =
+            action.record === 'msg_g2c_send_message' || action.record === 'msg_c2g_send_message';
+        let targets = [];
         if (queue) {
             for (const room of this.rooms.values()) {
                 if (room._ownsQueue(queue)) targets.push(room);
             }
+        }
+
+        if (isChatMsg && targets.length > 1) {
+            targets = narrowChatFrameTargets(queue, targets);
         }
 
         if (targets.length > 0) {
@@ -242,9 +248,7 @@ export class ImvuAccountWebSocketClient extends EventEmitter {
             return;
         }
 
-        const isChatMsg =
-            action.record === 'msg_g2c_send_message' || action.record === 'msg_c2g_send_message';
-        if (queue && isChatMsg && isImvuRoomChatQueue(queue)) {
+        if (isChatMsg) {
             return;
         }
 
@@ -316,7 +320,7 @@ export class ImvuAccountWebSocketClient extends EventEmitter {
         for (const [opId, owner] of [...this.opOwners.entries()]) {
             if (owner === room) this.opOwners.delete(opId);
         }
-        if (this.rooms.size === 0) this.close();
+        // Keep the account websocket open with zero rooms so DM !join and friend accepts still work.
     }
 
     #startPing(roomId) {
@@ -377,6 +381,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
         this.visibleHeartbeatTimer = null;
         this.forceVisibleRefreshTimer = null;
         this.forceVisibleRefreshRunning = false;
+        this.lastEnsureVisibleAt = 0;
         this.mediaPlayerQueue = '';
         this.mediaPlayerSubscribed = false;
     }
@@ -465,6 +470,8 @@ export class ImvuAccountRoomClient extends EventEmitter {
             queue.startsWith('/chat/') &&
             String(action.user_id || '') === userId
         ) {
+            if (this.closedByUser) return;
+            if (!this._ownsQueue(queue)) return;
             this.logger.warn(`[IMVU-WS][${this.roomId}] left legacy ${queue}; will resubscribe before visible join`);
             this.chatQueue = '';
             this.legacyChatSubscribed = false;
@@ -487,7 +494,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
                 this.legacyChatOpId = null;
             }
         }
-        if (queue.startsWith('/chat/')) {
+        if (queue.startsWith('/chat/') && this._ownsQueue(queue)) {
             this.chatQueue = queue;
             if (action.record === 'msg_g2c_joined_queue') {
                 this.#sendVisibilityBootstrap();
@@ -711,15 +718,28 @@ export class ImvuAccountRoomClient extends EventEmitter {
     }
 
     async ensureVisible(reason = 'manual') {
-        if (!this.visibilityEnabled) return false;
+        if (!this.visibilityEnabled || this.closedByUser) return false;
+        const now = Date.now();
+        const minGapMs = Math.max(5000, envInt('IMVU_ENSURE_VISIBLE_MIN_GAP_MS', 45000));
+        if (reason === 'force-refresh' && now - this.lastEnsureVisibleAt < minGapMs) {
+            return false;
+        }
         if (!this.isOpen) await this.connect();
-        await this.#ensureChatParticipantWithRetry();
+        const skipParticipantRest =
+            (reason === 'force-refresh' || reason === 'visible-heartbeat') &&
+            this.participantReady &&
+            this.legacyChatSubscribed &&
+            Boolean(this.chatQueue);
+        if (!skipParticipantRest) {
+            await this.#ensureChatParticipantWithRetry();
+        }
         if (!this.chatQueue || !this.legacyChatSubscribed) {
             void this.#discoverLegacyChatQueue();
             return false;
         }
         this.visibilityBootstrapped = false;
         this.#sendVisibilityBootstrap();
+        this.lastEnsureVisibleAt = now;
         this.logger.log(`[IMVU-WS][${this.roomId}] visibility refreshed (${reason})`);
         return true;
     }
@@ -828,5 +848,6 @@ export class ImvuAccountRoomClient extends EventEmitter {
         this.#stopVisibilityHeartbeat();
         this.#stopForceVisibleRefresh();
         this.account.unregisterRoom(this);
+        this.emit('close');
     }
 }

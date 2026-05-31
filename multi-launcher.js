@@ -23,6 +23,75 @@ dotenv.config({ path: path.join(__dirname, '..', 'imvu-bot-laravel', '.env') });
 const API_BASE_URL = backendApiBaseUrl('http://127.0.0.1:8000');
 console.log(`[MULTI-LAUNCHER] Laravel API base (bot→HTTP): ${API_BASE_URL}`);
 
+/** @type {import('child_process').ChildProcess[]} */
+const trackedChildren = [];
+let discordChild = null;
+let intentionalShutdown = false;
+
+function trackChild(child) {
+    if (!child) return child;
+    trackedChildren.push(child);
+    child.once('exit', () => {
+        const i = trackedChildren.indexOf(child);
+        if (i >= 0) trackedChildren.splice(i, 1);
+    });
+    return child;
+}
+
+function shutdownAllChildren(signal = 'SIGTERM') {
+    intentionalShutdown = true;
+    console.log('\n[MULTI-LAUNCHER] Shutting down — stopping bot and Discord child processes…');
+    const toKill = [...trackedChildren];
+    if (discordChild && !discordChild.killed) toKill.push(discordChild);
+    for (const child of toKill) {
+        try {
+            if (!child.killed) child.kill(signal);
+        } catch {
+            /* optional */
+        }
+    }
+    const deadline = Date.now() + 8000;
+    const poll = () => {
+        const alive = trackedChildren.filter((c) => c.exitCode == null && !c.killed);
+        const discordAlive = discordChild && discordChild.exitCode == null && !discordChild.killed;
+        if (!alive.length && !discordAlive) {
+            process.exit(0);
+            return;
+        }
+        if (Date.now() >= deadline) {
+            for (const child of alive) {
+                try {
+                    child.kill('SIGKILL');
+                } catch {
+                    /* optional */
+                }
+            }
+            if (discordAlive) {
+                try {
+                    discordChild.kill('SIGKILL');
+                } catch {
+                    /* optional */
+                }
+            }
+            process.exit(0);
+            return;
+        }
+        setTimeout(poll, 200);
+    };
+    setTimeout(poll, 200);
+}
+
+/** Ctrl+C / SIGTERM — do not auto-restart the bot child. */
+function isGracefulStopExit(code, signal) {
+    if (intentionalShutdown) return true;
+    if (signal === 'SIGINT' || signal === 'SIGTERM') return true;
+    if (code === 130 || code === 143) return true;
+    return false;
+}
+
+process.once('SIGINT', () => shutdownAllChildren('SIGINT'));
+process.once('SIGTERM', () => shutdownAllChildren('SIGTERM'));
+
 /** Comma- or newline-separated proxy URLs; used when a bot row has no `proxy`. */
 function parseProxyPool() {
     const raw = process.env.PROXY_POOL || process.env.PROXY_LIST || '';
@@ -356,6 +425,10 @@ function spawnIsolatedBotChild(botName, roomsArg, proxyUrl, discordRelayPort) {
     });
 }
 
+function spawnIsolatedBotChildTracked(botName, roomsArg, proxyUrl, discordRelayPort) {
+    return trackChild(spawnIsolatedBotChild(botName, roomsArg, proxyUrl, discordRelayPort));
+}
+
 function runBot(botName, roomsArg, launchOpts = {}) {
     const processKey = `${botName}_${roomsArg}`;
     if (activeBots.has(processKey)) return;
@@ -374,7 +447,7 @@ function runBot(botName, roomsArg, launchOpts = {}) {
         `[MULTI-LAUNCHER] child env | BOT_NAME=${botName} | proxy=${proxy ? redactSplitProxyForLog(split) : '(direct)'} | IMVU_DISCORD_RELAY_PORT=${childEnv.IMVU_DISCORD_RELAY_PORT ?? '(unset)'}`
     );
 
-    const child = spawnIsolatedBotChild(botName, roomsArg, proxy, drp);
+    const child = spawnIsolatedBotChildTracked(botName, roomsArg, proxy, drp);
 
     console.log(`[MULTI-LAUNCHER] child pid=${child.pid} BOT_NAME=${botName}`);
 
@@ -384,8 +457,15 @@ function runBot(botName, roomsArg, launchOpts = {}) {
         }
     });
 
-    child.on('exit', (code) => {
+    child.on('exit', (code, signal) => {
         activeBots.delete(processKey);
+
+        if (isGracefulStopExit(code, signal)) {
+            console.log(
+                `[MULTI-LAUNCHER] Bot ${botName} stopped${signal ? ` (${signal})` : code != null ? ` (code ${code})` : ''}.`
+            );
+            return;
+        }
 
         if (code === EXIT_PROXY_ROTATE && launchOpts.rotateFromWebshare) {
             const max = Math.max(1, parseInt(process.env.IMVU_MAX_PROXY_ROTATIONS || '10', 10));
@@ -440,11 +520,13 @@ function startDiscord() {
     if (discordStarted) return;
     discordStarted = true;
 
-    spawn('node', ['discord-server.js'], {
-        cwd: __dirname,
-        stdio: 'inherit',
-        env: { ...process.env },
-    });
+    discordChild = trackChild(
+        spawn('node', ['discord-server.js'], {
+            cwd: __dirname,
+            stdio: 'inherit',
+            env: { ...process.env },
+        })
+    );
 }
 
 function pollIntervalMs() {
@@ -471,7 +553,6 @@ async function run() {
 
     let botsNeedingAuto = 0;
     for (const bot of bots) {
-        if (parseRooms(bot.room_ids).length === 0) continue;
         if (!(bot.proxy && String(bot.proxy).trim())) botsNeedingAuto += 1;
     }
 
@@ -502,13 +583,14 @@ async function run() {
             continue;
         }
         const rooms = parseRooms(bot.room_ids);
-        if (rooms.length === 0) {
-            console.log(`[MULTI-LAUNCHER] ℹ️ Bot [${canonicalName}] has no rooms assigned in dashboard, skipping.`);
-            continue;
-        }
         const { url, source } = resolveProxyForBot(bot.proxy, proxyPool, poolIndex);
         poolIndex += 1;
         seenBotNames.add(canonicalName);
+        if (rooms.length === 0) {
+            console.log(
+                `[MULTI-LAUNCHER] ℹ️ Bot [${canonicalName}] has no rooms — launching idle (listens for DM !join).`
+            );
+        }
         botsToLaunch.push({
             name: canonicalName,
             username: bot.username,
@@ -519,7 +601,7 @@ async function run() {
     }
 
     if (botsToLaunch.length === 0) {
-        console.warn('[MULTI-LAUNCHER] ⚠️ No bots with rooms to launch.');
+        console.warn('[MULTI-LAUNCHER] ⚠️ No active bots to launch.');
         return;
     }
 
@@ -540,7 +622,7 @@ async function run() {
     for (let i = 0; i < botsToLaunch.length; i++) {
         const b = botsToLaunch[i];
         const relayPort = relayPorts[i];
-        console.log(`[MULTI-LAUNCHER] 🚀 Launching [${b.name}] (${b.username}) for rooms: ${b.roomsArg}`);
+        console.log(`[MULTI-LAUNCHER] 🚀 Launching [${b.name}] (${b.username})${b.roomsArg ? ` for rooms: ${b.roomsArg}` : ' (idle — DM !join)'}`);
 
         runBot(b.name, b.roomsArg, {
             proxy: b.proxy,

@@ -1,20 +1,6 @@
-/** LurkBot-style aliases and common typos → canonical command name. */
-const COMMAND_ALIASES = {
-    newgreetings: 'newgreeting',
-    newgreeting: 'newgreeting',
-    autogreeet: 'autogreet',
-    autgreet: 'autogreet',
-    roomcheck: 'roomcheck',
-    maxscaler: 'maxscaler',
-    maxoccupancy: 'maxoccupancy',
-    minage: 'minage',
-    nolurk: 'nolurk',
-    command: 'help',
-    commands: 'help',
-    help: 'help',
-    settings: 'settings',
-    greeting: 'settings',
-};
+import { canonicalCommand } from './catalog.js';
+
+export const JOIN_COMMAND_USAGE = 'Usage: !join <room-id>';
 
 /**
  * Parse `!command` / `*command` room chat lines (case-insensitive command word).
@@ -26,7 +12,7 @@ export function parseRoomCommand(text) {
     const m = raw.match(/^[!*](\w+)(?:\s+(.*))?$/is);
     if (!m) return null;
     const word = m[1].toLowerCase();
-    const cmd = COMMAND_ALIASES[word] || word;
+    const cmd = canonicalCommand(word);
     return {
         cmd,
         args: (m[2] || '').trim(),

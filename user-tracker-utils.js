@@ -57,9 +57,9 @@ export const isImvuRoomChatQueue = (queue) => {
 
 /**
  * When multiple IMVU room tabs share one account WebSocket, the same chat frame can reach every tracker.
- * Only handle chat (mentions, logs) if this frame's queue names our room (e.g. chat-261755692-875-…).
+ * Only handle chat (mentions, logs) if this frame's queue names our room (e.g. chat-{ownerId}-{roomNum}-…).
  * @param {string} queue
- * @param {string} roomId dashboard slug e.g. 261755692-875 or room-261755692-875
+ * @param {string} roomId dashboard slug e.g. {ownerId}-{roomNum} or room-{ownerId}-{roomNum}
  * @param {{ knownChatQueue?: string } | string} [opts] this room's subscribed legacy chat queue, when known
  * @returns {boolean} false when the queue clearly targets a different room or cannot be routed safely
  */
@@ -89,6 +89,43 @@ export const roomQueueBelongsToRoom = (queue, roomId, opts = null) => {
     }
     if (found.length === 0) return false;
     return found.includes(key);
+};
+
+/**
+ * When one account WS serves multiple rooms, a chat frame must not fan out to every tracker.
+ * @param {string} queue
+ * @param {Array<{ roomId?: string }>} targets
+ * @returns {Array<{ roomId?: string }>}
+ */
+export const narrowChatFrameTargets = (queue, targets) => {
+    if (!Array.isArray(targets) || targets.length <= 1) return targets || [];
+
+    const q = String(queue || '');
+    const slugs = [];
+    const re = /(?:chat|room)-(\d+-\d+)/gi;
+    let match;
+    while ((match = re.exec(q)) !== null) {
+        slugs.push(match[1]);
+    }
+
+    if (slugs.length === 1) {
+        const slug = slugs[0];
+        const filtered = targets.filter((room) => {
+            const key = String(room?.roomId || '')
+                .trim()
+                .replace(/^room-/i, '');
+            return key === slug;
+        });
+        if (filtered.length) return filtered;
+    }
+
+    // Legacy numeric /chat/123456 queues: keep only rooms whose subscribed queue matches exactly.
+    if (q.startsWith('/chat/')) {
+        const filtered = targets.filter((room) => String(room?.chatQueue || '') === q);
+        if (filtered.length) return filtered;
+    }
+
+    return [];
 };
 
 export const chatVerbose = () =>

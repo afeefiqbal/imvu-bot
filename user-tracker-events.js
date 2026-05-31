@@ -142,6 +142,11 @@ export const createIncomingMessageHandler = (ctx) => {
         parseInt(String(process.env.IMVU_INITIAL_LEGACY_ROSTER_MS || '12000'), 10) || 12000
     );
     const userLastReply = new Map();
+    const recentRoomCommandKeys = new Map();
+    const ROOM_COMMAND_DEDUPE_MS = Math.max(
+        500,
+        parseInt(String(process.env.IMVU_ROOM_COMMAND_DEDUPE_MS || '2500'), 10) || 2500
+    );
 
     const queueForThisRoom = (queue) =>
         roomQueueBelongsToRoom(queue, ctx.roomId, {
@@ -265,6 +270,7 @@ export const createIncomingMessageHandler = (ctx) => {
                 record === 'msg_g2c_create_mount' &&
                 (mount === 'participants' || mount === 'edge:participants')
             ) {
+                if (queue && !queueForThisRoom(queue)) continue;
                 const hasRosterPayload =
                     Array.isArray(props.items) ||
                     Array.isArray(props.participants) ||
@@ -340,6 +346,7 @@ export const createIncomingMessageHandler = (ctx) => {
             }
 
             if (record === 'msg_g2c_joined_queue' && typeof queue === 'string' && isImvuRoomChatQueue(queue)) {
+                if (!queueForThisRoom(queue)) continue;
                 if (!ctx.state.welcomeArrivalsEnabled) {
                     const avatarId = decodeId(action.user_id);
                     if (avatarId && ctx.isSelfId(avatarId) && !ctx.state.botJoinedChat) {
@@ -456,6 +463,7 @@ export const createIncomingMessageHandler = (ctx) => {
             }
 
             if (record === 'msg_g2c_left_queue' || record === 'msg_g2c_user_exited') {
+                if (queue && isImvuRoomChatQueue(queue) && !queueForThisRoom(queue)) continue;
                 const avatarId = decodeId(action.user_id || action.avatar_id);
                 if (avatarId && ctx.lastUserMap.has(avatarId)) {
                     if (ctx.isSelfId(avatarId)) {
@@ -497,7 +505,6 @@ export const createIncomingMessageHandler = (ctx) => {
                     if (deltaAction === 'deleted' || deltaAction === 'removed') {
                         const username = ctx.lastUserMap.get(avatarId);
                         ctx.lastUserMap.delete(avatarId);
-                        ctx.skipWelcomeAvatarIds.delete(avatarId);
                         ctx.joinQueueBackendAnnounced.delete(avatarId);
                         ctx.activeJoinSessions.delete(avatarId);
                         ctx.cancelPendingWelcome?.(avatarId);
@@ -615,15 +622,39 @@ export const createIncomingMessageHandler = (ctx) => {
                     }
                     if (
                         direction === 'IN' &&
+                        typeof ctx.tryVerificationCodeFromChat === 'function'
+                    ) {
+                        void ctx.tryVerificationCodeFromChat({
+                            senderLabel,
+                            senderId,
+                            text: trimmed,
+                        });
+                    }
+                    if (
+                        direction === 'IN' &&
                         typeof ctx.roomChatCommandHandler === 'function'
                     ) {
+                        const commandDedupeKey = `${ctx.roomId}:${senderId || 'anon'}:${trimmed.toLowerCase()}`;
+                        const commandNow = Date.now();
+                        const lastCommandAt = recentRoomCommandKeys.get(commandDedupeKey) || 0;
+                        if (commandNow - lastCommandAt < ROOM_COMMAND_DEDUPE_MS) {
+                            continue;
+                        }
+                        recentRoomCommandKeys.set(commandDedupeKey, commandNow);
+                        if (recentRoomCommandKeys.size > 400) {
+                            recentRoomCommandKeys.clear();
+                        }
+
                         const handled = await ctx.roomChatCommandHandler({
                             text: trimmed,
                             senderLabel,
                             senderId,
                             isSelf: ctx.isSelfId(senderId),
                         });
-                        if (handled) continue;
+                        if (handled) {
+                            console.log(`[room-cmd][${ctx.roomId}] ${senderLabel || senderId}: ${trimmed.slice(0, 120)}`);
+                            continue;
+                        }
                     }
                     if (
                         direction === 'IN' &&

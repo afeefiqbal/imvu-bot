@@ -192,6 +192,8 @@ export class ImvuRoomWebSocketClient extends EventEmitter {
             queue.startsWith('/chat/') &&
             String(action.user_id || '') === userId
         ) {
+            if (this.closedByUser) return;
+            if (this.chatQueue && this.chatQueue !== queue) return;
             this.logger.warn(`[IMVU-WS][${this.roomId}] left legacy ${queue}; will resubscribe before visible join`);
             this.chatQueue = '';
             this.legacyChatSubscribed = false;
@@ -209,7 +211,7 @@ export class ImvuRoomWebSocketClient extends EventEmitter {
                 );
             }
         }
-        if (queue.startsWith('/chat/')) {
+        if (queue.startsWith('/chat/') && (!this.chatQueue || this.chatQueue === queue)) {
             this.chatQueue = queue;
             if (action.record === 'msg_g2c_joined_queue') {
                 this.#sendVisibilityBootstrap();

@@ -24,9 +24,11 @@ import {
     createRoomChatCommandHandler,
     isLurkEnabledForRoom,
     maybeWarnMinAgeOnJoin,
+    maybeWarnScalerOnJoin,
 } from './room-commands/index.js';
 import { getRoomSettings } from './room-settings/store.js';
 import { registerRoomRuntime, unregisterRoomRuntime } from './room-runtime-registry.js';
+import { tryVerificationCodeFromChat } from './imvu-verification-sync.js';
 
 const envFlag = (name, defaultValue = false) => {
     const raw = process.env[name];
@@ -589,9 +591,11 @@ export async function startUserTracking(page, roomId, options = {}) {
     const freshAccountChecks = new Map();
     const lastSpokeAt = new Map();
     const minAgeWarned = new Set();
+    const scalerWarnedAt = new Map();
     const roomCommandsEnabled = envFlag('IMVU_ROOM_COMMANDS_ENABLED', true);
     let cachedRoomOwnerId = null;
     let cachedRoomModeratorIds = null;
+    let cachedRoomOwnerUsername = null;
 
     const getRoomOwnerId = async () => {
         if (cachedRoomOwnerId !== null) return cachedRoomOwnerId;
@@ -602,10 +606,37 @@ export async function startUserTracking(page, roomId, options = {}) {
         return cachedRoomOwnerId;
     };
 
+    const getRoomOwnerUsername = async () => {
+        if (cachedRoomOwnerUsername !== null) return cachedRoomOwnerUsername;
+        const details = await sessionClient?.fetchRoomDetails?.(roomId);
+        cachedRoomOwnerUsername =
+            welcomeHandleKey(details?.owner_username || details?.owner_avatarname || '') || '';
+        return cachedRoomOwnerUsername;
+    };
+
     const getRoomModeratorIds = async () => {
         if (cachedRoomModeratorIds) return cachedRoomModeratorIds;
         cachedRoomModeratorIds = new Set((await sessionClient?.fetchRoomModeratorIds?.(roomId)) || []);
         return cachedRoomModeratorIds;
+    };
+
+    const canUseRoomManageCommand = async ({ senderId, senderLabel }) => {
+        const sid = senderId != null ? String(senderId) : '';
+        const ownerId = String(await getRoomOwnerId());
+        if (sid && ownerId && sid === ownerId) return true;
+        if (sid && (await getRoomModeratorIds()).has(sid)) return true;
+
+        const handleKey = welcomeHandleKey(senderLabel);
+        if (!handleKey) return false;
+        if (handleKey === (await getRoomOwnerUsername())) return true;
+
+        const moderators = await sessionClient?.fetchRoomModerators?.(roomId);
+        if (Array.isArray(moderators)) {
+            for (const mod of moderators) {
+                if (welcomeHandleKey(mod?.username || mod?.avatarname) === handleKey) return true;
+            }
+        }
+        return false;
     };
 
     const canUseKickCommand = async ({ senderId, senderLabel }) => {
@@ -655,7 +686,6 @@ export async function startUserTracking(page, roomId, options = {}) {
         suppressAvatarChat(avatarId);
         cancelPendingWelcome(avatarId);
         lastUserMap.delete(avatarId);
-        skipWelcomeAvatarIds.delete(avatarId);
         joinQueueBackendAnnounced.delete(avatarId);
         activeJoinSessions.delete(avatarId);
         processedJoins.delete(avatarId);
@@ -669,7 +699,7 @@ export async function startUserTracking(page, roomId, options = {}) {
         const logPrefix = reason === 'autoboot' ? '[AUTOBOOT]' : '[KICK]';
         if (!/^\d+$/.test(avatarId)) return false;
         if (isSelfId(avatarId)) {
-            if (reply) await sendMessage('(bot) Cannot kick myself.');
+            if (reply) await sendMessage('Cannot kick myself.');
             return true;
         }
         suppressAvatarChat(avatarId);
@@ -710,8 +740,8 @@ export async function startUserTracking(page, roomId, options = {}) {
             if (reply) {
                 await sendMessage(
                     removed
-                        ? `(bot) Removed ${label}.`
-                        : `(bot) Kick failed for ${label}; IMVU did not remove them.`
+                        ? `Removed ${label}.`
+                        : `Kick failed for ${label}; IMVU did not remove them.`
                 );
             }
             if (!removed) {
@@ -824,13 +854,13 @@ export async function startUserTracking(page, roomId, options = {}) {
 
         if (!(await canUseKickCommand({ senderId, senderLabel }))) {
             console.log(`[KICK] refused command from ${senderLabel || senderId || 'unknown'} in room ${roomId}`);
-            await sendMessage('(bot) Kick command refused; only configured commanders, room owner, or room mods can use it.');
+            await sendMessage('Kick command refused; only configured commanders, room owner, or room mods can use it.');
             return true;
         }
 
         const target = findRosterEntryByHandle(lastUserMap, parsed.handle);
         if (!target) {
-            await sendMessage(`(bot) No one in this room matches "${parsed.handle}".`);
+            await sendMessage(`No one in this room matches "${parsed.handle}".`);
             return true;
         }
 
@@ -938,6 +968,14 @@ export async function startUserTracking(page, roomId, options = {}) {
                 minAgeWarned,
                 sendMessage,
             });
+            void maybeWarnScalerOnJoin({
+                roomId,
+                avatarId,
+                displayName,
+                sessionClient,
+                scalerWarnedAt,
+                sendMessage,
+            });
             return true;
         }
         const welcomeTimer = setTimeout(async () => {
@@ -961,6 +999,14 @@ export async function startUserTracking(page, roomId, options = {}) {
                     displayName,
                     sessionClient,
                     minAgeWarned,
+                    sendMessage,
+                });
+                void maybeWarnScalerOnJoin({
+                    roomId,
+                    avatarId,
+                    displayName,
+                    sessionClient,
+                    scalerWarnedAt,
                     sendMessage,
                 });
 
@@ -998,13 +1044,19 @@ export async function startUserTracking(page, roomId, options = {}) {
             sendMessage,
             getRoomName: () => ROOM_NAME,
             getSelfUserId: () => (state.selfUserId != null ? String(state.selfUserId) : null),
-            canUseRoomCommand: canUseKickCommand,
+            canUseRoomCommand: canUseRoomManageCommand,
+            watchDirectMessageUser:
+                typeof sessionClient?.watchDirectMessageUser === 'function'
+                    ? (userId) => sessionClient.watchDirectMessageUser(userId)
+                    : undefined,
             sessionClient,
+            getRoomModerators: async () => sessionClient?.fetchRoomModerators?.(roomId) || [],
             lastUserMap,
             lastSpokeAt,
             minAgeWarned,
+            scalerWarnedAt,
         });
-        console.log(`${syncLogPrefix} room commands on (!move !newgreeting !autogreet !scale !roomcheck !nolurk …)`);
+        console.log(`${syncLogPrefix} room commands on (!help !info !roomid !move …)`);
     }
 
     const handleIncomingMessage = createIncomingMessageHandler({
@@ -1045,6 +1097,13 @@ export async function startUserTracking(page, roomId, options = {}) {
         triggerCountUpdate,
         welcomeByHandleLastAt,
         welcomeTimestamps,
+        tryVerificationCodeFromChat: ({ senderLabel, senderId, text }) =>
+            tryVerificationCodeFromChat({
+                senderLabel,
+                senderId,
+                text,
+                botName: syncBotName || syncBotUsername || BOT_USERNAME,
+            }),
     });
 
     let roomNameRetries = 0;

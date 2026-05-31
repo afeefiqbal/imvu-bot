@@ -3,7 +3,7 @@ import { normalizeImvuUsername, normalizeRoomApiSlug } from './user-tracker-util
 const KICK_RE = /^!(?:kick|boot)\s+(.+)$/i;
 const KICK_SLASH_RE = /^\/(?:kick|boot)\s+(.+)$/i;
 
-/** First numeric segment of room id `261755692-875` → legacy *boot arg (may be product id, not avatar CID). */
+/** First numeric segment of room id `{ownerId}-{roomNum}` → legacy *boot arg (may be product id, not avatar CID). */
 export const roomBootOwnerIdFromRoomId = (roomId) => {
     const s = String(roomId ?? '')
         .trim()
@@ -342,7 +342,7 @@ export async function tryHandleDiscordRelayMessage(ctx) {
 
     const self = selfUserId != null ? String(selfUserId) : '';
     if (!/^\d+$/.test(self)) {
-        await reply('(bot) Cannot kick yet — session id not ready.');
+        await reply('Cannot kick yet — session id not ready.');
         console.log(`${logPrefix} no selfUserId`);
         return { handled: true };
     }
@@ -364,7 +364,7 @@ export async function tryHandleDiscordRelayMessage(ctx) {
 
     if (!isOwner && !isModListed && !bypassMod) {
         await reply(
-            '(bot) Discord kick refused — could not confirm moderator status (room/chat moderators API). Owner short-id also does not match this account. Set IMVU_DISCORD_KICK_SKIP_MOD_CHECK=1 only if you accept the risk.'
+            'Discord kick refused — could not confirm moderator status (room/chat moderators API). Owner short-id also does not match this account. Set IMVU_DISCORD_KICK_SKIP_MOD_CHECK=1 only if you accept the risk.'
         );
         console.log(
             `${logPrefix} not moderator; self=${self} roomKey=${ownerIdFromRoomKey} apiOwner=${ownerCidFromApi || '—'} mods=${modIds.slice(0, 12).join(',')}`
@@ -374,20 +374,20 @@ export async function tryHandleDiscordRelayMessage(ctx) {
 
     const target = findRosterEntryByHandle(lastUserMap, parsed.handle);
     if (!target) {
-        await reply(`(bot) No one in this room matches "${parsed.handle}" (check spelling / roster).`);
+        await reply(`No one in this room matches "${parsed.handle}" (check spelling / roster).`);
         console.log(`${logPrefix} no roster match for`, parsed.handle);
         return { handled: true };
     }
 
     if (target.avatarId === self) {
-        await reply('(bot) Cannot kick myself.');
+        await reply('Cannot kick myself.');
         return { handled: true };
     }
 
     const bootPrimary =
         (ownerCidFromApi && String(ownerCidFromApi)) || (ownerIdFromRoomKey && String(ownerIdFromRoomKey)) || null;
     if (!bootPrimary) {
-        await reply('(bot) Cannot resolve *boot owner id (room API + room id).');
+        await reply('Cannot resolve *boot owner id (room API + room id).');
         console.log(`${logPrefix} bad room id`, roomId);
         return { handled: true };
     }
@@ -475,7 +475,7 @@ export async function tryHandleDiscordRelayMessage(ctx) {
         } else if (triedRest) {
             detail += ' REST participant DELETE did not succeed; see bot console for HTTP statuses.';
         }
-        await reply(`(bot) Kick did not complete — ${detail}`);
+        await reply(`Kick did not complete — ${detail}`);
     } else {
         console.log(`${logPrefix} roster no longer shows ${target.label} (${target.avatarId})`);
     }

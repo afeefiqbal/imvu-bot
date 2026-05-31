@@ -209,8 +209,15 @@ function extractParticipantData(payload, roomId, userId) {
 
     const participantUrl = `${DEFAULT_API_ORIGIN}/chat/chat-${roomId}/participants/user-${userId}`;
     const direct = denormalized[participantUrl]?.data;
-    if (direct && typeof direct === 'object') return direct;
+    if (direct && typeof direct === 'object' && direct.seat_number != null) return direct;
 
+    for (const [key, entry] of Object.entries(denormalized)) {
+        if (!key.includes(`/participants/user-${userId}`)) continue;
+        const data = entry?.data;
+        if (data && typeof data === 'object' && data.seat_number != null) return data;
+    }
+
+    if (direct && typeof direct === 'object') return direct;
     for (const [key, entry] of Object.entries(denormalized)) {
         if (key.endsWith(`/chat/chat-${roomId}/participants/user-${userId}`) && entry?.data) {
             return entry.data;
@@ -265,6 +272,7 @@ function profileUrlForUsername(username) {
 export function createImvuSessionClient({ bot = {}, agents = {}, logger = console } = {}) {
     const jar = new CookieJar();
     let loginResponseData = null;
+    let cachedBotUserId = findBotImvuUserId(bot) || null;
     let imvuSauce = String(process.env.IMVU_X_SAUCE || process.env.IMVU_SAUCE || '').trim();
     const client = wrapper(
         axios.create({
@@ -390,17 +398,43 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
     async function fetchApiUserId() {
         const username = String(bot.username || '').trim();
         if (!username) return null;
+        return resolveUserIdFromUsername(username, { log: true });
+    }
+
+    async function resolveUserIdFromUsername(username, options = {}) {
+        const name = String(username || '').trim();
+        if (!name) return null;
+        const shouldLog = options.log === true;
         try {
-            const json = await apiGet(`/user?username=${encodeURIComponent(username)}`);
+            const json = await apiGet(`/user?username=${encodeURIComponent(name)}`);
             const userId = findNumericUserId(json) || extractNumericUserIdFromText(JSON.stringify(json));
-            if (userId) {
-                logger.log(`[IMVU-SESSION] Resolved IMVU user id from user lookup API.`);
+            if (userId && shouldLog) {
+                logger.log(`[IMVU-SESSION] Resolved IMVU user id for ${name}.`);
             }
             return userId;
         } catch (error) {
-            logger.warn(`[IMVU-SESSION] Could not resolve API user id: ${error.message}`);
+            if (shouldLog) {
+                logger.warn(`[IMVU-SESSION] Could not resolve user id for ${name}: ${error.message}`);
+            }
             return null;
         }
+    }
+
+    async function resolveBotUserId() {
+        if (cachedBotUserId && /^\d+$/.test(String(cachedBotUserId))) {
+            return String(cachedBotUserId);
+        }
+        const fromBot = findBotImvuUserId(bot);
+        if (fromBot) {
+            cachedBotUserId = fromBot;
+            return fromBot;
+        }
+        const fromLogin = findNumericUserId(loginResponseData);
+        if (fromLogin) {
+            cachedBotUserId = fromLogin;
+            return fromLogin;
+        }
+        return null;
     }
 
     async function resolveImqIdentity() {
@@ -414,6 +448,9 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
             findBotImvuUserId(bot) ||
             (await fetchApiUserId()) ||
             (await fetchProfileUserId());
+        if (userId) {
+            cachedBotUserId = String(userId);
+        }
         return {
             userId,
             connectCookie,
@@ -629,23 +666,100 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         for (const child of Object.values(o)) collectWearableNameStrings(child, out, seen);
     }
 
-    async function apiGetWearableNames(userId) {
-        const id = String(userId || '').trim();
-        if (!/^\d+$/.test(id)) return [];
-        const names = new Set();
-        try {
-            collectWearableNameStrings(await apiGet(`/user/user-${id}`), names);
-        } catch {
-            /* optional */
+    function collectScalerPercentsFromApi(value, out, seen = new Set()) {
+        if (value == null) return;
+        if (typeof value === 'number') return;
+        if (typeof value !== 'object' || seen.has(value)) return;
+        seen.add(value);
+        if (Array.isArray(value)) {
+            for (const item of value) collectScalerPercentsFromApi(item, out, seen);
+            return;
         }
-        for (const path of [`/inventory/outfit-${id}-1`, `/inventory/outfit-${id}-2`]) {
+        const o = /** @type {Record<string, unknown>} */ (value);
+        for (const [key, raw] of Object.entries(o)) {
+            if (typeof raw === 'number' && /scale|scaler|height/i.test(key)) {
+                const pct = raw > 0 && raw <= 5 ? Math.round(raw * 100) : Math.round(raw);
+                if (pct >= 50 && pct <= 500) out.add(pct);
+            }
+            collectScalerPercentsFromApi(raw, out, seen);
+        }
+    }
+
+    async function apiGetWearableScan(userId) {
+        const id = String(userId || '').trim();
+        if (!/^\d+$/.test(id)) return { names: [], scalePercents: [] };
+        const names = new Set();
+        const scalePercents = new Set();
+        const paths = [
+            `/user/user-${id}`,
+            `/inventory/outfit_list-${id}-1`,
+            `/inventory/outfit-${id}-1`,
+            `/inventory/outfit-${id}-2`,
+        ];
+        for (const path of paths) {
             try {
-                collectWearableNameStrings(await apiGet(path), names);
+                const json = await apiGet(path);
+                collectWearableNameStrings(json, names);
+                collectScalerPercentsFromApi(json, scalePercents);
             } catch {
                 /* optional */
             }
         }
-        return [...names].filter(Boolean);
+        return {
+            names: [...names].filter(Boolean),
+            scalePercents: [...scalePercents],
+        };
+    }
+
+    async function apiGetWearableNames(userId) {
+        const scan = await apiGetWearableScan(userId);
+        return scan.names;
+    }
+
+    function looksLikeUrlField(key, value) {
+        if (typeof value !== 'string' || value === '') return false;
+        if (!value.startsWith('http') && !value.startsWith('//')) return false;
+        const k = String(key);
+        return k.includes('url') || k.includes('image') || k.endsWith('_link');
+    }
+
+    function absoluteUrl(url) {
+        const trimmed = String(url || '').trim();
+        if (trimmed.startsWith('//')) return `https:${trimmed}`;
+        return trimmed;
+    }
+
+    function normalizeUserProfile(data) {
+        const profile = {};
+        for (const [key, value] of Object.entries(data)) {
+            if (typeof value === 'string' && looksLikeUrlField(key, value)) {
+                profile[key] = absoluteUrl(value);
+            } else {
+                profile[key] = value;
+            }
+        }
+        if (profile.legacy_cid != null) {
+            profile.legacy_cid = Number(profile.legacy_cid);
+        }
+        profile.is_guest = Boolean(
+            profile.is_guest ||
+                profile.persona_type === 0 ||
+                /^guest_/i.test(firstString(profile.username, profile.display_name))
+        );
+        return profile;
+    }
+
+    async function fetchFullUserProfile(userId) {
+        const id = String(userId || '').trim();
+        if (!/^\d+$/.test(id)) return null;
+        try {
+            const json = await apiGet(`/user/user-${id}`);
+            const data = extractDenormalizedData(json);
+            if (!data || typeof data !== 'object') return null;
+            return normalizeUserProfile(data);
+        } catch {
+            return null;
+        }
     }
 
     async function fetchUserProfile(userId) {
@@ -693,6 +807,7 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         const normalizedUserId = String(userId || '').trim();
         if (!/^\d+-\d+$/.test(normalizedRoomId) || !/^\d+$/.test(normalizedUserId)) return null;
 
+        const resolvedSauce = sauce || (await resolveImvuSauce());
         const response = await client.get(
             new URL(
                 `chat/chat-${normalizedRoomId}/participants/user-${normalizedUserId}`,
@@ -704,7 +819,7 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                     Origin: process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN,
                     Referer: `${process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN}/next/chat/room-${normalizedRoomId}/`,
                     'X-IMVU-Application': process.env.IMVU_X_APPLICATION || 'next_desktop/1',
-                    ...(sauce ? { 'X-IMVU-Sauce': sauce } : {}),
+                    ...(resolvedSauce ? { 'X-IMVU-Sauce': resolvedSauce } : {}),
                 },
                 validateStatus: (status) => status >= 200 && status < 500,
             }
@@ -1309,6 +1424,926 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         }
     }
 
+    async function apiPost(path, body = {}, options = {}) {
+        const url = /^https?:\/\//i.test(String(path))
+            ? String(path)
+            : new URL(String(path).replace(/^\/+/, ''), `${DEFAULT_API_ORIGIN}/`).href;
+        const response = await client.post(url, body, {
+            ...options,
+            headers: {
+                Accept: 'application/json',
+                'Content-Type': 'application/json',
+                Origin: process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN,
+                Referer: `${process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN}/`,
+                ...(options.headers || {}),
+            },
+            validateStatus: (status) => status >= 200 && status < 500,
+        });
+        return response;
+    }
+
+    async function buildImvuApiHeaders(extra = {}) {
+        const sauce = await resolveImvuSauce();
+        return {
+            Accept: 'application/json; charset=utf-8',
+            'Content-Type': 'application/json; charset=UTF-8',
+            Origin: process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN,
+            Referer: `${process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN}/`,
+            'X-IMVU-Application': process.env.IMVU_X_APPLICATION || 'next_desktop/1',
+            ...(sauce ? { 'X-IMVU-Sauce': sauce } : {}),
+            ...extra,
+        };
+    }
+
+    async function buildImvuActivityHeaders(extra = {}) {
+        const webOrigin = process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN;
+        const sauce = await resolveImvuSauce();
+        return {
+            Accept: 'application/json; charset=utf-8',
+            Origin: webOrigin,
+            Referer: `${webOrigin}/next/home/`,
+            'X-IMVU-Application': process.env.IMVU_X_APPLICATION || 'next_desktop/1',
+            ...(sauce ? { 'X-IMVU-Sauce': sauce } : {}),
+            ...extra,
+        };
+    }
+
+    function parseImvuApiFailure(payload) {
+        if (!payload || typeof payload !== 'object') return null;
+        const error = String(payload.error || '').trim();
+        const message = String(payload.message || '').trim();
+        if (!error && !message) return null;
+        return { error, message };
+    }
+
+    async function sendFriendRequest(targetUserId, targetUsername = '') {
+        const botId = await resolveBotUserId();
+        const targetId = String(targetUserId || '').trim();
+        if (!botId || !/^\d+$/.test(targetId)) {
+            return { ok: false, reason: 'invalid ids' };
+        }
+        try {
+            const refererUsername = String(targetUsername || '').trim();
+            const headers = await buildImvuApiHeaders({
+                Referer: refererUsername
+                    ? `${process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN}/next/av/${encodeURIComponent(refererUsername)}/`
+                    : `${process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN}/`,
+            });
+            const response = await apiPost(
+                `/user/user-${botId}/outbound_friend_requests`,
+                { id: `${DEFAULT_API_ORIGIN}/user/user-${targetId}` },
+                { headers }
+            );
+            if (response.status >= 200 && response.status < 300) {
+                logger.log(`[IMVU-SESSION] Sent friend request to user-${targetId}.`);
+                return { ok: true };
+            }
+            return {
+                ok: false,
+                reason: `status ${response.status}${summarizeResponseData(response.data)}`,
+            };
+        } catch (error) {
+            return { ok: false, reason: error.message || 'friend-request-failed' };
+        }
+    }
+
+    const watchedConversationPaths = new Set();
+    const watchedDmUserIds = new Set();
+    /** Users checked — no conversation exists yet; skip repeat API lookups. */
+    const dmConversationAbsentUserIds = new Set();
+
+    function extractConversationId(value) {
+        const match = String(value || '').match(/conversation-\d+/i);
+        return match ? match[0] : '';
+    }
+
+    function denormPathSuffix(value) {
+        return String(value || '')
+            .trim()
+            .replace(/^https?:\/\/[^/]+/i, '')
+            .replace(/^\/+/, '');
+    }
+
+    function denormGet(denorm, key) {
+        if (!denorm || !key) return null;
+        if (denorm[key]) return denorm[key];
+        const suffix = denormPathSuffix(key);
+        if (!suffix) return null;
+        for (const [candidateKey, candidateValue] of Object.entries(denorm)) {
+            if (denormPathSuffix(candidateKey) === suffix) return candidateValue;
+        }
+        return null;
+    }
+
+    function extractUserIdFromImvuRef(value) {
+        const match = String(value || '').match(/(?:user-|users\/)(\d+)/i);
+        return match ? match[1] : null;
+    }
+
+    function rememberConversationRef(value, botId) {
+        const convId = extractConversationId(value);
+        if (!convId || !botId) return;
+        watchedConversationPaths.add(`user/user-${botId}/conversations/${convId}`);
+    }
+
+    function watchDirectMessageUser(userId) {
+        const id = String(userId || '').trim();
+        if (/^\d+$/.test(id)) {
+            watchedDmUserIds.add(id);
+            dmConversationAbsentUserIds.delete(id);
+        }
+    }
+
+    function getWatchedDirectMessageUserIds() {
+        return [...watchedDmUserIds];
+    }
+
+    async function watchRoomDmContacts(roomId) {
+        const normalizedRoomId = String(roomId || '')
+            .trim()
+            .replace(/^room-/i, '');
+        if (!normalizedRoomId) return;
+
+        const ids = new Set();
+        try {
+            const ownerId = await fetchRoomOwnerId(normalizedRoomId);
+            if (ownerId) ids.add(String(ownerId));
+        } catch {
+            /* optional */
+        }
+        try {
+            for (const modId of await fetchRoomModeratorIds(normalizedRoomId)) {
+                if (modId) ids.add(String(modId));
+            }
+        } catch {
+            /* optional */
+        }
+
+        for (const id of ids) watchDirectMessageUser(id);
+    }
+
+    async function listAcceptedFriendUserIds() {
+        const botId = await resolveBotUserId();
+        if (!botId) return [];
+
+        try {
+            const headers = await buildImvuApiHeaders();
+            const url = new URL(`user/user-${botId}/friends?limit=100`, `${DEFAULT_API_ORIGIN}/`).href;
+            const response = await client.get(url, {
+                headers: { Accept: 'application/json; charset=utf-8', ...headers },
+                validateStatus: (status) => status >= 200 && status < 500,
+            });
+            if (response.status < 200 || response.status >= 300) return [];
+
+            const denorm = response.data?.denormalized || {};
+            const ids = new Set();
+            for (const key of Object.keys(denorm)) {
+                const match = key.match(/\/(?:friends\/)?user-(\d+)/i);
+                if (match && match[1] !== String(botId)) ids.add(match[1]);
+            }
+
+            const listKey = Object.keys(denorm).find(
+                (key) => key.includes('/friends') && !/\/friends\/user-/i.test(key)
+            );
+            const items = listKey ? denorm[listKey]?.data?.items : null;
+            if (Array.isArray(items)) {
+                for (const itemUrl of items) {
+                    const userId = extractUserIdFromImvuRef(itemUrl);
+                    if (userId && userId !== String(botId)) ids.add(userId);
+                }
+            }
+
+            return [...ids];
+        } catch (error) {
+            logger.warn(`[IMVU-SESSION] listAcceptedFriendUserIds failed: ${error.message}`);
+            return [];
+        }
+    }
+
+    async function refreshDirectMessageWatchList(roomIds = []) {
+        const normalizedRooms = [...new Set(
+            (Array.isArray(roomIds) ? roomIds : [])
+                .map((roomId) =>
+                    String(roomId || '')
+                        .trim()
+                        .replace(/^room-/i, '')
+                )
+                .filter(Boolean)
+        )];
+
+        for (const roomId of normalizedRooms) {
+            await watchRoomDmContacts(roomId).catch(() => {});
+        }
+
+        return watchedDmUserIds.size;
+    }
+
+    function conversationMessageFromData(data, botId, detailDenorm, convKey) {
+        const lastMessage = data?.last_message;
+        const text = Array.isArray(lastMessage?.payloads)
+            ? lastMessage.payloads
+                  .map((entry) => (entry?.type === 'text' ? String(entry.content || '') : ''))
+                  .filter(Boolean)
+                  .join(' ')
+                  .trim()
+            : '';
+        const sentBy = String(lastMessage?.sent_by || lastMessage?.sender || '');
+        if (!text || sentBy.includes(`/user-${botId}`)) return null;
+
+        const senderMatch =
+            sentBy.match(/user-(\d+)/i) ||
+            String(lastMessage?.sender || '').match(/users\/(\d+)/i);
+        const participants = Array.isArray(data?.participants) ? data.participants : [];
+        const other = participants.find((entry) => {
+            const user = String(entry?.user || '');
+            return user.includes('/user/') && !user.includes(`/user-${botId}`);
+        });
+
+        let senderUsername = String(other?.name || other?.username || '').trim();
+        if (!senderUsername && other?.user) {
+            const userKey = String(other.user);
+            const userData = detailDenorm[userKey]?.data;
+            if (userData && typeof userData === 'object') {
+                senderUsername = String(userData.username || userData.display_name || '').trim();
+            }
+        }
+
+        return {
+            messageId: String(lastMessage?.message_id || `${convKey}:${text}`),
+            text,
+            senderUserId: senderMatch ? senderMatch[1] : null,
+            senderUsername,
+        };
+    }
+
+    function parseInboundMessageRecord(messageData, botId, detailDenorm, convKey, participants = []) {
+        const text = Array.isArray(messageData?.payloads)
+            ? messageData.payloads
+                  .map((entry) => (entry?.type === 'text' ? String(entry.content || '') : ''))
+                  .filter(Boolean)
+                  .join(' ')
+                  .trim()
+            : '';
+        const sentBy = String(messageData?.sent_by || messageData?.sender || '');
+        if (!text || sentBy.includes(`/user-${botId}`)) return null;
+
+        const senderMatch = sentBy.match(/user-(\d+)/i) || String(messageData?.sender || '').match(/users\/(\d+)/i);
+        const roster = Array.isArray(participants) ? participants : [];
+        const other = roster.find((entry) => {
+            const user = String(entry?.user || '');
+            return user.includes('/user/') && !user.includes(`/user-${botId}`);
+        });
+
+        let senderUsername = String(other?.name || other?.username || '').trim();
+        const senderUserId = senderMatch ? senderMatch[1] : null;
+        if (!senderUsername && senderUserId) {
+            for (const [key, value] of Object.entries(detailDenorm || {})) {
+                if (!key.includes(`/users/${senderUserId}`) && !key.includes(`/user-${senderUserId}`)) continue;
+                const userData = value?.data;
+                if (userData && typeof userData === 'object') {
+                    senderUsername = String(userData.username || userData.display_name || '').trim();
+                    if (senderUsername) break;
+                }
+            }
+        }
+
+        return {
+            messageId: String(messageData?.message_id || `${convKey}:${text}`),
+            text,
+            senderUserId,
+            senderUsername,
+        };
+    }
+
+    async function directMessageHeaders(extra = {}) {
+        return buildImvuApiHeaders({
+            Referer: `${process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN}/next/messages/`,
+            ...extra,
+        });
+    }
+
+    async function resolveConversationIdBetweenUsers(botId, targetUserId, headers) {
+        const targetId = String(targetUserId || '').trim();
+        if (!/^\d+$/.test(targetId)) return null;
+
+        const participantPairs = [
+            [botId, targetId],
+            [targetId, botId],
+        ];
+
+        try {
+            const msgHeaders = headers || (await directMessageHeaders());
+            for (const [leftId, rightId] of participantPairs) {
+                const participants = [
+                    `${DEFAULT_API_ORIGIN}/user/user-${leftId}`,
+                    `${DEFAULT_API_ORIGIN}/user/user-${rightId}`,
+                ].join(',');
+                const listUrl = new URL(
+                    `conversation?participants=${encodeURIComponent(participants)}`,
+                    `${DEFAULT_API_ORIGIN}/`
+                ).href;
+
+                const response = await client.get(listUrl, {
+                    headers: { Accept: 'application/json; charset=utf-8', ...msgHeaders },
+                    validateStatus: (status) => status >= 200 && status < 500,
+                });
+                if (response.status < 200 || response.status >= 300) continue;
+
+                const denorm = response.data?.denormalized || {};
+                for (const value of Object.values(denorm)) {
+                    const items = value?.data?.items;
+                    if (!Array.isArray(items) || !items.length) continue;
+                    const convId = extractConversationId(String(items[0]));
+                    if (convId) {
+                        rememberConversationRef(convId, botId);
+                        return convId;
+                    }
+                }
+            }
+        } catch (error) {
+            logger.warn(`[IMVU-SESSION] resolveConversationIdBetweenUsers failed: ${error.message}`);
+        }
+        return null;
+    }
+
+    async function fetchConversationInboundMessages(botId, convId, headers, limit = 10) {
+        const normalizedConvId = extractConversationId(convId) || String(convId || '').trim();
+        if (!normalizedConvId.includes('conversation-')) return [];
+
+        const msgHeaders = headers || (await directMessageHeaders());
+        const listUrl = new URL(`conversation/${normalizedConvId}/messages`, `${DEFAULT_API_ORIGIN}/`).href;
+
+        try {
+            const response = await client.get(listUrl, {
+                headers: { Accept: 'application/json; charset=utf-8', ...msgHeaders },
+                validateStatus: (status) => status >= 200 && status < 500,
+            });
+            if (response.status < 200 || response.status >= 300) return [];
+
+            const denorm = response.data?.denormalized || {};
+            let items = [];
+            for (const [key, value] of Object.entries(denorm)) {
+                if (key.endsWith('/messages') && Array.isArray(value?.data?.items)) {
+                    items = value.data.items;
+                    break;
+                }
+            }
+
+            const detail = await fetchConversationDetail(botId, normalizedConvId, msgHeaders);
+            const participants = detail?.data?.participants || [];
+            const convKey = detail?.convKey || normalizedConvId;
+            const results = [];
+            const seen = new Set();
+
+            for (const itemUrl of items.slice(0, Math.max(1, limit))) {
+                const wrapperKey = String(itemUrl);
+                const wrapper = denormGet(denorm, wrapperKey);
+                const ref = String(wrapper?.relations?.ref || wrapperKey);
+                const msgData = denormGet(denorm, ref)?.data;
+                if (!msgData) continue;
+
+                const parsed = parseInboundMessageRecord(msgData, botId, denorm, convKey, participants);
+                if (!parsed || seen.has(parsed.messageId)) continue;
+                seen.add(parsed.messageId);
+                results.push(parsed);
+            }
+
+            return results;
+        } catch (error) {
+            logger.warn(`[IMVU-SESSION] fetchConversationInboundMessages failed: ${error.message}`);
+            return [];
+        }
+    }
+
+    function mergeConversationRefsFromDenorm(denorm, botId, refs) {
+        for (const [key, value] of Object.entries(denorm || {})) {
+            if (!key.includes('/conversation-')) continue;
+            rememberConversationRef(key, botId);
+            if (value?.data?.last_message) {
+                refs.set(key, { inline: true, data: value.data, detailDenorm: denorm, convKey: key });
+                continue;
+            }
+            refs.set(key, { inline: false });
+        }
+    }
+
+    async function fetchConversationDetail(botId, convId, headers) {
+        const conv = String(convId || '').trim();
+        if (!conv.includes('conversation-')) return null;
+
+        const msgHeaders = await buildImvuApiHeaders({
+            Referer: `${process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN}/next/messages/`,
+            ...(headers || {}),
+        });
+        const normalizedConvId = extractConversationId(conv) || conv.replace(/^\/+/, '');
+        const paths = [
+            `conversation/${normalizedConvId}`,
+            `user/user-${botId}/conversations/${normalizedConvId}?limit=0`,
+        ];
+
+        for (const path of paths) {
+            try {
+                const detailUrl = new URL(path.replace(/^\/+/, ''), `${DEFAULT_API_ORIGIN}/`).href;
+                const detailResponse = await client.get(detailUrl, {
+                    headers: { Accept: 'application/json; charset=utf-8', ...msgHeaders },
+                    validateStatus: (status) => status >= 200 && status < 500,
+                });
+                if (detailResponse.status < 200 || detailResponse.status >= 300) continue;
+
+                const detailDenorm = detailResponse.data?.denormalized || {};
+                const convKey = Object.keys(detailDenorm).find((key) => key.includes('/conversation-'));
+                const data = convKey ? detailDenorm[convKey]?.data : null;
+                if (!data) continue;
+                rememberConversationRef(convKey || conv, botId);
+                return { data, detailDenorm, convKey: convKey || conv };
+            } catch {
+                /* try next path */
+            }
+        }
+        return null;
+    }
+
+    async function openDirectConversationWithUser(botId, targetUserId, headers) {
+        const targetId = String(targetUserId || '').trim();
+        if (!/^\d+$/.test(targetId) || targetId === String(botId)) return null;
+
+        const msgHeaders = headers || (await directMessageHeaders());
+
+        try {
+            const convId = await resolveConversationIdBetweenUsers(botId, targetId, msgHeaders);
+            if (!convId) {
+                dmConversationAbsentUserIds.add(targetId);
+                return null;
+            }
+
+            const detail = await fetchConversationDetail(botId, convId, msgHeaders);
+            if (!detail) return null;
+
+            const inboundMessages = await fetchConversationInboundMessages(
+                botId,
+                convId,
+                msgHeaders,
+                30
+            );
+            return { ...detail, convId, inboundMessages };
+        } catch (error) {
+            logger.warn(`[IMVU-SESSION] Open DM with user-${targetId} failed: ${error.message}`);
+        }
+        return null;
+    }
+
+    async function listDirectMessagesFromWatchedUsers(botId, headers, limit) {
+        const messages = [];
+        const seenMessageIds = new Set();
+
+        for (const userId of watchedDmUserIds) {
+            if (messages.length >= limit) break;
+            if (String(userId) === String(botId)) continue;
+            if (dmConversationAbsentUserIds.has(String(userId))) continue;
+
+            const opened = await openDirectConversationWithUser(botId, userId, headers);
+            if (!opened) continue;
+
+            const inbound = Array.isArray(opened.inboundMessages) ? opened.inboundMessages : [];
+            if (inbound.length) {
+                for (const parsed of inbound) {
+                    if (!parsed || seenMessageIds.has(parsed.messageId)) continue;
+                    seenMessageIds.add(parsed.messageId);
+                    if (parsed.senderUserId) watchDirectMessageUser(parsed.senderUserId);
+                    messages.push(parsed);
+                    if (messages.length >= limit) break;
+                }
+                continue;
+            }
+
+            const parsed = conversationMessageFromData(
+                opened.data,
+                botId,
+                opened.detailDenorm,
+                opened.convKey
+            );
+            if (!parsed || seenMessageIds.has(parsed.messageId)) continue;
+
+            seenMessageIds.add(parsed.messageId);
+            if (parsed.senderUserId) watchDirectMessageUser(parsed.senderUserId);
+            messages.push(parsed);
+        }
+
+        return messages;
+    }
+
+    async function fetchConversationListRefs(botId, headers, limit) {
+        const refs = new Map();
+        const pageSize = Math.max(1, Math.min(limit, 50));
+        const queryVariants = [`limit=${pageSize}`, `limit=${pageSize}&offset=0`];
+
+        for (const query of queryVariants) {
+            const listUrl = new URL(`user/user-${botId}/conversations?${query}`, `${DEFAULT_API_ORIGIN}/`).href;
+            const listResponse = await client.get(listUrl, {
+                headers: { Accept: 'application/json; charset=utf-8', ...headers },
+                validateStatus: (status) => status >= 200 && status < 500,
+            });
+            if (listResponse.status < 200 || listResponse.status >= 300) continue;
+
+            const denorm = listResponse.data?.denormalized || {};
+            mergeConversationRefsFromDenorm(denorm, botId, refs);
+
+            const listKey = Object.keys(denorm).find(
+                (key) => key.includes('/conversations') && !key.includes('/conversation-')
+            );
+            const items = listKey ? denorm[listKey]?.data?.items : null;
+            if (Array.isArray(items)) {
+                for (const itemUrl of items) {
+                    rememberConversationRef(itemUrl, botId);
+                    refs.set(String(itemUrl), { inline: false });
+                }
+            }
+            if (refs.size > 0) break;
+        }
+
+        for (const path of watchedConversationPaths) {
+            refs.set(`${DEFAULT_API_ORIGIN}/${path.replace(/^\/+/, '')}`, { inline: false });
+        }
+
+        return refs;
+    }
+
+    async function sendDirectMessage(targetUserId, message, targetUsername = '') {
+        const botId = await resolveBotUserId();
+        const targetId = String(targetUserId || '').trim();
+        const text = String(message || '').trim();
+        if (!botId || !/^\d+$/.test(targetId) || !text) {
+            return { ok: false, reason: 'invalid payload' };
+        }
+
+        watchDirectMessageUser(targetId);
+
+        try {
+            const msgHeaders = await directMessageHeaders();
+            let convId = await resolveConversationIdBetweenUsers(botId, targetId, msgHeaders);
+
+            if (!convId) {
+                const refererUsername = String(targetUsername || '').trim();
+                const createHeaders = await buildImvuApiHeaders({
+                    Referer: refererUsername
+                        ? `${process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN}/next/av/${encodeURIComponent(refererUsername)}/`
+                        : `${process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN}/next/messages/`,
+                });
+                const createResponse = await apiPost(
+                    `/user/user-${botId}/conversations?limit=0`,
+                    {
+                        participants: [`${DEFAULT_API_ORIGIN}/user/user-${targetId}`],
+                        payloads: [{ type: 'text', content: text }],
+                    },
+                    { headers: createHeaders }
+                );
+                if (createResponse.status >= 200 && createResponse.status < 300) {
+                    rememberConversationRef(createResponse.data?.id, botId);
+                    logger.log(`[IMVU-SESSION] Sent direct message to user-${targetId}.`);
+                    return { ok: true };
+                }
+                const failure = parseImvuApiFailure(createResponse.data);
+                if (failure?.error === 'FRIEND-001') {
+                    return {
+                        ok: false,
+                        reason: failure.message || 'friend-required',
+                        friendRequired: true,
+                        error: failure.error,
+                    };
+                }
+                if (createResponse.status === 429 || failure?.error === 'RATE-001') {
+                    return {
+                        ok: false,
+                        reason: `status ${createResponse.status}${summarizeResponseData(createResponse.data)}`,
+                        rateLimited: true,
+                        error: failure?.error || 'RATE-001',
+                    };
+                }
+                return {
+                    ok: false,
+                    reason: `status ${createResponse.status}${summarizeResponseData(createResponse.data)}`,
+                };
+            }
+
+            const response = await apiPost(
+                `/conversation/${convId}/messages`,
+                { payloads: [{ type: 'text', content: text }] },
+                { headers: msgHeaders }
+            );
+            if (response.status >= 200 && response.status < 300) {
+                rememberConversationRef(convId, botId);
+                logger.log(`[IMVU-SESSION] Sent direct message to user-${targetId}.`);
+                return { ok: true };
+            }
+
+            const failure = parseImvuApiFailure(response.data);
+            if (failure?.error === 'FRIEND-001') {
+                return {
+                    ok: false,
+                    reason: failure.message || 'friend-required',
+                    friendRequired: true,
+                    error: failure.error,
+                };
+            }
+            if (response.status === 429 || failure?.error === 'RATE-001') {
+                return {
+                    ok: false,
+                    reason: `status ${response.status}${summarizeResponseData(response.data)}`,
+                    rateLimited: true,
+                    error: failure?.error || 'RATE-001',
+                };
+            }
+
+            return {
+                ok: false,
+                reason: `status ${response.status}${summarizeResponseData(response.data)}`,
+            };
+        } catch (error) {
+            return { ok: false, reason: error.message || 'direct-message-failed' };
+        }
+    }
+
+    async function listInboundFriendRequests() {
+        const botId = await resolveBotUserId();
+        if (!botId) return [];
+
+        try {
+            const headers = await buildImvuApiHeaders();
+            const url = new URL(`user/user-${botId}/inbound_friend_requests`, `${DEFAULT_API_ORIGIN}/`).href;
+            const response = await client.get(url, {
+                headers: { Accept: 'application/json; charset=utf-8', ...headers },
+                validateStatus: (status) => status >= 200 && status < 500,
+            });
+            if (response.status < 200 || response.status >= 300) return [];
+
+            const denorm = response.data?.denormalized || {};
+            const ids = [];
+            for (const key of Object.keys(denorm)) {
+                const match = key.match(/\/inbound_friend_requests\/user-(\d+)/i);
+                if (match) ids.push(match[1]);
+            }
+            return ids;
+        } catch {
+            return [];
+        }
+    }
+
+    async function acceptFriendRequest(fromUserId) {
+        const botId = await resolveBotUserId();
+        const fromId = String(fromUserId || '').trim();
+        if (!botId || !/^\d+$/.test(fromId)) {
+            return { ok: false, reason: 'invalid ids' };
+        }
+
+        try {
+            const headers = await buildImvuApiHeaders();
+            const response = await apiPost(
+                `/user/user-${botId}/inbound_friend_requests/user-${fromId}`,
+                {},
+                { headers }
+            );
+            if (response.status >= 200 && response.status < 300) {
+                logger.log(`[IMVU-SESSION] Accepted friend request from user-${fromId}.`);
+                return { ok: true };
+            }
+            return {
+                ok: false,
+                reason: `status ${response.status}${summarizeResponseData(response.data)}`,
+            };
+        } catch (error) {
+            return { ok: false, reason: error.message || 'accept-friend-failed' };
+        }
+    }
+
+    async function listRecentDirectMessages(limit = 20) {
+        const botId = await resolveBotUserId();
+        if (!botId) return [];
+
+        try {
+            const headers = await directMessageHeaders();
+            const maxMessages = Math.max(1, Math.min(limit, 50));
+            const messages = [];
+            const seenMessageIds = new Set();
+
+            const pushParsed = (parsed) => {
+                if (!parsed || seenMessageIds.has(parsed.messageId)) return false;
+                seenMessageIds.add(parsed.messageId);
+                if (parsed.senderUserId) watchDirectMessageUser(parsed.senderUserId);
+                messages.push(parsed);
+                return true;
+            };
+
+            if (watchedDmUserIds.size > 0) {
+                const watchedMessages = await listDirectMessagesFromWatchedUsers(
+                    botId,
+                    headers,
+                    maxMessages
+                );
+                for (const parsed of watchedMessages) {
+                    pushParsed(parsed);
+                    if (messages.length >= maxMessages) return messages;
+                }
+            }
+
+            const conversationRefs = await fetchConversationListRefs(botId, headers, maxMessages);
+            for (const [itemUrl, meta] of conversationRefs) {
+                if (messages.length >= maxMessages) break;
+
+                const convId = extractConversationId(itemUrl || meta.convKey || '');
+                if (convId) {
+                    const inbound = await fetchConversationInboundMessages(
+                        botId,
+                        convId,
+                        headers,
+                        maxMessages
+                    );
+                    for (const parsed of inbound) {
+                        pushParsed(parsed);
+                        if (messages.length >= maxMessages) break;
+                    }
+                    if (messages.length >= maxMessages) break;
+                }
+
+                if (meta.inline) {
+                    pushParsed(
+                        conversationMessageFromData(meta.data, botId, meta.detailDenorm, meta.convKey)
+                    );
+                }
+            }
+
+            return messages;
+        } catch (error) {
+            logger.warn(`[IMVU-SESSION] Could not list direct messages: ${error.message}`);
+            return [];
+        }
+    }
+
+    function parseChatInviteActivities(denorm) {
+        const invites = [];
+        const seenActivityKeys = new Set();
+
+        const listKey = Object.keys(denorm).find(
+            (key) => /\/activity(?:\?|$)/.test(key) && !/\/activity\/activity-/.test(key)
+        );
+        const itemUrls = listKey ? denorm[listKey]?.data?.items : null;
+        const activityKeys = Array.isArray(itemUrls)
+            ? itemUrls.map(String)
+            : Object.keys(denorm).filter((key) => key.includes('/activity/activity-'));
+
+        for (const itemKey of activityKeys) {
+            const wrapper = denorm[itemKey];
+            const ref = String(wrapper?.relations?.ref || itemKey);
+            const activityEntry = denorm[ref] || wrapper;
+            const data = activityEntry?.data;
+            if (!data?.activity_type || seenActivityKeys.has(ref)) continue;
+
+            const activityType = String(data.activity_type);
+            if (!activityType.includes('chat_invite')) continue;
+
+            seenActivityKeys.add(ref);
+            const relations = activityEntry?.relations || wrapper?.relations || {};
+            const actor = Array.isArray(data.actor) ? data.actor[0] : null;
+            const activityIdMatch = ref.match(/activity-\d+-(\d+)/i);
+            invites.push({
+                activityKey: ref,
+                activityId: activityIdMatch ? Number(activityIdMatch[1]) : 0,
+                activityType,
+                timestamp: String(data.timestamp || ''),
+                actorUserId: actor?.cid != null ? String(actor.cid) : null,
+                actorUsername: String(actor?.avatarname || actor?.display_name || '').trim(),
+                roomRef: String(relations.activity_reference_node || ''),
+                inviteEdge: String(relations.activity_reference_edge || ''),
+            });
+        }
+        return invites;
+    }
+
+    function sortChatInvitesNewestFirst(invites) {
+        return [...invites].sort((a, b) => {
+            const ta = Date.parse(a.timestamp || '') || 0;
+            const tb = Date.parse(b.timestamp || '') || 0;
+            if (tb !== ta) return tb - ta;
+            return (b.activityId || 0) - (a.activityId || 0);
+        });
+    }
+
+    async function listUnreadChatInvites() {
+        const botId = await resolveBotUserId();
+        if (!botId) return [];
+
+        try {
+            const headers = await buildImvuActivityHeaders();
+            const include =
+                'feed_like,feed_comment,chat_invite_v2,shop_together_invite,experience_invite_v2,friend_accept,friend_request,timelines_follow,moderator_add,moderator_remove,payme_received,payme_requested,product_gift_received,credit_gift_received,vcoin_gift_received,first_time_purchase_bonus_predits_received,quest_event_completed,tip_received';
+            // chat_invite (v1) appears on plain unread=1; chat_invite_v2 needs the include list (per IMVU client HAR).
+            const queryUrls = [
+                `user/user-${botId}/activity?unread=1`,
+                `user/user-${botId}/activity?unread=1&include=${encodeURIComponent(include)}`,
+            ];
+
+            const invites = [];
+            const seen = new Set();
+            for (const path of queryUrls) {
+                const listUrl = new URL(path, `${DEFAULT_API_ORIGIN}/`).href;
+                const response = await client.get(listUrl, {
+                    headers,
+                    validateStatus: (status) => status >= 200 && status < 500,
+                });
+                if (response.status < 200 || response.status >= 300) continue;
+
+                for (const invite of parseChatInviteActivities(response.data?.denormalized || {})) {
+                    if (seen.has(invite.activityKey)) continue;
+                    seen.add(invite.activityKey);
+                    invites.push(invite);
+                }
+            }
+            return sortChatInvitesNewestFirst(invites);
+        } catch (error) {
+            logger.warn(`[IMVU-SESSION] Could not list chat invites: ${error.message}`);
+            return [];
+        }
+    }
+
+    async function markChatInviteRead(activityKey) {
+        const ref = String(activityKey || '').trim();
+        if (!ref) return { ok: false, reason: 'missing activity key' };
+
+        const botId = await resolveBotUserId();
+        if (!botId) return { ok: false, reason: 'missing bot id' };
+
+        const activityIdMatch = ref.match(/activity-\d+-(\d+)/i);
+        if (!activityIdMatch) return { ok: false, reason: 'invalid activity key' };
+
+        try {
+            const headers = await buildImvuActivityHeaders();
+            const path = `user/user-${botId}/activity/activity-${botId}-${activityIdMatch[1]}`;
+            const response = await client.request({
+                method: 'put',
+                url: new URL(path, `${DEFAULT_API_ORIGIN}/`).href,
+                data: { has_read: true },
+                headers: {
+                    ...headers,
+                    'Content-Type': 'application/json; charset=UTF-8',
+                },
+                validateStatus: (status) => status >= 200 && status < 500,
+            });
+            if (response.status >= 200 && response.status < 300) {
+                return { ok: true };
+            }
+            return { ok: false, reason: `status ${response.status}${summarizeResponseData(response.data)}` };
+        } catch (error) {
+            return { ok: false, reason: error.message || 'mark-read-failed' };
+        }
+    }
+
+    async function acceptChatInvite(_inviteEdgeUrl) {
+        // IMVU room join is done via POST /chat/chat-{room}/participants — there is no separate
+        // accept-invite call in the Next client (POST to the invite edge returns 403).
+        return { ok: true, skipped: true };
+    }
+
+    async function resolveRoomIdFromChatRef(chatRef) {
+        const ref = String(chatRef || '').trim();
+        if (!ref) return null;
+
+        const roomMatch = ref.match(/\/room\/room-([\d-]+)/i);
+        if (roomMatch) return roomMatch[1];
+
+        const slugMatch = ref.match(/\/chat\/chat-([\d-]+)/i);
+        if (!slugMatch) return null;
+        const chatSlug = slugMatch[1];
+        if (chatSlug.includes('-')) return chatSlug;
+
+        try {
+            const headers = await buildImvuApiHeaders();
+            const json = await apiGet(`/chat/chat-${chatSlug}`, {
+                headers,
+                timeout: Number(process.env.IMVU_INVITE_CHAT_LOOKUP_MS || 10000),
+            });
+            const denorm = json?.denormalized || {};
+            for (const [key, value] of Object.entries(denorm)) {
+                const nestedRoom = key.match(/\/room\/room-([\d-]+)/i);
+                if (nestedRoom) return nestedRoom[1];
+                const roomRel = value?.relations?.room;
+                if (roomRel) {
+                    const relMatch = String(roomRel).match(/room-([\d-]+)/i);
+                    if (relMatch) return relMatch[1];
+                }
+                const data = value?.data;
+                if (data && typeof data === 'object') {
+                    for (const field of ['room_id', 'room_slug', 'room_name']) {
+                        const raw = String(data[field] || '');
+                        const match = raw.match(/([\d]+-[\d]+)/);
+                        if (match) return match[1];
+                    }
+                }
+            }
+        } catch (error) {
+            logger.warn(`[IMVU-SESSION] resolveRoomIdFromChatRef(${chatSlug}) failed: ${error.message}`);
+        }
+        return null;
+    }
+
     return {
         jar,
         client,
@@ -1324,7 +2359,10 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         fetchChatParticipant,
         updateChatParticipantSeat,
         fetchUserProfile,
+        fetchFullUserProfile,
+        resolveUserIdFromUsername,
         apiGetWearableNames,
+        apiGetWearableScan,
         fetchUserName,
         fetchLegacyChatQueue,
         ensureChatParticipant,
@@ -1333,5 +2371,19 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         fetchRoomMediaPlayerUpdateQueue,
         setRoomRadioStreamUrl,
         stopRoomRadioStream,
+        sendFriendRequest,
+        sendDirectMessage,
+        listInboundFriendRequests,
+        acceptFriendRequest,
+        listRecentDirectMessages,
+        watchDirectMessageUser,
+        getWatchedDirectMessageUserIds,
+        watchRoomDmContacts,
+        refreshDirectMessageWatchList,
+        listAcceptedFriendUserIds,
+        listUnreadChatInvites,
+        acceptChatInvite,
+        markChatInviteRead,
+        resolveRoomIdFromChatRef,
     };
 }

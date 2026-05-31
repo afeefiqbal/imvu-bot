@@ -2,6 +2,11 @@ import axios from 'axios';
 import { backendApiBaseUrl } from './env-app-url.js';
 import { getRoomSettings } from './room-settings/store.js';
 import { getRoomRuntime, trackerRoomKey } from './room-runtime-registry.js';
+import { fetchAndPostDashboardProfile } from './imvu-profile-sync.js';
+import { processPendingVerificationDeliveries } from './imvu-verification-sync.js';
+import { runBotSocialSync, isSocialSyncEnabled } from './bot-social-sync.js';
+
+export { runBotSocialSync, isSocialSyncEnabled };
 
 const BACKEND_URL = backendApiBaseUrl('http://127.0.0.1:8000');
 
@@ -38,6 +43,7 @@ async function reportMusicState(roomId, payload) {
  *   roomClients: Map<string, { client: { sendMessage: Function } }>,
  *   session: { setRoomRadioStreamUrl?: Function, stopRoomRadioStream?: Function },
  *   stopRoom: (roomId: string) => Promise<void>,
+ *   startRoom?: (roomId: string) => Promise<unknown>,
  *   botName: string,
  *   logger?: Console,
  * }} ctx
@@ -50,6 +56,7 @@ export async function processSyncActions(data, ctx) {
         for (const raw of data.pending_leave_rooms) {
             const roomId = trackerRoomKey(raw);
             if (!roomId) continue;
+            if (!ctx.roomClients?.has(roomId)) continue;
             logger.log(`${logPrefix} leaving room ${roomId} (pending_leave_rooms)`);
             await ctx.stopRoom(roomId);
         }
@@ -159,5 +166,42 @@ export async function processSyncActions(data, ctx) {
                 await reportMusicState(roomId, { state: 'error', track: musicUrl });
             }
         }
+    }
+
+    if (Array.isArray(data.pending_profile_fetches)) {
+        for (const item of data.pending_profile_fetches) {
+            if (!item || typeof item !== 'object') continue;
+            const username = String(item.username || '').trim();
+            if (!username) continue;
+
+            const result = await fetchAndPostDashboardProfile(ctx.session, item, ctx.botName);
+            if (result.ok) {
+                logger.log(
+                    `${logPrefix} synced dashboard IMVU profile for ${result.username || username} (user-${result.user_id})`
+                );
+            } else if (result.reason !== 'inflight') {
+                logger.warn(
+                    `${logPrefix} dashboard profile fetch failed for ${username}: ${result.reason || 'unknown'}`
+                );
+            }
+        }
+    }
+
+    if (Array.isArray(data.pending_verification_deliveries) && data.pending_verification_deliveries.length) {
+        await processPendingVerificationDeliveries({
+            session: ctx.session,
+            botName: ctx.botName,
+            logger,
+            pendingItems: data.pending_verification_deliveries,
+        });
+    }
+
+    if (isSocialSyncEnabled()) {
+        await runBotSocialSync({
+            session: ctx.session,
+            botName: ctx.botName,
+            logger,
+            startRoom: ctx.startRoom,
+        });
     }
 }
