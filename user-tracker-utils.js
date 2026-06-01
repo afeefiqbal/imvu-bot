@@ -55,6 +55,10 @@ export const isImvuRoomChatQueue = (queue) => {
     return false;
 };
 
+/** Numeric legacy queue from fetchLegacyChatQueue — not the room participant mount. */
+export const isEphemeralLegacyChatQueue = (queue) =>
+    /^\/chat\/\d+$/i.test(String(queue || '').trim());
+
 /**
  * When multiple IMVU room tabs share one account WebSocket, the same chat frame can reach every tracker.
  * Only handle chat (mentions, logs) if this frame's queue names our room (e.g. chat-{ownerId}-{roomNum}-…).

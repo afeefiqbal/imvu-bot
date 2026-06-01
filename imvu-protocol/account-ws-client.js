@@ -1,6 +1,11 @@
 import { EventEmitter } from 'events';
 import WebSocket from 'ws';
-import { roomQueueBelongsToRoom, isImvuRoomChatQueue, narrowChatFrameTargets } from '../user-tracker-utils.js';
+import {
+    roomQueueBelongsToRoom,
+    isImvuRoomChatQueue,
+    isEphemeralLegacyChatQueue,
+    narrowChatFrameTargets,
+} from '../user-tracker-utils.js';
 
 function parseFrame(raw) {
     const text = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw || '');
@@ -472,7 +477,20 @@ export class ImvuAccountRoomClient extends EventEmitter {
         ) {
             if (this.closedByUser) return;
             if (!this._ownsQueue(queue)) return;
-            this.logger.warn(`[IMVU-WS][${this.roomId}] left legacy ${queue}; will resubscribe before visible join`);
+            const wasLegacyChat =
+                isEphemeralLegacyChatQueue(queue) &&
+                (this.chatQueue === queue || this.legacyChatSubscribed);
+            if (wasLegacyChat) {
+                this.logger.log(
+                    `[IMVU-WS][${this.roomId}] legacy chat subscription ended (${queue}); resubscribing in-room`
+                );
+                this.legacyChatSubscribed = false;
+                this.legacyChatOpId = null;
+                this.visibilityBootstrapped = false;
+                void this.#resubscribeLegacyChat(queue);
+                return;
+            }
+            this.logger.warn(`[IMVU-WS][${this.roomId}] left ${queue}; will resubscribe before visible join`);
             this.chatQueue = '';
             this.legacyChatSubscribed = false;
             this.legacyChatOpId = null;
@@ -524,7 +542,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
         if (!intervalMs || this.visibleHeartbeatTimer || !this.visibilityEnabled) return;
         this.visibleHeartbeatTimer = setInterval(() => {
             if (!this.isOpen || !this.chatQueue || !this.participantReady || this.closedByUser) return;
-            this.#sendVisibilityBootstrap({ force: true, label: 'visible-heartbeat' });
+            void this.ensureVisible('visible-heartbeat');
         }, intervalMs);
     }
 
@@ -549,6 +567,38 @@ export class ImvuAccountRoomClient extends EventEmitter {
         if (this.forceVisibleRefreshTimer) clearInterval(this.forceVisibleRefreshTimer);
         this.forceVisibleRefreshTimer = null;
         this.forceVisibleRefreshRunning = false;
+    }
+
+    async #resubscribeLegacyChat(preferredQueue = '') {
+        if (!this.visibilityEnabled || this.closedByUser || !this.isOpen) return;
+        if (this.discoveringLegacyChat || this.legacyChatSubscribed) return;
+
+        let queue = String(preferredQueue || this.chatQueue || '').trim();
+        if (!queue && this.session?.fetchLegacyChatQueue) {
+            queue = (await this.session.fetchLegacyChatQueue(this.roomId)) || '';
+        }
+        if (!queue || !this.isOpen) return;
+
+        const participantReady = this.participantReady || (await this.#ensureChatParticipant());
+        if (!participantReady) {
+            this.#scheduleVisibleRetry('participant edge missing');
+            return;
+        }
+
+        this.legacyChatSubscribed = true;
+        this.chatQueue = queue;
+        this.legacyChatOpId = this.account.allocateOpId(this);
+        const frame = JSON.stringify({
+            record: 'msg_c2g_subscribe',
+            queues_with_results: [
+                {
+                    record: 'subscription',
+                    name: queue,
+                    op_id: this.legacyChatOpId,
+                },
+            ],
+        });
+        this.account.sendRoomFrame(this, frame, 'legacy-chat-resubscribe');
     }
 
     async #discoverLegacyChatQueue() {
@@ -737,10 +787,19 @@ export class ImvuAccountRoomClient extends EventEmitter {
             void this.#discoverLegacyChatQueue();
             return false;
         }
-        this.visibilityBootstrapped = false;
-        this.#sendVisibilityBootstrap();
+        const softRefresh = reason === 'force-refresh' || reason === 'visible-heartbeat';
+        if (softRefresh && this.visibilityBootstrapped && this.participantReady) {
+            this.lastEnsureVisibleAt = now;
+            return true;
+        }
+        if (!softRefresh) {
+            this.visibilityBootstrapped = false;
+        }
+        this.#sendVisibilityBootstrap({ force: softRefresh });
         this.lastEnsureVisibleAt = now;
-        this.logger.log(`[IMVU-WS][${this.roomId}] visibility refreshed (${reason})`);
+        if (!softRefresh || process.env.WS_DEBUG === '1' || process.env.WS_DEBUG === 'true') {
+            this.logger.log(`[IMVU-WS][${this.roomId}] visibility refreshed (${reason})`);
+        }
         return true;
     }
 

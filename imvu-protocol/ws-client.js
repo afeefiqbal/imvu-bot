@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events';
 import WebSocket from 'ws';
+import { isEphemeralLegacyChatQueue } from '../user-tracker-utils.js';
 
 function parseFrame(raw) {
     const text = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw || '');
@@ -194,7 +195,20 @@ export class ImvuRoomWebSocketClient extends EventEmitter {
         ) {
             if (this.closedByUser) return;
             if (this.chatQueue && this.chatQueue !== queue) return;
-            this.logger.warn(`[IMVU-WS][${this.roomId}] left legacy ${queue}; will resubscribe before visible join`);
+            const wasLegacyChat =
+                isEphemeralLegacyChatQueue(queue) &&
+                (this.chatQueue === queue || this.legacyChatSubscribed);
+            if (wasLegacyChat) {
+                this.logger.log(
+                    `[IMVU-WS][${this.roomId}] legacy chat subscription ended (${queue}); resubscribing in-room`
+                );
+                this.legacyChatSubscribed = false;
+                this.legacyChatOpId = null;
+                this.visibilityBootstrapped = false;
+                void this.#resubscribeLegacyChat(queue);
+                return;
+            }
+            this.logger.warn(`[IMVU-WS][${this.roomId}] left ${queue}; will resubscribe before visible join`);
             this.chatQueue = '';
             this.legacyChatSubscribed = false;
             this.legacyChatOpId = null;
@@ -217,6 +231,34 @@ export class ImvuRoomWebSocketClient extends EventEmitter {
                 this.#sendVisibilityBootstrap();
             }
         }
+    }
+
+    async #resubscribeLegacyChat(preferredQueue = '') {
+        if (!this.visibilityEnabled || this.closedByUser || !this.isOpen) return;
+        if (this.legacyChatSubscribed) return;
+
+        let queue = String(preferredQueue || this.chatQueue || '').trim();
+        if (!queue && this.session?.fetchLegacyChatQueue) {
+            queue = (await this.session.fetchLegacyChatQueue(this.roomId)) || '';
+        }
+        if (!queue || !this.isOpen) return;
+
+        if (!(await this.#ensureChatParticipant())) return;
+
+        this.legacyChatSubscribed = true;
+        this.chatQueue = queue;
+        this.legacyChatOpId = this.nextRuntimeOpId++;
+        const frame = JSON.stringify({
+            record: 'msg_c2g_subscribe',
+            queues_with_results: [
+                {
+                    record: 'subscription',
+                    name: queue,
+                    op_id: this.legacyChatOpId,
+                },
+            ],
+        });
+        this.sendRaw(frame);
     }
 
     async #discoverLegacyChatQueue() {
@@ -368,20 +410,28 @@ export class ImvuRoomWebSocketClient extends EventEmitter {
     async ensureVisible(reason = 'manual') {
         if (!this.visibilityEnabled) return false;
         if (!this.isOpen) await this.connect();
-        await this.#ensureChatParticipant();
+        const softRefresh = reason === 'force-refresh' || reason === 'visible-heartbeat';
+        if (!softRefresh) {
+            await this.#ensureChatParticipant();
+        }
         if (!this.chatQueue || !this.legacyChatSubscribed) {
             void this.#discoverLegacyChatQueue();
             return false;
         }
-        this.visibilityBootstrapped = false;
-        this.#sendVisibilityBootstrap();
+        if (softRefresh && this.visibilityBootstrapped) {
+            return true;
+        }
+        if (!softRefresh) {
+            this.visibilityBootstrapped = false;
+        }
+        this.#sendVisibilityBootstrap({ force: softRefresh });
         this.logger.log(`[IMVU-WS][${this.roomId}] visibility refreshed (${reason})`);
         return true;
     }
 
-    #sendVisibilityBootstrap() {
+    #sendVisibilityBootstrap({ force = false } = {}) {
         if (!this.visibilityEnabled) return;
-        if (this.visibilityBootstrapped || !this.isOpen || !this.chatQueue.startsWith('/chat/')) return;
+        if ((!force && this.visibilityBootstrapped) || !this.isOpen || !this.chatQueue.startsWith('/chat/')) return;
         this.visibilityBootstrapped = true;
 
         const userId = String(this.bot.imqUserId || this.bot.user_id || this.bot.userId || '').trim();

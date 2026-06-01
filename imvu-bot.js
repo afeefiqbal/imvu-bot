@@ -14,7 +14,12 @@ import { ImvuAccountWebSocketClient } from './imvu-protocol/account-ws-client.js
 import { ImvuRoomWebSocketClient } from './imvu-protocol/ws-client.js';
 import { startProtocolUserTracking } from './user-tracker.js';
 import { applySyncRoomSettings, patchRoomSettingsLocal, setGlobalLurkDefault } from './room-settings/store.js';
-import { decodeChatEnvelope, decodeId, roomQueueBelongsToRoom } from './user-tracker-utils.js';
+import {
+    decodeChatEnvelope,
+    decodeId,
+    isEphemeralLegacyChatQueue,
+    roomQueueBelongsToRoom,
+} from './user-tracker-utils.js';
 import { allRoomRuntimes, trackerRoomKey } from './room-runtime-registry.js';
 import { processSyncActions, runBotSocialSync, isSocialSyncEnabled } from './sync-actions.js';
 import { resolveBotImvuProfile } from './imvu-profile-sync.js';
@@ -108,7 +113,12 @@ function frameShowsSelfRemovedFromRoom(action, roomId, selfUserId) {
 
     if (action.record === 'msg_g2c_left_queue' || action.record === 'msg_g2c_user_exited') {
         const avatarId = decodeId(action.user_id || action.avatar_id);
-        return avatarId != null && String(avatarId) === self;
+        if (avatarId == null || String(avatarId) !== self) return false;
+        // Legacy /chat/{id} subscription churn during visibility refresh is not a room leave.
+        if (action.record === 'msg_g2c_left_queue' && isEphemeralLegacyChatQueue(queue)) {
+            return false;
+        }
+        return true;
     }
 
     if (!envTruthy('IMVU_SELF_REJOIN_ON_PARTICIPANT_DELETE')) return false;

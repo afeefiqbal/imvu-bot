@@ -14,7 +14,13 @@ import {
     roomQueueBelongsToRoom,
 } from './user-tracker-utils.js';
 import {
+    clearSivaSession,
+    isLikelyRoomCommand,
+    isSivaSessionActive,
+    markSivaSessionActive,
+    messageEndsSivaSession,
     messageInvokesSivaCharacterAi,
+    messageStartsNewSivaThread,
     stripSivaCharacterAiTriggers,
 } from './sivaCharacterAi.js';
 
@@ -714,9 +720,29 @@ export const createIncomingMessageHandler = (ctx) => {
                         if (handled) continue;
                     }
 
+                    if (
+                        direction === 'IN' &&
+                        senderId != null &&
+                        !ctx.isSelfId(senderId) &&
+                        messageEndsSivaSession(trimmed)
+                    ) {
+                        clearSivaSession(ctx.roomId, senderId);
+                        continue;
+                    }
+
                     const sivaHitIn = messageInvokesSivaCharacterAi(trimmed);
-                    const mentionHit =
+                    const sivaFollowUp =
                         !sivaHitIn &&
+                        isSivaSessionActive(ctx.roomId, senderId) &&
+                        !isLikelyRoomCommand(trimmed);
+                    const sivaActive = sivaHitIn || sivaFollowUp;
+
+                    if (sivaHitIn) {
+                        markSivaSessionActive(ctx.roomId, senderId);
+                    }
+
+                    const mentionHit =
+                        !sivaActive &&
                         messageMentionsBot(trimmed, ctx.botMentionAliases) &&
                         !isOnlyBotNameMention(trimmed, ctx.botMentionAliases);
 
@@ -724,7 +750,7 @@ export const createIncomingMessageHandler = (ctx) => {
                         direction === 'IN' &&
                         senderId != null &&
                         !ctx.isSelfId(senderId) &&
-                        (sivaHitIn || mentionHit) &&
+                        (sivaActive || mentionHit) &&
                         (typeof ctx.isLurkEnabled !== 'function' || ctx.isLurkEnabled())
                     ) {
                         const now = Date.now();
@@ -747,16 +773,19 @@ export const createIncomingMessageHandler = (ctx) => {
                                 const first = ctx.mentionReplyDedupe.values().next().value;
                                 ctx.mentionReplyDedupe.delete(first);
                             }
-                            const sivaHit = sivaHitIn;
+                            const sivaHit = sivaActive;
+                            const sivaMessage =
+                                stripSivaCharacterAiTriggers(trimmed) || trimmed;
                             void (async () => {
                                 try {
                                     const res = sivaHit
                                         ? await axios.post(`${ctx.API_BASE_URL}/api/siva-chat`, {
-                                              message: stripSivaCharacterAiTriggers(trimmed) || trimmed,
+                                              message: sivaMessage,
                                               username: senderLabel,
                                               room_id: String(ctx.roomId),
                                               imvu_avatar_id: avatarForLog,
                                               already_logged_user_message: true,
+                                              new_thread: messageStartsNewSivaThread(trimmed),
                                           })
                                         : await axios.post(`${ctx.API_BASE_URL}/api/lurk`, {
                                               message: trimmed,
@@ -774,6 +803,9 @@ export const createIncomingMessageHandler = (ctx) => {
                                           });
                                     const reply = res.data?.reply;
                                     if (reply && typeof reply === 'string' && reply.trim()) {
+                                        if (sivaHit) {
+                                            markSivaSessionActive(ctx.roomId, senderId);
+                                        }
                                         await ctx.sendMessage(reply.trim(), {
                                             participantUsername: senderLabel,
                                             participantAvatarId: avatarForLog ?? undefined,
