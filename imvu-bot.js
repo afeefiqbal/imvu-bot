@@ -373,7 +373,7 @@ async function main() {
         if (!entry || entry.leaving) return;
         entry.leaving = true;
         locallyPausedRooms.add(id);
-        console.log(`[${BOT_NAME}] Leaving room ${id}`);
+        console.warn(`[BOT-ROOM-LEAVE][${id}] ${BOT_NAME}: intentional leave (dashboard/stopRoom)`);
         if (entry.selfRejoinTimer) clearTimeout(entry.selfRejoinTimer);
         entry.selfRejoinTimer = null;
         // Prevent self-rejoin / force-refresh from undoing an intentional leave.
@@ -411,7 +411,9 @@ async function main() {
             /* optional */
         }
         roomClients.delete(id);
-        console.log(`[${BOT_NAME}] Room ${id} websocket closed — avatar stays in IMVU room.`);
+        console.warn(
+            `[BOT-ROOM-LEAVE][${id}] ${BOT_NAME}: websocket closed only — avatar may still show in IMVU room`
+        );
     };
 
     const startRoom = async (roomId, { force = false } = {}) => {

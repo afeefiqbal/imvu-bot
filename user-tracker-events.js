@@ -5,6 +5,7 @@ import {
     decodeChatEnvelope,
     decodeId,
     displayNameFromEnvelope,
+    isEphemeralLegacyChatQueue,
     isImvuMessagesMount,
     isImvuRoomChatQueue,
     isImvuRoomProtocolLine,
@@ -115,6 +116,11 @@ function wsDebugVerboseEnabled() {
 }
 
 /** True when WS_DEBUG should print this payload (avoids Railway 500 logs/s on presence spam). */
+function logBotSelfRoomLeave(ctx, reason, { queue = '' } = {}) {
+    const q = queue ? ` queue=${queue}` : '';
+    console.warn(`[BOT-ROOM-LEAVE][${ctx.roomId}] ${ctx.BOT_USERNAME}: ${reason}${q}`);
+}
+
 function wsDebugChatCandidate(msg) {
     const actions = Array.isArray(msg) ? msg : [msg];
     for (const action of actions) {
@@ -473,6 +479,18 @@ export const createIncomingMessageHandler = (ctx) => {
                 const avatarId = decodeId(action.user_id || action.avatar_id);
                 if (avatarId && ctx.lastUserMap.has(avatarId)) {
                     if (ctx.isSelfId(avatarId)) {
+                        if (
+                            record === 'msg_g2c_left_queue' &&
+                            isEphemeralLegacyChatQueue(queue)
+                        ) {
+                            console.log(
+                                `[BOT-ROOM-LEAVE][${ctx.roomId}] ${ctx.BOT_USERNAME}: legacy chat unsubscribed (${queue}); not a full room leave`
+                            );
+                        } else {
+                            logBotSelfRoomLeave(ctx, `${record} (bot left room chat)`, {
+                                queue,
+                            });
+                        }
                         ctx.lastUserMap.delete(avatarId);
                         ctx.skipWelcomeAvatarIds.delete(avatarId);
                         ctx.joinQueueBackendAnnounced.delete(avatarId);
@@ -510,6 +528,12 @@ export const createIncomingMessageHandler = (ctx) => {
                 for (const avatarId of avatarIds) {
                     if (deltaAction === 'deleted' || deltaAction === 'removed') {
                         const username = ctx.lastUserMap.get(avatarId);
+                        if (ctx.isSelfId(avatarId)) {
+                            logBotSelfRoomLeave(
+                                ctx,
+                                'participant removed from room (kicked or left on IMVU)'
+                            );
+                        }
                         ctx.lastUserMap.delete(avatarId);
                         ctx.joinQueueBackendAnnounced.delete(avatarId);
                         ctx.activeJoinSessions.delete(avatarId);

@@ -192,8 +192,17 @@ export class ImvuAccountWebSocketClient extends EventEmitter {
             const frame = parseFrame(raw);
             if (frame == null) return;
             if (process.env.WS_DEBUG === '1' || process.env.WS_DEBUG === 'true') {
+                const actions = Array.isArray(frame) ? frame : [frame];
+                const verbose =
+                    process.env.WS_DEBUG_VERBOSE === '1' ||
+                    process.env.WS_DEBUG_VERBOSE === 'true';
                 const line = typeof frame === 'string' ? frame : JSON.stringify(frame);
-                this.logger.log(`[IMVU-ACCOUNT-WS][recv] ${line.slice(0, 800)}`);
+                const onlyPong =
+                    actions.length > 0 &&
+                    actions.every((a) => a && typeof a === 'object' && a.record === 'msg_g2c_pong');
+                if (!onlyPong || verbose) {
+                    this.logger.log(`[IMVU-ACCOUNT-WS][recv] ${line.slice(0, 800)}`);
+                }
             }
             this.emit('raw', frame);
             const actions = Array.isArray(frame) ? frame : [frame];
