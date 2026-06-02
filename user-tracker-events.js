@@ -118,7 +118,7 @@ function wsDebugVerboseEnabled() {
 /** True when WS_DEBUG should print this payload (avoids Railway 500 logs/s on presence spam). */
 function logBotSelfRoomLeave(ctx, reason, { queue = '' } = {}) {
     const q = queue ? ` queue=${queue}` : '';
-    console.warn(`[BOT-ROOM-LEAVE][${ctx.roomId}] ${ctx.BOT_USERNAME}: ${reason}${q}`);
+    console.log(`[BOT-ROOM-LEAVE][${ctx.roomId}] ${ctx.BOT_USERNAME}: ${reason}${q}`);
 }
 
 function wsDebugChatCandidate(msg) {

@@ -121,7 +121,7 @@ function frameShowsSelfRemovedFromRoom(action, roomId, selfUserId) {
         return true;
     }
 
-    if (!envTruthy('IMVU_SELF_REJOIN_ON_PARTICIPANT_DELETE')) return false;
+    if (envDisabled('IMVU_SELF_REJOIN_ON_PARTICIPANT_DELETE')) return false;
     if (action.record !== 'msg_g2c_send_message') return false;
     if (!String(action.mount || '').toLowerCase().includes('participants')) return false;
 

@@ -77,10 +77,8 @@ export const roomQueueBelongsToRoom = (queue, roomId, opts = null) => {
     const q = String(queue || '');
     if (!q) return false;
 
-    if (knownChatQueue) {
-        if (q === knownChatQueue) return true;
-        if (isImvuRoomChatQueue(q)) return false;
-    }
+    if (knownChatQueue && q === knownChatQueue) return true;
+    // inv:/chat/chat-{room} and legacy /chat/{num} can both apply to the same room; match by slug below.
 
     if (!key || !/^\d+-\d+$/.test(key)) return true;
     if (!isImvuRoomChatQueue(q)) return true;
