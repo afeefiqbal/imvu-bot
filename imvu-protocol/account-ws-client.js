@@ -497,7 +497,9 @@ export class ImvuAccountRoomClient extends EventEmitter {
                 this.legacyChatOpId = null;
                 this.visibilityBootstrapped = false;
                 this.participantReady = false;
-                void this.#resubscribeLegacyChat(queue);
+                void this.#resubscribeLegacyChat(queue).then(() => {
+                    void this.ensureVisible('legacy-chat-drop');
+                });
                 return;
             }
             this.logger.warn(`[IMVU-WS][${this.roomId}] left ${queue}; will resubscribe before visible join`);
@@ -601,19 +603,19 @@ export class ImvuAccountRoomClient extends EventEmitter {
     }
 
     async #resubscribeLegacyChat(preferredQueue = '') {
-        if (!this.visibilityEnabled || this.closedByUser || !this.isOpen) return;
-        if (this.discoveringLegacyChat || this.legacyChatSubscribed) return;
+        if (!this.visibilityEnabled || this.closedByUser || !this.isOpen) return false;
+        if (this.discoveringLegacyChat || this.legacyChatSubscribed) return false;
 
         let queue = String(preferredQueue || this.chatQueue || '').trim();
         if (!queue && this.session?.fetchLegacyChatQueue) {
             queue = (await this.session.fetchLegacyChatQueue(this.roomId)) || '';
         }
-        if (!queue || !this.isOpen) return;
+        if (!queue || !this.isOpen) return false;
 
         const participantReady = await this.#ensureChatParticipantWithRetry();
         if (!participantReady) {
             this.#scheduleVisibleRetry('participant edge missing');
-            return;
+            return false;
         }
 
         this.legacyChatSubscribed = true;
@@ -630,6 +632,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
             ],
         });
         this.account.sendRoomFrame(this, frame, 'legacy-chat-resubscribe');
+        return true;
     }
 
     async #discoverLegacyChatQueue() {
@@ -814,6 +817,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
         const skipParticipantRest =
             reason !== 'self-removed' &&
             reason !== 'unknown-user-repair' &&
+            reason !== 'legacy-chat-drop' &&
             reason !== 'participant-repair' &&
             (reason === 'force-refresh' || reason === 'visible-heartbeat') &&
             this.participantReady &&
