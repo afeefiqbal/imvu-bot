@@ -496,6 +496,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
                 this.legacyChatSubscribed = false;
                 this.legacyChatOpId = null;
                 this.visibilityBootstrapped = false;
+                this.participantReady = false;
                 void this.#resubscribeLegacyChat(queue);
                 return;
             }
@@ -508,6 +509,27 @@ export class ImvuAccountRoomClient extends EventEmitter {
             this.participantReady = false;
             this.#stopVisibilityHeartbeat();
             return;
+        }
+        if (
+            action.record === 'msg_g2c_result' &&
+            action.status === 1 &&
+            String(action.error_message || '') === 'unknown_user'
+        ) {
+            if (this.participantReady || this.visibilityBootstrapped) {
+                this.logger.warn(
+                    `[IMVU-WS][${this.roomId}] IMVU unknown_user (op ${action.op_id}); re-establishing room participant`
+                );
+                this.participantReady = false;
+                this.visibilityBootstrapped = false;
+                void this.#ensureChatParticipantWithRetry().then((ok) => {
+                    if (!ok || !this.isOpen) return;
+                    if (this.legacyChatSubscribed && this.chatQueue) {
+                        void this.ensureVisible('unknown-user-repair');
+                    } else {
+                        void this.#discoverLegacyChatQueue();
+                    }
+                });
+            }
         }
         if (action.record === 'msg_g2c_result' && action.op_id === this.legacyChatOpId) {
             if (action.status === 0) {
@@ -588,7 +610,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
         }
         if (!queue || !this.isOpen) return;
 
-        const participantReady = this.participantReady || (await this.#ensureChatParticipant());
+        const participantReady = await this.#ensureChatParticipantWithRetry();
         if (!participantReady) {
             this.#scheduleVisibleRetry('participant edge missing');
             return;
@@ -776,6 +798,11 @@ export class ImvuAccountRoomClient extends EventEmitter {
         return false;
     }
 
+    resetPresenceForRejoin() {
+        this.participantReady = false;
+        this.visibilityBootstrapped = false;
+    }
+
     async ensureVisible(reason = 'manual') {
         if (!this.visibilityEnabled || this.closedByUser) return false;
         const now = Date.now();
@@ -785,6 +812,9 @@ export class ImvuAccountRoomClient extends EventEmitter {
         }
         if (!this.isOpen) await this.connect();
         const skipParticipantRest =
+            reason !== 'self-removed' &&
+            reason !== 'unknown-user-repair' &&
+            reason !== 'participant-repair' &&
             (reason === 'force-refresh' || reason === 'visible-heartbeat') &&
             this.participantReady &&
             this.legacyChatSubscribed &&

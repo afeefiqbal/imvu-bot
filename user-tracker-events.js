@@ -117,6 +117,10 @@ function wsDebugVerboseEnabled() {
 
 /** True when WS_DEBUG should print this payload (avoids Railway 500 logs/s on presence spam). */
 function logBotSelfRoomLeave(ctx, reason, { queue = '' } = {}) {
+    const now = Date.now();
+    const lastAt = ctx.lastBotLeaveLogAt || 0;
+    if (now - lastAt < 2000) return;
+    ctx.lastBotLeaveLogAt = now;
     const q = queue ? ` queue=${queue}` : '';
     console.log(`[BOT-ROOM-LEAVE][${ctx.roomId}] ${ctx.BOT_USERNAME}: ${reason}${q}`);
 }
@@ -486,11 +490,11 @@ export const createIncomingMessageHandler = (ctx) => {
                             console.log(
                                 `[BOT-ROOM-LEAVE][${ctx.roomId}] ${ctx.BOT_USERNAME}: legacy chat unsubscribed (${queue}); not a full room leave`
                             );
-                        } else {
-                            logBotSelfRoomLeave(ctx, `${record} (bot left room chat)`, {
-                                queue,
-                            });
+                            continue;
                         }
+                        logBotSelfRoomLeave(ctx, `${record} (bot left room chat)`, {
+                            queue,
+                        });
                         ctx.lastUserMap.delete(avatarId);
                         ctx.skipWelcomeAvatarIds.delete(avatarId);
                         ctx.joinQueueBackendAnnounced.delete(avatarId);

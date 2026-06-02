@@ -491,6 +491,9 @@ async function main() {
                 entry.selfRejoinTimer = null;
                 if (roomClients.get(id) !== entry) return;
                 if (entry.visibleRejoinPausedUntil && Date.now() < entry.visibleRejoinPausedUntil) return;
+                if (typeof client.resetPresenceForRejoin === 'function') {
+                    client.resetPresenceForRejoin();
+                }
                 void client.ensureVisible('self-removed').catch((error) => {
                     console.warn(`[${BOT_NAME}][${id}] self rejoin failed: ${error.message}`);
                 });
