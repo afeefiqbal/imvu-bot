@@ -492,6 +492,9 @@ export const createIncomingMessageHandler = (ctx) => {
                             );
                             continue;
                         }
+                        if (typeof ctx.isPresenceRepairInFlight === 'function' && ctx.isPresenceRepairInFlight()) {
+                            continue;
+                        }
                         logBotSelfRoomLeave(ctx, `${record} (bot left room chat)`, {
                             queue,
                         });
@@ -533,6 +536,12 @@ export const createIncomingMessageHandler = (ctx) => {
                     if (deltaAction === 'deleted' || deltaAction === 'removed') {
                         const username = ctx.lastUserMap.get(avatarId);
                         if (ctx.isSelfId(avatarId)) {
+                            if (
+                                typeof ctx.isPresenceRepairInFlight === 'function' &&
+                                ctx.isPresenceRepairInFlight()
+                            ) {
+                                continue;
+                            }
                             logBotSelfRoomLeave(
                                 ctx,
                                 'participant removed from room (kicked or left on IMVU)'

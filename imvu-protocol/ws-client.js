@@ -205,7 +205,6 @@ export class ImvuRoomWebSocketClient extends EventEmitter {
                 this.legacyChatSubscribed = false;
                 this.legacyChatOpId = null;
                 this.visibilityBootstrapped = false;
-                this.participantReady = false;
                 void this.#resubscribeLegacyChat(queue);
                 return;
             }

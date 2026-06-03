@@ -391,13 +391,30 @@ export class ImvuAccountRoomClient extends EventEmitter {
         this.closedByUser = false;
         this.discoveringLegacyChat = false;
         this.participantReady = false;
+        this.visibilityBootstrapPending = false;
+        this.unknownUserRepairInFlight = false;
+        this.unknownUserRepairCooldownUntil = 0;
+        this.unknownUserRepairBackoffMs = Math.max(
+            1000,
+            envInt('IMVU_UNKNOWN_USER_REPAIR_COOLDOWN_MS', 5000)
+        );
         this.visibleRetryTimer = null;
         this.visibleHeartbeatTimer = null;
         this.forceVisibleRefreshTimer = null;
         this.forceVisibleRefreshRunning = false;
         this.lastEnsureVisibleAt = 0;
+        this.lastParticipantEnsureOkAt = 0;
         this.mediaPlayerQueue = '';
         this.mediaPlayerSubscribed = false;
+    }
+
+    /** True while WS/visibility repair is running — ignore transient "left room" signals. */
+    get presenceRepairInFlight() {
+        return (
+            this.unknownUserRepairInFlight ||
+            this.visibilityBootstrapPending ||
+            this.discoveringLegacyChat
+        );
     }
 
     get isOpen() {
@@ -423,10 +440,12 @@ export class ImvuAccountRoomClient extends EventEmitter {
         this.legacyChatSubscribed = false;
         this.legacyChatOpId = null;
         this.visibilityBootstrapped = false;
+        this.visibilityBootstrapPending = false;
         this.testMessageSent = false;
         this.joined = false;
         this.discoveringLegacyChat = false;
         this.participantReady = false;
+        this.unknownUserRepairInFlight = false;
         if (this.visibleRetryTimer) clearTimeout(this.visibleRetryTimer);
         this.visibleRetryTimer = null;
         this.#stopVisibilityHeartbeat();
@@ -496,9 +515,9 @@ export class ImvuAccountRoomClient extends EventEmitter {
                 this.legacyChatSubscribed = false;
                 this.legacyChatOpId = null;
                 this.visibilityBootstrapped = false;
-                this.participantReady = false;
-                void this.#resubscribeLegacyChat(queue).then(() => {
-                    void this.ensureVisible('legacy-chat-drop');
+                this.visibilityBootstrapPending = false;
+                void this.#resubscribeLegacyChat(queue).then((resubscribed) => {
+                    if (!resubscribed) void this.ensureVisible('legacy-chat-drop');
                 });
                 return;
             }
@@ -507,30 +526,31 @@ export class ImvuAccountRoomClient extends EventEmitter {
             this.legacyChatSubscribed = false;
             this.legacyChatOpId = null;
             this.visibilityBootstrapped = false;
+            this.visibilityBootstrapPending = false;
             this.discoveringLegacyChat = false;
-            this.participantReady = false;
+            this.unknownUserRepairInFlight = false;
             this.#stopVisibilityHeartbeat();
+            void this.#discoverLegacyChatQueue();
             return;
+        }
+        if (action.record === 'msg_g2c_result' && action.status === 0 && this.visibilityBootstrapPending) {
+            this.visibilityBootstrapPending = false;
+            this.visibilityBootstrapped = true;
+            this.unknownUserRepairBackoffMs = Math.max(
+                1000,
+                envInt('IMVU_UNKNOWN_USER_REPAIR_COOLDOWN_MS', 5000)
+            );
         }
         if (
             action.record === 'msg_g2c_result' &&
             action.status === 1 &&
             String(action.error_message || '') === 'unknown_user'
         ) {
-            if (this.participantReady || this.visibilityBootstrapped) {
+            if (this.participantReady || this.visibilityBootstrapped || this.visibilityBootstrapPending) {
                 this.logger.warn(
-                    `[IMVU-WS][${this.roomId}] IMVU unknown_user (op ${action.op_id}); re-establishing room participant`
+                    `[IMVU-WS][${this.roomId}] IMVU unknown_user (op ${action.op_id}); scheduling participant repair`
                 );
-                this.participantReady = false;
-                this.visibilityBootstrapped = false;
-                void this.#ensureChatParticipantWithRetry().then((ok) => {
-                    if (!ok || !this.isOpen) return;
-                    if (this.legacyChatSubscribed && this.chatQueue) {
-                        void this.ensureVisible('unknown-user-repair');
-                    } else {
-                        void this.#discoverLegacyChatQueue();
-                    }
-                });
+                void this.#scheduleUnknownUserRepair(action.op_id);
             }
         }
         if (action.record === 'msg_g2c_result' && action.op_id === this.legacyChatOpId) {
@@ -564,7 +584,8 @@ export class ImvuAccountRoomClient extends EventEmitter {
             this.legacyChatSubscribed = false;
             this.legacyChatOpId = null;
             this.visibilityBootstrapped = false;
-            this.participantReady = false;
+            this.visibilityBootstrapPending = false;
+            this.unknownUserRepairInFlight = false;
             this.#stopVisibilityHeartbeat();
             void this.#discoverLegacyChatQueue();
         }, retryMs);
@@ -582,6 +603,72 @@ export class ImvuAccountRoomClient extends EventEmitter {
     #stopVisibilityHeartbeat() {
         if (this.visibleHeartbeatTimer) clearInterval(this.visibleHeartbeatTimer);
         this.visibleHeartbeatTimer = null;
+    }
+
+    #scheduleUnknownUserRepair(opId) {
+        if (this.closedByUser || !this.isOpen) return;
+        if (this.unknownUserRepairInFlight) return;
+        const now = Date.now();
+        if (now < this.unknownUserRepairCooldownUntil) {
+            if (process.env.WS_DEBUG === '1' || process.env.WS_DEBUG === 'true') {
+                this.logger.log(
+                    `[IMVU-WS][${this.roomId}] unknown_user repair suppressed (cooldown ${this.unknownUserRepairCooldownUntil - now}ms, op ${opId})`
+                );
+            }
+            return;
+        }
+        void this.#runUnknownUserRepair(opId);
+    }
+
+    async #runUnknownUserRepair(opId) {
+        if (this.unknownUserRepairInFlight || this.closedByUser || !this.isOpen) return;
+        this.unknownUserRepairInFlight = true;
+        this.visibilityBootstrapped = false;
+        this.visibilityBootstrapPending = false;
+
+        try {
+            const stickyMs = Math.max(0, envInt('IMVU_PARTICIPANT_STICKY_MS', 120000));
+            const participantSticky =
+                this.participantReady &&
+                stickyMs > 0 &&
+                Date.now() - (this.lastParticipantEnsureOkAt || 0) < stickyMs;
+
+            if (!participantSticky) {
+                const ok = await this.#ensureChatParticipantWithRetry();
+                if (!ok || !this.isOpen) {
+                    this.logger.warn(
+                        `[IMVU-WS][${this.roomId}] unknown_user repair: participant POST failed (op ${opId})`
+                    );
+                    return;
+                }
+                const readyDelayMs = Math.max(0, envInt('IMVU_WS_PARTICIPANT_READY_DELAY_MS', 1500));
+                if (readyDelayMs) await delay(readyDelayMs);
+            }
+
+            if (this.chatQueue) {
+                this.legacyChatSubscribed = false;
+                this.legacyChatOpId = null;
+                const resubscribed = await this.#resubscribeLegacyChat(this.chatQueue);
+                if (resubscribed) return;
+            } else {
+                await this.#discoverLegacyChatQueue();
+                return;
+            }
+
+            if (!this.isOpen) return;
+            await this.ensureVisible('unknown-user-repair');
+        } finally {
+            this.unknownUserRepairInFlight = false;
+            this.unknownUserRepairCooldownUntil = Date.now() + this.unknownUserRepairBackoffMs;
+            this.unknownUserRepairBackoffMs = Math.min(
+                60000,
+                Math.max(
+                    1000,
+                    envInt('IMVU_UNKNOWN_USER_REPAIR_COOLDOWN_MS', 5000),
+                    Math.floor(this.unknownUserRepairBackoffMs * 1.5)
+                )
+            );
+        }
     }
 
     #scheduleForceVisibleRefresh() {
@@ -781,6 +868,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
         });
         this.#rememberParticipant(result?.participant);
         this.participantReady = Boolean(result);
+        if (result) this.lastParticipantEnsureOkAt = Date.now();
         return result;
     }
 
@@ -802,8 +890,8 @@ export class ImvuAccountRoomClient extends EventEmitter {
     }
 
     resetPresenceForRejoin() {
-        this.participantReady = false;
         this.visibilityBootstrapped = false;
+        this.visibilityBootstrapPending = false;
     }
 
     async ensureVisible(reason = 'manual') {
@@ -837,6 +925,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
         }
         if (!softRefresh) {
             this.visibilityBootstrapped = false;
+            this.visibilityBootstrapPending = false;
         }
         this.#sendVisibilityBootstrap({ force: softRefresh });
         this.lastEnsureVisibleAt = now;
@@ -853,7 +942,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
             this.#scheduleVisibleRetry('participant not confirmed');
             return;
         }
-        this.visibilityBootstrapped = true;
+        this.visibilityBootstrapPending = true;
 
         const userId = String(this.bot.imqUserId || this.bot.user_id || this.bot.userId || '').trim();
         if (!/^\d+$/.test(userId)) return;
@@ -947,6 +1036,8 @@ export class ImvuAccountRoomClient extends EventEmitter {
         this.closedByUser = true;
         if (this.visibleRetryTimer) clearTimeout(this.visibleRetryTimer);
         this.visibleRetryTimer = null;
+        this.unknownUserRepairInFlight = false;
+        this.visibilityBootstrapPending = false;
         this.#stopVisibilityHeartbeat();
         this.#stopForceVisibleRefresh();
         this.account.unregisterRoom(this);

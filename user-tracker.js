@@ -1090,6 +1090,7 @@ export async function startUserTracking(page, roomId, options = {}) {
         lastSpokeAt,
         roomId,
         getRoomChatQueue: () => protocolClient?.chatQueue || '',
+        isPresenceRepairInFlight: () => Boolean(protocolClient?.presenceRepairInFlight),
         scheduleWelcomeForAvatar,
         sendMessage,
         skipWelcomeAvatarIds,

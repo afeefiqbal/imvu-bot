@@ -361,7 +361,7 @@ async function main() {
     });
     const selfRejoinEnabled = !envDisabled('IMVU_SELF_REJOIN');
     const selfRejoinDelayMs = Math.max(1000, envInt('IMVU_SELF_REJOIN_DELAY_MS', 5000));
-    const selfRejoinMaxPerRoom = Math.max(0, envInt('IMVU_SELF_REJOIN_MAX_PER_ROOM', 1));
+    const selfRejoinMaxPerRoom = Math.max(0, envInt('IMVU_SELF_REJOIN_MAX_PER_ROOM', 8));
     const selfRejoinWindowMs = Math.max(10000, envInt('IMVU_SELF_REJOIN_WINDOW_MS', 10 * 60 * 1000));
     const selfRejoinCooldownMs = Math.max(10000, envInt('IMVU_SELF_REJOIN_COOLDOWN_MS', 15 * 60 * 1000));
 
@@ -464,6 +464,7 @@ async function main() {
         client.on('frame', (action) => {
             if (!selfRejoinEnabled || !frameShowsSelfRemovedFromRoom(action, id, bot.imqUserId)) return;
             if (!entry) return;
+            if (client.presenceRepairInFlight) return;
             const now = Date.now();
             if (entry.visibleRejoinPausedUntil && now < entry.visibleRejoinPausedUntil) return;
 
