@@ -61,7 +61,7 @@ export const isEphemeralLegacyChatQueue = (queue) =>
 
 /**
  * When multiple IMVU room tabs share one account WebSocket, the same chat frame can reach every tracker.
- * Only handle chat (mentions, logs) if this frame's queue names our room (e.g. chat-{ownerId}-{roomNum}-…).
+ * Only handle chat (music, mentions, logs) if this frame's queue names our room (e.g. chat-{ownerId}-{roomNum}-…).
  * @param {string} queue
  * @param {string} roomId dashboard slug e.g. {ownerId}-{roomNum} or room-{ownerId}-{roomNum}
  * @param {{ knownChatQueue?: string } | string} [opts] this room's subscribed legacy chat queue, when known

@@ -1035,9 +1035,33 @@ export async function startUserTracking(page, roomId, options = {}) {
 
     const resolveImvuHandleFromNumericId = createImvuHandleResolver({ page, sessionClient });
 
+    let roomCommandsHandler = null;
+    let musicCommandHandler = null;
     let roomChatCommandHandler = null;
+
+    const musicEnabled = envFlag('IMVU_MUSIC_ENABLED', false) || envFlag('MUSIC_ENABLED', false);
+    if (musicEnabled) {
+        try {
+            const { createMusicRoomChatCommandHandler } = await import('./music/index.js');
+            musicCommandHandler = await createMusicRoomChatCommandHandler({
+                page: protocolMode ? null : page,
+                protocolClient,
+                sessionClient,
+                roomId,
+                apiBaseUrl: API_BASE_URL,
+                botName: syncBotName || undefined,
+                sendMessage,
+            });
+            console.log(
+                `${syncLogPrefix} room music commands on (!play/!p · !add · !queue · !skip · !stop · !music)`
+            );
+        } catch (e) {
+            console.warn(`${syncLogPrefix} music init failed:`, e?.message || e);
+        }
+    }
+
     if (roomCommandsEnabled) {
-        roomChatCommandHandler = createRoomChatCommandHandler({
+        roomCommandsHandler = createRoomChatCommandHandler({
             roomId,
             botName: syncBotName,
             apiBaseUrl: API_BASE_URL,
@@ -1057,6 +1081,22 @@ export async function startUserTracking(page, roomId, options = {}) {
             scalerWarnedAt,
         });
         console.log(`${syncLogPrefix} room commands on (!help !info !roomid !move …)`);
+    }
+
+    if (musicCommandHandler || roomCommandsHandler) {
+        roomChatCommandHandler = async (ctx) => {
+            if (typeof musicCommandHandler === 'function') {
+                const musicHandled = await musicCommandHandler(ctx);
+                if (musicHandled) return true;
+            }
+            if (typeof roomCommandsHandler === 'function') {
+                return Boolean(await roomCommandsHandler(ctx));
+            }
+            return false;
+        };
+        if (roomCommandsHandler?.stopScaleInterval) {
+            roomChatCommandHandler.stopScaleInterval = () => roomCommandsHandler.stopScaleInterval();
+        }
     }
 
     const handleIncomingMessage = createIncomingMessageHandler({

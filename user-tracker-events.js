@@ -16,8 +16,6 @@ import {
 } from './user-tracker-utils.js';
 import {
     clearSivaSession,
-    isLikelyRoomCommand,
-    isSivaSessionActive,
     markSivaSessionActive,
     messageEndsSivaSession,
     messageInvokesSivaCharacterAi,
@@ -157,7 +155,6 @@ export const createIncomingMessageHandler = (ctx) => {
         0,
         parseInt(String(process.env.IMVU_INITIAL_LEGACY_ROSTER_MS || '12000'), 10) || 12000
     );
-    const userLastReply = new Map();
     const recentRoomCommandKeys = new Map();
     const ROOM_COMMAND_DEDUPE_MS = Math.max(
         500,
@@ -768,11 +765,8 @@ export const createIncomingMessageHandler = (ctx) => {
                     }
 
                     const sivaHitIn = messageInvokesSivaCharacterAi(trimmed);
-                    const sivaFollowUp =
-                        !sivaHitIn &&
-                        isSivaSessionActive(ctx.roomId, senderId) &&
-                        !isLikelyRoomCommand(trimmed);
-                    const sivaActive = sivaHitIn || sivaFollowUp;
+                    // Only explicit sugar / ".…" triggers — no open follow-up session.
+                    const sivaActive = sivaHitIn;
 
                     if (sivaHitIn) {
                         markSivaSessionActive(ctx.roomId, senderId);
@@ -790,29 +784,24 @@ export const createIncomingMessageHandler = (ctx) => {
                         (sivaActive || mentionHit) &&
                         (typeof ctx.isLurkEnabled !== 'function' || ctx.isLurkEnabled())
                     ) {
-                        const now = Date.now();
-                        if (now - (userLastReply.get(senderId) || 0) < 15000) {
-                            console.log(`[AI-CHAT] 🚦 Ignoring ${senderLabel} (15s cooldown limit)`);
-                            continue; // Note: In a loop, continue instead of return since we want to process other records!
-                        }
-                        userLastReply.set(senderId, now);
-
-                        // Clean up the map occasionally
-                        if (userLastReply.size > 200) userLastReply.clear();
-
+                        // Dedupe identical back-to-back WS echoes only (no reply cooldown).
                         const dedupeKey = `${ctx.roomId}:${senderId}:${trimmed}`;
                         if (!ctx.mentionReplyDedupe.has(dedupeKey)) {
                             ctx.mentionReplyDedupe.add(dedupeKey);
                             setTimeout(() => {
                                 ctx.mentionReplyDedupe.delete(dedupeKey);
-                            }, 15000);
+                            }, 4000);
                             if (ctx.mentionReplyDedupe.size > ctx.MENTION_REPLY_DEDUPE_CAP) {
                                 const first = ctx.mentionReplyDedupe.values().next().value;
                                 ctx.mentionReplyDedupe.delete(first);
                             }
                             const sivaHit = sivaActive;
+                            const wakeStyle = /^\s*\./.test(trimmed) ? 'dot' : 'sugar';
                             const sivaMessage =
                                 stripSivaCharacterAiTriggers(trimmed) || trimmed;
+                            console.log(
+                                `[AI-CHAT] ${sivaHit ? `sugar(${wakeStyle})` : 'lurk'} ← ${senderLabel}: ${String(sivaMessage).slice(0, 120)}`
+                            );
                             void (async () => {
                                 try {
                                     const res = sivaHit
@@ -823,6 +812,7 @@ export const createIncomingMessageHandler = (ctx) => {
                                               imvu_avatar_id: avatarForLog,
                                               already_logged_user_message: true,
                                               new_thread: messageStartsNewSivaThread(trimmed),
+                                              wake: wakeStyle,
                                           })
                                         : await axios.post(`${ctx.API_BASE_URL}/api/lurk`, {
                                               message: trimmed,
@@ -847,6 +837,11 @@ export const createIncomingMessageHandler = (ctx) => {
                                             participantUsername: senderLabel,
                                             participantAvatarId: avatarForLog ?? undefined,
                                         });
+                                    } else {
+                                        console.warn(
+                                            `[AI-CHAT] empty reply from ${sivaHit ? '/api/siva-chat' : '/api/lurk'} ` +
+                                                `(status ${res.status}). Check GROQ_API_KEY in Laravel .env`
+                                        );
                                     }
                                 } catch (e) {
                                     console.error(`[AI-CHAT] Error communicating with AI backend:`, e.message);

@@ -3,26 +3,10 @@ import { backendApiBaseUrl } from './env-app-url.js';
 
 const BACKEND_URL = backendApiBaseUrl('http://127.0.0.1:8000');
 const deliveryInflight = new Set();
-const localRetryUntil = new Map();
+/** `${dashboardUserId}:${code}` — do not retry the same failed delivery */
+const deliveryAbandoned = new Set();
 const lastWarnAt = new Map();
 const CODE_PATTERN = /\b([A-Z0-9]{6})\b/i;
-
-function envInt(key, fallback) {
-    const value = parseInt(process.env[key] || '', 10);
-    return Number.isFinite(value) && value > 0 ? value : fallback;
-}
-
-function retryMs() {
-    return envInt('IMVU_VERIFY_DM_RETRY_MS', 2 * 60 * 1000);
-}
-
-function rateLimitMs() {
-    return envInt('IMVU_VERIFY_DM_RATE_LIMIT_MS', 10 * 60 * 1000);
-}
-
-function normalizeUsername(value) {
-    return String(value || '').trim().toLowerCase();
-}
 
 function isDmRateLimited(dm) {
     if (dm?.rateLimited) return true;
@@ -30,12 +14,16 @@ function isDmRateLimited(dm) {
     return reason.includes('429') || reason.includes('rate-001');
 }
 
-function markLocalRetry(dashboardUserId, ms) {
-    localRetryUntil.set(Number(dashboardUserId), Date.now() + ms);
+function abandonKey(dashboardUserId, code) {
+    return `${Number(dashboardUserId)}:${String(code || '').trim().toUpperCase()}`;
 }
 
-function isLocallyCoolingDown(dashboardUserId) {
-    return Date.now() < (localRetryUntil.get(Number(dashboardUserId)) || 0);
+function abandonDelivery(dashboardUserId, code) {
+    deliveryAbandoned.add(abandonKey(dashboardUserId, code));
+}
+
+function isDeliveryAbandoned(dashboardUserId, code) {
+    return deliveryAbandoned.has(abandonKey(dashboardUserId, code));
 }
 
 function warnOnce(logger, logPrefix, key, message) {
@@ -75,11 +63,13 @@ async function reportDeliveryStatus(dashboardUserId, deliveryMethod, botName, { 
     });
 }
 
-async function reportDeliveryBlocked(dashboardUserId, { rateLimited = false } = {}) {
+/** Stop Laravel from re-queuing this delivery (rate limit / hard failure). */
+async function reportDeliveryAbandoned(dashboardUserId, { rateLimited = false } = {}) {
     await axios.post(`${BACKEND_URL}/api/imvu-verification/deliver-status`, {
         dashboard_user_id: Number(dashboardUserId),
         rate_limited: rateLimited,
         delivery_failed: !rateLimited,
+        abandon: true,
     });
 }
 
@@ -110,11 +100,11 @@ export async function processPendingVerificationDeliveries(ctx) {
             continue;
         }
 
-        if (isLocallyCoolingDown(dashboardUserId)) {
+        if (isDeliveryAbandoned(dashboardUserId, code)) {
             continue;
         }
 
-        const key = `${dashboardUserId}:${code}`;
+        const key = abandonKey(dashboardUserId, code);
         if (deliveryInflight.has(key)) continue;
         deliveryInflight.add(key);
 
@@ -137,18 +127,17 @@ export async function processPendingVerificationDeliveries(ctx) {
                 if (dm?.ok) {
                     await reportDeliveryStatus(dashboardUserId, 'direct_message', ctx.botName);
                     logger.log(`${logPrefix} sent code via IMVU message to ${username} (user-${targetUserId})`);
-                    localRetryUntil.delete(dashboardUserId);
                     continue;
                 }
 
                 if (isDmRateLimited(dm)) {
-                    markLocalRetry(dashboardUserId, rateLimitMs());
-                    await reportDeliveryBlocked(dashboardUserId, { rateLimited: true });
+                    abandonDelivery(dashboardUserId, code);
+                    await reportDeliveryAbandoned(dashboardUserId, { rateLimited: true });
                     warnOnce(
                         logger,
                         logPrefix,
                         `rate:${dashboardUserId}`,
-                        `IMVU rate limit for ${username}; retry in ${Math.round(rateLimitMs() / 60000)} min (or type the code in room chat)`
+                        `IMVU rate limit for ${username}; not retrying (type the code in room chat)`
                     );
                     continue;
                 }
@@ -159,30 +148,32 @@ export async function processPendingVerificationDeliveries(ctx) {
                         await reportDeliveryStatus(dashboardUserId, 'friend_request', ctx.botName, {
                             complete: false,
                         });
-                        markLocalRetry(dashboardUserId, envInt('IMVU_VERIFY_DM_FRIEND_PENDING_MS', 15 * 60 * 1000));
+                        abandonDelivery(dashboardUserId, code);
+                        // Clear pending on Laravel so we do not DM-spam after friend accept.
+                        await reportDeliveryAbandoned(dashboardUserId, { rateLimited: false }).catch(() => {});
                         logger.log(
-                            `${logPrefix} ${username} requires friends-only messages; friend request sent from bot — accept it on IMVU, then the code will arrive in messages`
+                            `${logPrefix} ${username} requires friends-only messages; friend request sent — accept on IMVU, then resend verification from the dashboard`
                         );
                         continue;
                     }
-                    markLocalRetry(dashboardUserId, retryMs());
-                    await reportDeliveryBlocked(dashboardUserId, { rateLimited: false });
+                    abandonDelivery(dashboardUserId, code);
+                    await reportDeliveryAbandoned(dashboardUserId, { rateLimited: false });
                     warnOnce(
                         logger,
                         logPrefix,
                         `friend:${dashboardUserId}`,
-                        `friend request to ${username} failed: ${friend?.reason || 'unknown'}`
+                        `friend request to ${username} failed: ${friend?.reason || 'unknown'}; not retrying`
                     );
                     continue;
                 }
 
-                markLocalRetry(dashboardUserId, retryMs());
-                await reportDeliveryBlocked(dashboardUserId, { rateLimited: false });
+                abandonDelivery(dashboardUserId, code);
+                await reportDeliveryAbandoned(dashboardUserId, { rateLimited: false });
                 warnOnce(
                     logger,
                     logPrefix,
                     `dm:${dashboardUserId}`,
-                    `direct message to ${username} failed: ${dm?.reason || 'unknown'}`
+                    `direct message to ${username} failed: ${dm?.reason || 'unknown'}; not retrying`
                 );
                 continue;
             }
@@ -194,13 +185,13 @@ export async function processPendingVerificationDeliveries(ctx) {
                 `could not deliver code to ${username} via IMVU messages yet`
             );
         } catch (error) {
-            markLocalRetry(dashboardUserId, retryMs());
-            await reportDeliveryBlocked(dashboardUserId, { rateLimited: false }).catch(() => {});
+            abandonDelivery(dashboardUserId, code);
+            await reportDeliveryAbandoned(dashboardUserId, { rateLimited: false }).catch(() => {});
             warnOnce(
                 logger,
                 logPrefix,
                 `error:${dashboardUserId}`,
-                `delivery failed for ${username}: ${error?.message || error}`
+                `delivery failed for ${username}: ${error?.message || error}; not retrying`
             );
         } finally {
             deliveryInflight.delete(key);

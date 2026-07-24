@@ -1,20 +1,21 @@
 /**
- * Character.AI "Siva" triggers — chat commands and name mentions.
- * Matches: !siva, !s (not !siva), whole-word siva (case-insensitive).
+ * Sugar AI triggers (case-insensitive):
+ * - Message contains "sugar" (e.g. sugar, !sugar, SugarNix), OR
+ * - Message starts with "." (silent ask, e.g. ".how do I play music")
  *
- * After the first trigger, follow-up messages in the same room (no !siva needed)
- * stay in the Siva thread until the session expires or the user sends !endsiva.
+ * No open follow-up session — only those messages get an AI reply.
  */
 
-const HAS_SIVA_COMMAND = /\!siva\b/i;
-const HAS_NEW_SIVA_COMMAND = /\!newsiva\b/i;
-/** !s as its own token — avoids matching the !s prefix of !siva */
-const HAS_SHORT_S_COMMAND = /(?:^|[\s,])!s(?:$|[\s,])/i;
-const HAS_SIVA_WORD = /\bsiva\b/i;
-const ENDS_SIVA_COMMAND = /\!endsiva\b/i;
-const NEW_SIVA_THREAD_COMMAND = /\!newsiva\b/i;
+const HAS_SUGAR_COMMAND = /\!sugar\b/i;
+const HAS_NEW_SUGAR_COMMAND = /\!newsugar\b/i;
+/** Any word that contains "sugar" anywhere inside it */
+const HAS_SUGAR_SUBSTRING = /sugar/i;
+/** Silent ask: first non-space char is "." */
+const STARTS_WITH_DOT = /^\s*\./;
+const ENDS_SESSION_COMMAND = /\!endsugar\b|\!endsiva\b/i;
+const NEW_THREAD_COMMAND = /\!newsugar\b|\!newsiva\b/i;
 
-/** roomId:senderId -> last activity timestamp */
+/** roomId:senderId -> last activity timestamp (optional; not used for auto-follow-ups) */
 const sivaSessionLastAt = new Map();
 
 function sessionKey(roomId, senderId) {
@@ -30,24 +31,18 @@ export function messageInvokesSivaCharacterAi(text) {
     if (typeof text !== 'string' || !text.trim()) {
         return false;
     }
-    if (HAS_SIVA_COMMAND.test(text) || HAS_NEW_SIVA_COMMAND.test(text)) {
+    if (STARTS_WITH_DOT.test(text)) {
         return true;
     }
-    if (HAS_SHORT_S_COMMAND.test(text)) {
-        return true;
-    }
-    if (HAS_SIVA_WORD.test(text)) {
-        return true;
-    }
-    return false;
+    return HAS_SUGAR_SUBSTRING.test(text);
 }
 
 export function messageEndsSivaSession(text) {
-    return typeof text === 'string' && ENDS_SIVA_COMMAND.test(text);
+    return typeof text === 'string' && ENDS_SESSION_COMMAND.test(text);
 }
 
 export function messageStartsNewSivaThread(text) {
-    return typeof text === 'string' && NEW_SIVA_THREAD_COMMAND.test(text);
+    return typeof text === 'string' && NEW_THREAD_COMMAND.test(text);
 }
 
 /** Room commands (!move, !help, …) should not continue a Siva Q&A thread. */
@@ -59,7 +54,7 @@ export function isLikelyRoomCommand(text) {
     if (!t.startsWith('!')) {
         return false;
     }
-    if (ENDS_SIVA_COMMAND.test(t) || NEW_SIVA_THREAD_COMMAND.test(t)) {
+    if (ENDS_SESSION_COMMAND.test(t) || NEW_THREAD_COMMAND.test(t) || HAS_SUGAR_COMMAND.test(t) || HAS_NEW_SUGAR_COMMAND.test(t)) {
         return false;
     }
     return /^![a-z]/i.test(t);
@@ -108,18 +103,22 @@ function pruneSivaSessions() {
 }
 
 /**
- * Remove trigger tokens so the upstream character only sees the user's intent.
+ * Remove wake tokens so the model only sees the user's intent.
  */
 export function stripSivaCharacterAiTriggers(message) {
     if (typeof message !== 'string') {
         return '';
     }
-    let q = message;
-    q = q.replace(/\!siva\b/gi, ' ');
-    q = q.replace(/\!newsiva\b/gi, ' ');
+    let q = message.trim();
+    // Silent ask: ".how do I …" → "how do I …"
+    if (q.startsWith('.')) {
+        q = q.slice(1).trim();
+    }
+    q = q.replace(/\!endsugar\b/gi, ' ');
     q = q.replace(/\!endsiva\b/gi, ' ');
-    q = q.replace(/\bsiva\b/gi, ' ');
-    q = q.replace(/(^|[\s,])!s($|[\s,])/gi, '$1 ');
+    q = q.replace(/\!newsiva\b/gi, ' ');
+    // Strip any token that contains "sugar" (sugar, !sugar, SugarNix, …)
+    q = q.replace(/\S*sugar\S*/gi, ' ');
     q = q.replace(/\s+/g, ' ').trim();
     return q;
 }
