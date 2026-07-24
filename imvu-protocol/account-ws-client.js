@@ -358,6 +358,20 @@ export class ImvuAccountWebSocketClient extends EventEmitter {
         this.pingTimer = null;
     }
 
+    /** Close the shared account socket so the normal reconnect path re-auths IMQ. */
+    requestReconnect(reason = 'manual') {
+        if (this.closedByUser) return false;
+        if (!this.ws || this.ws.readyState >= WebSocket.CLOSING) return false;
+        const text = String(reason || 'manual').slice(0, 100);
+        this.logger.warn(`[IMVU-ACCOUNT-WS] reconnect requested (${text})`);
+        try {
+            this.ws.close(4000, text);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
     close() {
         this.closedByUser = true;
         this.#stopPing();
@@ -394,6 +408,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
         this.visibilityBootstrapPending = false;
         this.unknownUserRepairInFlight = false;
         this.unknownUserRepairCooldownUntil = 0;
+        this.unknownUserRepairFailures = 0;
         this.unknownUserRepairBackoffMs = Math.max(
             1000,
             envInt('IMVU_UNKNOWN_USER_REPAIR_COOLDOWN_MS', 5000)
@@ -446,6 +461,8 @@ export class ImvuAccountRoomClient extends EventEmitter {
         this.discoveringLegacyChat = false;
         this.participantReady = false;
         this.unknownUserRepairInFlight = false;
+        this.unknownUserRepairFailures = 0;
+        this.unknownUserRepairCooldownUntil = 0;
         if (this.visibleRetryTimer) clearTimeout(this.visibleRetryTimer);
         this.visibleRetryTimer = null;
         this.#stopVisibilityHeartbeat();
@@ -536,6 +553,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
         if (action.record === 'msg_g2c_result' && action.status === 0 && this.visibilityBootstrapPending) {
             this.visibilityBootstrapPending = false;
             this.visibilityBootstrapped = true;
+            this.unknownUserRepairFailures = 0;
             this.unknownUserRepairBackoffMs = Math.max(
                 1000,
                 envInt('IMVU_UNKNOWN_USER_REPAIR_COOLDOWN_MS', 5000)
@@ -547,6 +565,8 @@ export class ImvuAccountRoomClient extends EventEmitter {
             String(action.error_message || '') === 'unknown_user'
         ) {
             if (this.participantReady || this.visibilityBootstrapped || this.visibilityBootstrapPending) {
+                this.visibilityBootstrapped = false;
+                this.visibilityBootstrapPending = false;
                 this.logger.warn(
                     `[IMVU-WS][${this.roomId}] IMVU unknown_user (op ${action.op_id}); scheduling participant repair`
                 );
@@ -596,6 +616,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
         if (!intervalMs || this.visibleHeartbeatTimer || !this.visibilityEnabled) return;
         this.visibleHeartbeatTimer = setInterval(() => {
             if (!this.isOpen || !this.chatQueue || !this.participantReady || this.closedByUser) return;
+            if (this.presenceRepairInFlight || !this.visibilityBootstrapped) return;
             void this.ensureVisible('visible-heartbeat');
         }, intervalMs);
     }
@@ -620,29 +641,91 @@ export class ImvuAccountRoomClient extends EventEmitter {
         void this.#runUnknownUserRepair(opId);
     }
 
+    async #hardRejoinParticipant() {
+        const userId = String(this.bot.imqUserId || this.bot.user_id || this.bot.userId || '').trim();
+        if (!/^\d+$/.test(userId)) return false;
+        this.participantReady = false;
+        this.lastParticipantEnsureOkAt = 0;
+        if (typeof this.session?.removeChatParticipant === 'function') {
+            try {
+                await this.session.removeChatParticipant(this.roomId, userId);
+            } catch (error) {
+                this.logger.warn(
+                    `[IMVU-WS][${this.roomId}] unknown_user hard rejoin DELETE failed: ${error?.message || error}`
+                );
+            }
+            const gapMs = Math.max(0, envInt('IMVU_UNKNOWN_USER_HARD_REJOIN_GAP_MS', 1500));
+            if (gapMs) await delay(gapMs);
+        }
+        return this.#ensureChatParticipantWithRetry();
+    }
+
+    #scheduleUnknownUserRepairRetry() {
+        if (this.closedByUser || this.visibilityBootstrapped) return;
+        const waitMs = Math.max(1000, this.unknownUserRepairBackoffMs);
+        setTimeout(() => {
+            if (this.closedByUser || !this.isOpen || this.visibilityBootstrapped) return;
+            if (this.unknownUserRepairInFlight) return;
+            void this.#scheduleUnknownUserRepair('retry');
+        }, waitMs);
+    }
+
     async #runUnknownUserRepair(opId) {
         if (this.unknownUserRepairInFlight || this.closedByUser || !this.isOpen) return;
         this.unknownUserRepairInFlight = true;
         this.visibilityBootstrapped = false;
         this.visibilityBootstrapPending = false;
+        this.unknownUserRepairFailures += 1;
+        const failure = this.unknownUserRepairFailures;
+        const hardRejoinAfter = Math.max(1, envInt('IMVU_UNKNOWN_USER_HARD_REJOIN_AFTER', 2));
+        const reconnectAfter = Math.max(
+            hardRejoinAfter + 1,
+            envInt('IMVU_UNKNOWN_USER_RECONNECT_AFTER', 3)
+        );
 
         try {
+            this.logger.warn(
+                `[IMVU-WS][${this.roomId}] unknown_user repair #${failure} (op ${opId})`
+            );
+
+            if (failure >= reconnectAfter && typeof this.account.requestReconnect === 'function') {
+                this.logger.warn(
+                    `[IMVU-WS][${this.roomId}] unknown_user persists after ${failure} repairs; reconnecting account WS`
+                );
+                this.account.requestReconnect(`unknown_user:${this.roomId}`);
+                return;
+            }
+
             const stickyMs = Math.max(0, envInt('IMVU_PARTICIPANT_STICKY_MS', 120000));
             const participantSticky =
+                failure < hardRejoinAfter &&
                 this.participantReady &&
                 stickyMs > 0 &&
                 Date.now() - (this.lastParticipantEnsureOkAt || 0) < stickyMs;
 
-            if (!participantSticky) {
-                const ok = await this.#ensureChatParticipantWithRetry();
-                if (!ok || !this.isOpen) {
-                    this.logger.warn(
-                        `[IMVU-WS][${this.roomId}] unknown_user repair: participant POST failed (op ${opId})`
-                    );
-                    return;
-                }
-                const readyDelayMs = Math.max(0, envInt('IMVU_WS_PARTICIPANT_READY_DELAY_MS', 1500));
-                if (readyDelayMs) await delay(readyDelayMs);
+            let ok = true;
+            if (failure >= hardRejoinAfter) {
+                ok = await this.#hardRejoinParticipant();
+            } else if (!participantSticky) {
+                ok = await this.#ensureChatParticipantWithRetry();
+            }
+
+            if (!ok || !this.isOpen) {
+                this.logger.warn(
+                    `[IMVU-WS][${this.roomId}] unknown_user repair: participant edge failed (op ${opId})`
+                );
+                return;
+            }
+            const readyDelayMs = Math.max(0, envInt('IMVU_WS_PARTICIPANT_READY_DELAY_MS', 1500));
+            if (readyDelayMs) await delay(readyDelayMs);
+
+            // Prefer a fresh legacy queue after hard rejoin; sticky queue can be orphaned.
+            if (failure >= hardRejoinAfter) {
+                this.chatQueue = '';
+                this.legacyChatSubscribed = false;
+                this.legacyChatOpId = null;
+                await this.#discoverLegacyChatQueue();
+                return;
             }
 
             if (this.chatQueue) {
@@ -668,6 +751,9 @@ export class ImvuAccountRoomClient extends EventEmitter {
                     Math.floor(this.unknownUserRepairBackoffMs * 1.5)
                 )
             );
+            if (!this.visibilityBootstrapped && !this.closedByUser) {
+                this.#scheduleUnknownUserRepairRetry();
+            }
         }
     }
 
@@ -676,6 +762,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
         if (!intervalMs || this.forceVisibleRefreshTimer || !this.visibilityEnabled) return;
         this.forceVisibleRefreshTimer = setInterval(() => {
             if (this.forceVisibleRefreshRunning || this.closedByUser || !this.isOpen) return;
+            if (this.presenceRepairInFlight || !this.visibilityBootstrapped) return;
             this.forceVisibleRefreshRunning = true;
             void this.ensureVisible('force-refresh').finally(() => {
                 this.forceVisibleRefreshRunning = false;
@@ -897,6 +984,13 @@ export class ImvuAccountRoomClient extends EventEmitter {
     async ensureVisible(reason = 'manual') {
         if (!this.visibilityEnabled || this.closedByUser) return false;
         const now = Date.now();
+        const softRefresh = reason === 'force-refresh' || reason === 'visible-heartbeat';
+        if (softRefresh && (this.presenceRepairInFlight || !this.visibilityBootstrapped)) {
+            if (!this.presenceRepairInFlight && !this.visibilityBootstrapped) {
+                void this.#scheduleUnknownUserRepair(reason);
+            }
+            return false;
+        }
         const minGapMs = Math.max(5000, envInt('IMVU_ENSURE_VISIBLE_MIN_GAP_MS', 45000));
         if (reason === 'force-refresh' && now - this.lastEnsureVisibleAt < minGapMs) {
             return false;
@@ -907,7 +1001,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
             reason !== 'unknown-user-repair' &&
             reason !== 'legacy-chat-drop' &&
             reason !== 'participant-repair' &&
-            (reason === 'force-refresh' || reason === 'visible-heartbeat') &&
+            softRefresh &&
             this.participantReady &&
             this.legacyChatSubscribed &&
             Boolean(this.chatQueue);
@@ -918,7 +1012,6 @@ export class ImvuAccountRoomClient extends EventEmitter {
             void this.#discoverLegacyChatQueue();
             return false;
         }
-        const softRefresh = reason === 'force-refresh' || reason === 'visible-heartbeat';
         if (softRefresh && this.visibilityBootstrapped && this.participantReady) {
             this.lastEnsureVisibleAt = now;
             return true;
