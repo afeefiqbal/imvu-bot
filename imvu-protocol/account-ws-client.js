@@ -612,7 +612,8 @@ export class ImvuAccountRoomClient extends EventEmitter {
     }
 
     #scheduleVisibilityHeartbeat() {
-        const intervalMs = Math.max(0, envInt('IMVU_VISIBLE_HEARTBEAT_MS', 120000));
+        // IMVU drops room presence without a periodic participant REST touch (~every few minutes).
+        const intervalMs = Math.max(0, envInt('IMVU_VISIBLE_HEARTBEAT_MS', 180000));
         if (!intervalMs || this.visibleHeartbeatTimer || !this.visibilityEnabled) return;
         this.visibleHeartbeatTimer = setInterval(() => {
             if (!this.isOpen || !this.chatQueue || !this.participantReady || this.closedByUser) return;
@@ -985,6 +986,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
         if (!this.visibilityEnabled || this.closedByUser) return false;
         const now = Date.now();
         const softRefresh = reason === 'force-refresh' || reason === 'visible-heartbeat';
+        const isHeartbeat = reason === 'visible-heartbeat';
         if (softRefresh && (this.presenceRepairInFlight || !this.visibilityBootstrapped)) {
             if (!this.presenceRepairInFlight && !this.visibilityBootstrapped) {
                 void this.#scheduleUnknownUserRepair(reason);
@@ -996,17 +998,23 @@ export class ImvuAccountRoomClient extends EventEmitter {
             return false;
         }
         if (!this.isOpen) await this.connect();
-        const skipParticipantRest =
-            reason !== 'self-removed' &&
-            reason !== 'unknown-user-repair' &&
-            reason !== 'legacy-chat-drop' &&
-            reason !== 'participant-repair' &&
-            softRefresh &&
-            this.participantReady &&
-            this.legacyChatSubscribed &&
-            Boolean(this.chatQueue);
-        if (!skipParticipantRest) {
-            await this.#ensureChatParticipantWithRetry();
+        // Soft force-refresh may skip REST when healthy; heartbeat must never skip —
+        // that POST is the room keepalive (empty/refresh participant) IMVU expects.
+        if (isHeartbeat) {
+            await this.#ensureChatParticipant();
+        } else {
+            const skipParticipantRest =
+                reason !== 'self-removed' &&
+                reason !== 'unknown-user-repair' &&
+                reason !== 'legacy-chat-drop' &&
+                reason !== 'participant-repair' &&
+                softRefresh &&
+                this.participantReady &&
+                this.legacyChatSubscribed &&
+                Boolean(this.chatQueue);
+            if (!skipParticipantRest) {
+                await this.#ensureChatParticipantWithRetry();
+            }
         }
         if (!this.chatQueue || !this.legacyChatSubscribed) {
             void this.#discoverLegacyChatQueue();

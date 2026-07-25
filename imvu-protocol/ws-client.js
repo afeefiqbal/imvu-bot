@@ -411,7 +411,8 @@ export class ImvuRoomWebSocketClient extends EventEmitter {
         if (!this.visibilityEnabled) return false;
         if (!this.isOpen) await this.connect();
         const softRefresh = reason === 'force-refresh' || reason === 'visible-heartbeat';
-        if (!softRefresh) {
+        // Heartbeat must always touch /chat/.../participants (IMVU room keepalive).
+        if (!softRefresh || reason === 'visible-heartbeat') {
             await this.#ensureChatParticipant();
         }
         if (!this.chatQueue || !this.legacyChatSubscribed) {
