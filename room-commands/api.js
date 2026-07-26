@@ -51,9 +51,11 @@ export async function postBotRoomLeave(apiBaseUrl, botName, roomId, sender = {})
         );
         return response.data || { ok: false, message: 'empty response' };
     } catch (error) {
+        const data = error.response?.data;
         return {
             ok: false,
-            message: error.response?.data?.message || error.message || 'leave failed',
+            message: data?.error || data?.message || error.message || 'leave failed',
+            send_dm: data?.send_dm === true,
         };
     }
 }
@@ -62,7 +64,7 @@ export async function postBotRoomLeave(apiBaseUrl, botName, roomId, sender = {})
  * @param {string} apiBaseUrl
  * @param {string} botName
  * @param {string} roomId
- * @param {{ senderId?: string, senderLabel?: string }} sender
+ * @param {{ senderId?: string, senderLabel?: string, source?: 'dm'|'invite' }} sender
  */
 export async function postBotRoomJoin(apiBaseUrl, botName, roomId, sender = {}) {
     const base = String(apiBaseUrl || '').replace(/\/$/, '');
@@ -78,14 +80,17 @@ export async function postBotRoomJoin(apiBaseUrl, botName, roomId, sender = {}) 
                     ? Number(sender.senderId)
                     : null,
                 sender_username: sender.senderLabel ? String(sender.senderLabel) : null,
+                source: sender.source === 'dm' ? 'dm' : 'invite',
             },
             { timeout: 12000 }
         );
         return response.data || { ok: false, message: 'empty response' };
     } catch (error) {
+        const data = error.response?.data;
         return {
             ok: false,
-            message: error.response?.data?.message || error.message || 'join failed',
+            message: data?.error || data?.message || error.message || 'join failed',
+            send_dm: data?.send_dm === true,
         };
     }
 }

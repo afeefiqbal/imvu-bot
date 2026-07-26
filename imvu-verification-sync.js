@@ -142,27 +142,14 @@ export async function processPendingVerificationDeliveries(ctx) {
                     continue;
                 }
 
-                if (dm?.friendRequired && typeof ctx.session?.sendFriendRequest === 'function') {
-                    const friend = await ctx.session.sendFriendRequest(targetUserId, username);
-                    if (friend?.ok) {
-                        await reportDeliveryStatus(dashboardUserId, 'friend_request', ctx.botName, {
-                            complete: false,
-                        });
-                        abandonDelivery(dashboardUserId, code);
-                        // Clear pending on Laravel so we do not DM-spam after friend accept.
-                        await reportDeliveryAbandoned(dashboardUserId, { rateLimited: false }).catch(() => {});
-                        logger.log(
-                            `${logPrefix} ${username} requires friends-only messages; friend request sent — accept on IMVU, then resend verification from the dashboard`
-                        );
-                        continue;
-                    }
+                if (dm?.friendRequired) {
                     abandonDelivery(dashboardUserId, code);
                     await reportDeliveryAbandoned(dashboardUserId, { rateLimited: false });
                     warnOnce(
                         logger,
                         logPrefix,
                         `friend:${dashboardUserId}`,
-                        `friend request to ${username} failed: ${friend?.reason || 'unknown'}; not retrying`
+                        `${username} has friends-only messages — they must friend the bot first (bot never sends friend requests); not retrying`
                     );
                     continue;
                 }

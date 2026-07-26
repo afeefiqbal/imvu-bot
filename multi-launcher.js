@@ -636,7 +636,7 @@ async function run() {
         seenBotNames.add(canonicalName);
         if (rooms.length === 0) {
             console.log(
-                `[MULTI-LAUNCHER] ℹ️ Bot [${canonicalName}] has no rooms — launching idle (listens for DM !join).`
+                `[MULTI-LAUNCHER] ℹ️ Bot [${canonicalName}] has no rooms — launching idle (DM !join invites users when bot is in a room).`
             );
         }
         botsToLaunch.push({

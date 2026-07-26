@@ -203,6 +203,31 @@ function summarizeResponseData(data) {
     return body ? `: ${body.slice(0, 300)}` : '';
 }
 
+function denormalizedEntry(payload, preferredId = '') {
+    const denormalized = payload?.denormalized;
+    if (!denormalized || typeof denormalized !== 'object') return null;
+    const key = preferredId && denormalized[preferredId] ? preferredId : payload?.id;
+    if (key && denormalized[key]) return denormalized[key];
+    const values = Object.values(denormalized);
+    return values[0] || null;
+}
+
+function relationUrl(relations, key) {
+    if (!relations || typeof relations !== 'object') return '';
+    const raw = relations[key];
+    if (typeof raw === 'string' && raw.trim()) return raw.trim();
+    if (Array.isArray(raw)) {
+        const first = raw.find((v) => typeof v === 'string' && v.trim());
+        return first ? String(first).trim() : '';
+    }
+    return '';
+}
+
+function experienceIdFromUrl(url) {
+    const match = String(url || '').match(/experience-(\d+)/i);
+    return match ? match[1] : '';
+}
+
 function extractParticipantData(payload, roomId, userId) {
     const denormalized = payload?.denormalized;
     if (!denormalized || typeof denormalized !== 'object') return null;
@@ -883,10 +908,346 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         }
     }
 
+    const liveRoomContextCache = new Map();
+
+    async function fetchLiveRoomContext(roomId, { force = false } = {}) {
+        const normalizedRoomId = String(roomId || '').trim().replace(/^room-/i, '');
+        if (!/^\d+-\d+$/.test(normalizedRoomId)) return null;
+
+        const cached = liveRoomContextCache.get(normalizedRoomId);
+        const now = Date.now();
+        if (!force && cached && now - cached.fetchedAt < 60_000) {
+            return cached.value;
+        }
+
+        try {
+            const roomPayload = await apiGet(`/room/room-${normalizedRoomId}`);
+            const roomEntry = denormalizedEntry(roomPayload, `https://api.imvu.com/room/room-${normalizedRoomId}`);
+            const roomData = roomEntry?.data || {};
+            const roomRelations = roomEntry?.relations || {};
+            const supportsAudience = Boolean(roomData.supports_audience);
+            const hangoutUrl =
+                relationUrl(roomRelations, 'hangout_experience') ||
+                relationUrl(roomRelations, 'media_experience');
+
+            if (!supportsAudience || !hangoutUrl) {
+                const value = null;
+                liveRoomContextCache.set(normalizedRoomId, { fetchedAt: now, value });
+                return null;
+            }
+
+            const hangoutPayload = await apiGet(hangoutUrl);
+            const hangoutEntry = denormalizedEntry(hangoutPayload, hangoutUrl);
+            const hangoutData = hangoutEntry?.data || {};
+            const hangoutRelations = hangoutEntry?.relations || {};
+            const audienceUrl = relationUrl(hangoutRelations, 'audience_experience');
+            const sceneUrl = relationUrl(hangoutRelations, 'scene_experience');
+            if (!audienceUrl) {
+                liveRoomContextCache.set(normalizedRoomId, { fetchedAt: now, value: null });
+                return null;
+            }
+
+            const audiencePayload = await apiGet(audienceUrl);
+            const audienceEntry = denormalizedEntry(audiencePayload, audienceUrl);
+            const audienceData = audienceEntry?.data || {};
+
+            let sceneData = {};
+            if (sceneUrl) {
+                try {
+                    const scenePayload = await apiGet(sceneUrl);
+                    sceneData = denormalizedEntry(scenePayload, sceneUrl)?.data || {};
+                } catch {
+                    /* scene metadata optional for audience join */
+                }
+            }
+
+            const hangoutExperienceId = experienceIdFromUrl(hangoutUrl);
+            const value = {
+                isLive: true,
+                roomId: normalizedRoomId,
+                mimicChatRoom: Boolean(roomData.mimic_chat_room),
+                hangoutExperienceUrl: hangoutUrl,
+                hangoutExperienceId,
+                hangoutQueue: String(hangoutData.queue || '').trim(),
+                hangoutStateMount: String(hangoutData.state_mount || '').trim(),
+                audienceExperienceUrl: audienceUrl,
+                audienceQueue: String(audienceData.queue || '').trim(),
+                audienceMessageMount: String(audienceData.message_mount || 'audience_message_mount').trim(),
+                audienceStateMount: String(audienceData.state_mount || '').trim(),
+                sceneExperienceUrl: sceneUrl,
+                sceneQueue: String(sceneData.queue || '').trim(),
+                sceneMessageMount: String(sceneData.message_mount || '').trim(),
+                sceneStateMount: String(sceneData.state_mount || '').trim(),
+                chatId: hangoutExperienceId || normalizedRoomId.split('-')[1] || normalizedRoomId,
+            };
+            liveRoomContextCache.set(normalizedRoomId, { fetchedAt: now, value });
+            return value;
+        } catch (error) {
+            logger.warn(
+                `[IMVU-SESSION] Could not resolve live/audience context for room ${normalizedRoomId}: ${error.message}`
+            );
+            return null;
+        }
+    }
+
+    async function postExperienceAction(experienceUrl, actionType, roomId) {
+        const url = String(experienceUrl || '').trim();
+        if (!url) return { ok: false, status: 0, data: null, error: 'missing experience url' };
+        const sauce = await resolveImvuSauce();
+        const normalizedRoomId = String(roomId || '').trim().replace(/^room-/i, '');
+        const response = await client.request({
+            method: 'post',
+            url,
+            data: { action: { type: actionType } },
+            headers: {
+                Accept: 'application/json; charset=utf-8',
+                'Content-Type': 'application/json; charset=UTF-8',
+                Origin: process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN,
+                Referer: `${process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN}/next/chat/room-${normalizedRoomId}/`,
+                'X-IMVU-Application': process.env.IMVU_X_APPLICATION || 'next_desktop/1',
+                ...(sauce ? { 'X-IMVU-Sauce': sauce } : {}),
+            },
+            validateStatus: (status) => status >= 200 && status < 500,
+        });
+        const failure = parseImvuApiFailure(response.data);
+        const already =
+            failure?.error === 'AUDIENCE-EXPERIENCE-005' ||
+            /already joined/i.test(String(failure?.message || ''));
+        const ok =
+            (response.status >= 200 && response.status < 300) ||
+            response.status === 409 ||
+            already;
+        return {
+            ok,
+            status: response.status,
+            data: response.data,
+            error: failure?.error || '',
+            message: failure?.message || '',
+            already,
+        };
+    }
+
+    async function ensureAudienceJoin(roomId, context = null) {
+        const normalizedRoomId = String(roomId || '').trim().replace(/^room-/i, '');
+        const live = context?.isLive ? context : await fetchLiveRoomContext(normalizedRoomId);
+        if (!live?.audienceExperienceUrl) return false;
+
+        const result = await postExperienceAction(live.audienceExperienceUrl, 'join', normalizedRoomId);
+        if (!result.ok) {
+            logger.warn(
+                `[IMVU-SESSION] Audience join failed for room ${normalizedRoomId}: ` +
+                    `${result.status}${result.error ? ` ${result.error}` : ''}` +
+                    `${result.message ? ` ${result.message}` : ''}`
+            );
+            return false;
+        }
+        logger.log(
+            `[IMVU-SESSION] Joined audience experience for room ${normalizedRoomId}` +
+                ` via POST ${live.audienceExperienceUrl}` +
+                (result.already ? ' (already joined)' : ` ${result.status}`) +
+                '.'
+        );
+        return { ...live, mode: 'audience', status: result.status, already: result.already };
+    }
+
+    async function leaveAudienceJoin(roomId, context = null) {
+        const normalizedRoomId = String(roomId || '').trim().replace(/^room-/i, '');
+        const live = context?.isLive ? context : await fetchLiveRoomContext(normalizedRoomId);
+        if (!live?.audienceExperienceUrl) return { ok: false, status: 'not_live', attempts: [] };
+
+        const result = await postExperienceAction(live.audienceExperienceUrl, 'leave', normalizedRoomId);
+        if (!result.ok) {
+            logger.warn(
+                `[IMVU-SESSION] Audience leave failed for room ${normalizedRoomId}: ` +
+                    `${result.status}${result.error ? ` ${result.error}` : ''}`
+            );
+            return { ok: false, status: result.status, attempts: [result] };
+        }
+        logger.log(`[IMVU-SESSION] Left audience experience for room ${normalizedRoomId}.`);
+        return { ok: true, status: result.status, attempts: [result], mode: 'audience' };
+    }
+
+    /**
+     * Send a room invite to another user (classic chat invites edge, or live sendInvite).
+     * Returns inviteId + joinUrl when IMVU accepts the invite.
+     */
+    async function inviteUserToRoom(roomId, recipientUserId) {
+        const normalizedRoomId = String(roomId || '').trim().replace(/^room-/i, '');
+        const recipientId = String(recipientUserId || '').trim();
+        if (!/^\d+-\d+$/.test(normalizedRoomId) || !/^\d+$/.test(recipientId)) {
+            return { ok: false, error: 'invalid', message: 'Invalid room or recipient id' };
+        }
+
+        const joinUrl =
+            String(process.env.IMVU_ROOM_JOIN_URL_TEMPLATE || '')
+                .replace(/\{room\}/gi, normalizedRoomId)
+                .trim() || `https://go.imvu.com/chat/room-${normalizedRoomId}`;
+
+        // Inviter must be a participant for classic chat invites to deliver.
+        const botUserId = await resolveBotUserId();
+        if (botUserId) {
+            await ensureChatParticipant(normalizedRoomId, botUserId).catch(() => false);
+        }
+
+        const sauce = await resolveImvuSauce();
+        const headers = {
+            Accept: 'application/json; charset=utf-8',
+            'Content-Type': 'application/json; charset=UTF-8',
+            Origin: process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN,
+            Referer: `${process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN}/next/chat/room-${normalizedRoomId}/`,
+            'X-IMVU-Application': process.env.IMVU_X_APPLICATION || 'next_desktop/1',
+            ...(sauce ? { 'X-IMVU-Sauce': sauce } : {}),
+        };
+
+        const live = await fetchLiveRoomContext(normalizedRoomId);
+        if (live?.isLive && live.audienceExperienceUrl) {
+            const response = await client.request({
+                method: 'post',
+                url: live.audienceExperienceUrl,
+                data: {
+                    action: {
+                        type: 'sendInvite',
+                        payload: { recipient: recipientId },
+                    },
+                },
+                headers,
+                validateStatus: (status) => status >= 200 && status < 500,
+            });
+            const failure = parseImvuApiFailure(response.data);
+            const ok = response.status >= 200 && response.status < 300;
+            if (!ok) {
+                logger.warn(
+                    `[IMVU-SESSION] Live room invite to user-${recipientId} for ${normalizedRoomId} failed: ` +
+                        `${response.status}${failure?.error ? ` ${failure.error}` : ''}` +
+                        `${failure?.message ? ` ${failure.message}` : ''}`
+                );
+                return {
+                    ok: false,
+                    mode: 'audience',
+                    status: response.status,
+                    error: failure?.error || '',
+                    message: failure?.message || `HTTP ${response.status}`,
+                    joinUrl,
+                };
+            }
+            logger.log(
+                `[IMVU-SESSION] Invited user-${recipientId} to live room ${normalizedRoomId} via audience sendInvite.`
+            );
+            return {
+                ok: true,
+                mode: 'audience',
+                status: response.status,
+                inviteId: '',
+                joinUrl,
+                roomId: normalizedRoomId,
+            };
+        }
+
+        // Official Next: room.getSingleEdge("chat").getEdgeCollection("invites").create({relations:{recipient:user.url()}})
+        let inviteUrl = new URL(
+            `chat/chat-${normalizedRoomId}/invites`,
+            `${DEFAULT_API_ORIGIN}/`
+        ).href;
+        try {
+            const roomPayload = await apiGet(`/room/room-${normalizedRoomId}`);
+            const roomNode =
+                roomPayload?.denormalized?.[`https://api.imvu.com/room/room-${normalizedRoomId}`] ||
+                null;
+            const chatUrl = String(roomNode?.relations?.chat || '').trim();
+            if (chatUrl) {
+                const chatPayload = await apiGet(chatUrl.replace(/^https?:\/\/api\.imvu\.com/i, ''));
+                const chatNode = chatPayload?.denormalized?.[chatUrl] || null;
+                const collectionUrl = String(chatNode?.relations?.invites || '').trim();
+                if (collectionUrl) inviteUrl = collectionUrl;
+            }
+        } catch {
+            // Fall back to chat/chat-{roomId}/invites
+        }
+
+        // Match EdgeCollection.create — user node URL only (not profile).
+        const recipient = `https://api.imvu.com/user/user-${recipientId}`;
+        const response = await client.request({
+            method: 'post',
+            url: inviteUrl,
+            data: { relations: { recipient } },
+            headers,
+            validateStatus: (status) => status >= 200 && status < 500,
+        });
+        const failure = parseImvuApiFailure(response.data);
+        const ok =
+            (response.status >= 200 && response.status < 300) || response.status === 409;
+        if (!ok) {
+            logger.warn(
+                `[IMVU-SESSION] Chat invite to user-${recipientId} for ${normalizedRoomId} failed: ` +
+                    `${response.status}${failure?.error ? ` ${failure.error}` : ''}` +
+                    `${failure?.message ? ` ${failure.message}` : ''}`
+            );
+            return {
+                ok: false,
+                mode: 'chat',
+                status: response.status,
+                error: failure?.error || '',
+                message: failure?.message || `HTTP ${response.status}`,
+                joinUrl,
+            };
+        }
+
+        const location =
+            String(response.headers?.location || response.headers?.Location || '').trim() ||
+            String(response.data?.id || '').trim();
+        // Official client loads Location into the invites collection after 201.
+        if (location) {
+            try {
+                await client.get(location, {
+                    headers,
+                    validateStatus: (status) => status >= 200 && status < 500,
+                });
+            } catch {
+                // non-fatal
+            }
+        }
+
+        const inviteIdMatch = location.match(/invite-(\d+)/i);
+        const inviteId = inviteIdMatch ? inviteIdMatch[1] : '';
+        const roomRel =
+            response.data?.denormalized?.[`https://api.imvu.com/invite/invite-${inviteId}`]
+                ?.relations?.room || '';
+        logger.log(
+            `[IMVU-SESSION] Invited user-${recipientId} to room ${normalizedRoomId}` +
+                ` via chat invites ${response.status}` +
+                (inviteId ? ` (invite-${inviteId})` : '') +
+                (roomRel ? ` room=${roomRel}` : '') +
+                '.'
+        );
+        return {
+            ok: true,
+            mode: 'chat',
+            status: response.status,
+            inviteId,
+            joinUrl,
+            roomId: normalizedRoomId,
+            inviteUrl: location || inviteUrl,
+        };
+    }
+
     async function ensureChatParticipant(roomId, userId, options = {}) {
         const normalizedRoomId = String(roomId || '').trim().replace(/^room-/i, '');
         const normalizedUserId = String(userId || '').trim();
         if (!/^\d+-\d+$/.test(normalizedRoomId) || !/^\d+$/.test(normalizedUserId)) return false;
+
+        const live = await fetchLiveRoomContext(normalizedRoomId);
+        if (live?.isLive) {
+            const joined = await ensureAudienceJoin(normalizedRoomId, live);
+            if (!joined) return false;
+            return {
+                participant: null,
+                method: 'post',
+                path: live.audienceExperienceUrl,
+                status: joined.status,
+                mode: 'audience',
+                live,
+            };
+        }
 
         const refreshPayload = participantSeatPayload(options.participant);
         const candidates = refreshPayload
@@ -934,7 +1295,7 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
               ];
 
         const sauce = await resolveImvuSauce();
-        let lastError = '';
+        const failures = [];
         for (const candidate of candidates) {
             try {
                 const response = await client.request({
@@ -968,14 +1329,18 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                         status: response.status,
                     };
                 }
-                lastError = `${candidate.method.toUpperCase()} ${candidate.path} ${response.status}${summarizeResponseData(response.data)}`;
+                failures.push(
+                    `${candidate.method.toUpperCase()} ${candidate.path} ${response.status}${summarizeResponseData(response.data)}`
+                );
             } catch (error) {
-                lastError = `${candidate.method.toUpperCase()} ${candidate.path} ${error.message}`;
+                failures.push(`${candidate.method.toUpperCase()} ${candidate.path} ${error.message}`);
             }
         }
 
+        const primary = failures.find((f) => /AUTHORIZATION|FORBIDDEN|403/i.test(f)) || failures[0] || 'no method attempted';
         logger.warn(
-            `[IMVU-SESSION] Could not ensure chat participant user-${normalizedUserId} in chat-${normalizedRoomId}: ${lastError || 'no method attempted'}`
+            `[IMVU-SESSION] Could not ensure chat participant user-${normalizedUserId} in chat-${normalizedRoomId}: ${primary}` +
+                (failures.length > 1 ? ` (+${failures.length - 1} more)` : '')
         );
         return false;
     }
@@ -985,6 +1350,11 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         const normalizedUserId = String(userId || '').trim();
         if (!/^\d+-\d+$/.test(normalizedRoomId) || !/^\d+$/.test(normalizedUserId)) {
             return { ok: false, status: 'invalid', attempts: [] };
+        }
+
+        const live = await fetchLiveRoomContext(normalizedRoomId);
+        if (live?.isLive) {
+            return leaveAudienceJoin(normalizedRoomId, live);
         }
 
         const sauce = await resolveImvuSauce();
@@ -1477,34 +1847,10 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
     }
 
     async function sendFriendRequest(targetUserId, targetUsername = '') {
-        const botId = await resolveBotUserId();
-        const targetId = String(targetUserId || '').trim();
-        if (!botId || !/^\d+$/.test(targetId)) {
-            return { ok: false, reason: 'invalid ids' };
-        }
-        try {
-            const refererUsername = String(targetUsername || '').trim();
-            const headers = await buildImvuApiHeaders({
-                Referer: refererUsername
-                    ? `${process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN}/next/av/${encodeURIComponent(refererUsername)}/`
-                    : `${process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN}/`,
-            });
-            const response = await apiPost(
-                `/user/user-${botId}/outbound_friend_requests`,
-                { id: `${DEFAULT_API_ORIGIN}/user/user-${targetId}` },
-                { headers }
-            );
-            if (response.status >= 200 && response.status < 300) {
-                logger.log(`[IMVU-SESSION] Sent friend request to user-${targetId}.`);
-                return { ok: true };
-            }
-            return {
-                ok: false,
-                reason: `status ${response.status}${summarizeResponseData(response.data)}`,
-            };
-        } catch (error) {
-            return { ok: false, reason: error.message || 'friend-request-failed' };
-        }
+        // Bot policy: never send outbound friend requests — only accept inbound ones.
+        void targetUserId;
+        void targetUsername;
+        return { ok: false, reason: 'outbound friend requests disabled' };
     }
 
     const watchedConversationPaths = new Set();
@@ -1892,14 +2238,20 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         return null;
     }
 
-    async function listDirectMessagesFromWatchedUsers(botId, headers, limit) {
+    async function listDirectMessagesFromUserIds(botId, headers, userIds, limit) {
         const messages = [];
         const seenMessageIds = new Set();
+        const ids = [...new Set(
+            (Array.isArray(userIds) ? userIds : [])
+                .map((id) => String(id || '').trim())
+                .filter((id) => /^\d+$/.test(id) && id !== String(botId))
+        )];
 
-        for (const userId of watchedDmUserIds) {
+        for (const userId of ids) {
             if (messages.length >= limit) break;
-            if (String(userId) === String(botId)) continue;
-            if (dmConversationAbsentUserIds.has(String(userId))) continue;
+            // Always retry hinted senders — a prior miss must not permanently skip them.
+            dmConversationAbsentUserIds.delete(String(userId));
+            watchDirectMessageUser(userId);
 
             const opened = await openDirectConversationWithUser(botId, userId, headers);
             if (!opened) continue;
@@ -1930,6 +2282,41 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         }
 
         return messages;
+    }
+
+    async function listDirectMessagesFromWatchedUsers(botId, headers, limit, preferUserIds = []) {
+        const preferred = [...new Set(
+            (Array.isArray(preferUserIds) ? preferUserIds : [])
+                .map((id) => String(id || '').trim())
+                .filter((id) => /^\d+$/.test(id))
+        )];
+        // Prefer recent WS senders first — otherwise room owners/mods fill the limit
+        // and we never open the conversation that actually sent !join.
+        const ordered = [
+            ...preferred,
+            ...[...watchedDmUserIds].filter((id) => !preferred.includes(String(id))),
+        ];
+        return listDirectMessagesFromUserIds(botId, headers, ordered, limit);
+    }
+
+    /** Fast path: fetch DMs only for specific user ids (WS messageReceived senders). */
+    async function listRecentDirectMessagesFromUsers(userIds, limit = 40) {
+        const botId = await resolveBotUserId();
+        if (!botId) return [];
+        try {
+            const headers = await directMessageHeaders();
+            return listDirectMessagesFromUserIds(
+                botId,
+                headers,
+                userIds,
+                Math.max(1, Math.min(limit, 50))
+            );
+        } catch (error) {
+            logger.warn(
+                `[IMVU-SESSION] Could not list DMs for users: ${error.message}`
+            );
+            return [];
+        }
     }
 
     async function fetchConversationListRefs(botId, headers, limit) {
@@ -2069,7 +2456,10 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
 
         try {
             const headers = await buildImvuApiHeaders();
-            const url = new URL(`user/user-${botId}/inbound_friend_requests`, `${DEFAULT_API_ORIGIN}/`).href;
+            const url = new URL(
+                `user/user-${botId}/inbound_friend_requests?limit=25`,
+                `${DEFAULT_API_ORIGIN}/`
+            ).href;
             const response = await client.get(url, {
                 headers: { Accept: 'application/json; charset=utf-8', ...headers },
                 validateStatus: (status) => status >= 200 && status < 500,
@@ -2078,10 +2468,40 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
 
             const denorm = response.data?.denormalized || {};
             const ids = [];
-            for (const key of Object.keys(denorm)) {
-                const match = key.match(/\/inbound_friend_requests\/user-(\d+)/i);
-                if (match) ids.push(match[1]);
+            const seen = new Set();
+
+            const pushId = (raw) => {
+                const id = String(raw || '').trim();
+                if (!/^\d+$/.test(id) || seen.has(id)) return;
+                seen.add(id);
+                ids.push(id);
+            };
+
+            // Prefer the collection's items list (pending requests only).
+            for (const [key, node] of Object.entries(denorm)) {
+                if (!/\/inbound_friend_requests(?:\?|$)/i.test(key)) continue;
+                if (/\/inbound_friend_requests\/user-\d+/i.test(key)) continue;
+                const items = node?.data?.items;
+                if (!Array.isArray(items)) continue;
+                for (const item of items) {
+                    const match = String(item || '').match(/\/inbound_friend_requests\/user-(\d+)/i);
+                    if (match) pushId(match[1]);
+                }
             }
+
+            // Fallback: edge keys that still look pending.
+            if (!ids.length) {
+                for (const [key, node] of Object.entries(denorm)) {
+                    const match = key.match(/\/inbound_friend_requests\/user-(\d+)/i);
+                    if (!match) continue;
+                    const status = String(node?.data?.status || '').toLowerCase();
+                    if (status && status !== 'pending' && status !== 'open' && status !== 'incoming') {
+                        continue;
+                    }
+                    pushId(match[1]);
+                }
+            }
+
             return ids;
         } catch {
             return [];
@@ -2096,32 +2516,39 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         }
 
         try {
-            const headers = await buildImvuApiHeaders();
-            const response = await apiPost(
-                `/user/user-${botId}/inbound_friend_requests/user-${fromId}`,
-                {},
-                { headers }
-            );
+            const headers = await buildImvuApiHeaders({
+                Referer: `${process.env.IMVU_WEB_ORIGIN || DEFAULT_WEB_ORIGIN}/next/friends/`,
+            });
+            const path = `/user/user-${botId}/inbound_friend_requests/user-${fromId}`;
+            // Official client: edge.save({ status: "accept" }) / { status: "reject" }.
+            // Wrong enums (e.g. "accepted") → INBOUND VALIDATION-001.
+            // Empty {} → INBOUND_FRIENDS_REQUEST-001 "Invalid status update".
+            const response = await apiPost(path, { status: 'accept' }, { headers });
             if (response.status >= 200 && response.status < 300) {
                 logger.log(`[IMVU-SESSION] Accepted friend request from user-${fromId}.`);
                 return { ok: true };
             }
+            const failure = parseImvuApiFailure(response.data);
             return {
                 ok: false,
                 reason: `status ${response.status}${summarizeResponseData(response.data)}`,
+                error: failure?.error || '',
             };
         } catch (error) {
             return { ok: false, reason: error.message || 'accept-friend-failed' };
         }
     }
 
-    async function listRecentDirectMessages(limit = 20) {
+    async function listRecentDirectMessages(limit = 20, options = {}) {
         const botId = await resolveBotUserId();
         if (!botId) return [];
 
         try {
             const headers = await directMessageHeaders();
             const maxMessages = Math.max(1, Math.min(limit, 50));
+            const preferUserIds = Array.isArray(options.preferUserIds)
+                ? options.preferUserIds
+                : [];
             const messages = [];
             const seenMessageIds = new Set();
 
@@ -2133,21 +2560,37 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                 return true;
             };
 
+            const hasJoinCommand = () =>
+                messages.some((entry) => /^!join\b/i.test(String(entry?.text || '')));
+
+            if (preferUserIds.length > 0) {
+                const preferredMessages = await listDirectMessagesFromUserIds(
+                    botId,
+                    headers,
+                    preferUserIds,
+                    maxMessages
+                );
+                for (const parsed of preferredMessages) pushParsed(parsed);
+                if (hasJoinCommand()) return messages;
+            }
+
             if (watchedDmUserIds.size > 0) {
                 const watchedMessages = await listDirectMessagesFromWatchedUsers(
                     botId,
                     headers,
-                    maxMessages
+                    maxMessages,
+                    preferUserIds
                 );
                 for (const parsed of watchedMessages) {
                     pushParsed(parsed);
-                    if (messages.length >= maxMessages) return messages;
                 }
+                // Do not return early — conversation inbox may still hold the !join
+                // when watched owners/mods filled the buffer with unrelated DMs.
             }
 
             const conversationRefs = await fetchConversationListRefs(botId, headers, maxMessages);
             for (const [itemUrl, meta] of conversationRefs) {
-                if (messages.length >= maxMessages) break;
+                if (messages.length >= maxMessages && hasJoinCommand()) break;
 
                 const convId = extractConversationId(itemUrl || meta.convKey || '');
                 if (convId) {
@@ -2155,13 +2598,11 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                         botId,
                         convId,
                         headers,
-                        maxMessages
+                        Math.min(20, maxMessages)
                     );
                     for (const parsed of inbound) {
                         pushParsed(parsed);
-                        if (messages.length >= maxMessages) break;
                     }
-                    if (messages.length >= maxMessages) break;
                 }
 
                 if (meta.inline) {
@@ -2365,6 +2806,10 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         apiGetWearableScan,
         fetchUserName,
         fetchLegacyChatQueue,
+        fetchLiveRoomContext,
+        ensureAudienceJoin,
+        leaveAudienceJoin,
+        inviteUserToRoom,
         ensureChatParticipant,
         removeChatParticipant,
         fetchRoomMediaPlaybackState,
@@ -2376,6 +2821,7 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         listInboundFriendRequests,
         acceptFriendRequest,
         listRecentDirectMessages,
+        listRecentDirectMessagesFromUsers,
         watchDirectMessageUser,
         getWatchedDirectMessageUserIds,
         watchRoomDmContacts,

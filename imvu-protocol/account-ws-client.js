@@ -77,6 +77,182 @@ function extractFrameOpIds(frameText) {
     return frames.map(frameOpId).filter((opId) => opId != null);
 }
 
+const SOCIAL_HINT_MOUNTS = new Set([
+    'web_msg',
+    'edge:inbound_friend_requests',
+    'edge:conversations',
+    'edge:messages',
+    'edge:activity',
+    'edge:friends',
+    'edge:invites',
+]);
+
+function decodeImqPayload(raw) {
+    const text = String(raw || '').trim();
+    if (!text) return '';
+    try {
+        return Buffer.from(text, 'base64').toString('utf8');
+    } catch {
+        return text;
+    }
+}
+
+function classifySocialHint(mount, decoded) {
+    const m = String(mount || '');
+    const body = String(decoded || '');
+    if (m === 'web_msg') {
+        if (/^fanRequests\b/i.test(body)) return 'friend_request';
+        if (/^chatInvite\b/i.test(body)) return 'invite';
+        if (/^messageReceived\b/i.test(body)) return 'dm';
+        return 'web_msg';
+    }
+    if (m === 'edge:inbound_friend_requests' || m === 'edge:friends') return 'friend_request';
+    if (m === 'edge:invites') return 'invite';
+    if (m === 'edge:conversations' || m === 'edge:messages') return 'dm';
+    if (m === 'edge:activity') return 'activity';
+    return 'social';
+}
+
+function roomIdFromInviteLocation(location) {
+    if (!location || typeof location !== 'object') return '';
+    for (const key of ['room_id', 'roomId', 'id', 'slug']) {
+        const raw = String(location[key] || '')
+            .trim()
+            .replace(/^room-/i, '');
+        if (/^\d+-\d+$/.test(raw)) return raw;
+    }
+    for (const key of ['url', 'imageUrl', 'image_url']) {
+        const match = String(location[key] || '').match(/(\d+-\d+)/);
+        if (match) return match[1];
+    }
+    return '';
+}
+
+/** Parse edge JSON / web_msg bodies for friend-request / invite action + ids. */
+function parseSocialEdgePayload(mount, decoded) {
+    const m = String(mount || '');
+    const body = String(decoded || '').trim();
+    const out = {
+        action: '',
+        userIds: [],
+        objects: [],
+        roomId: '',
+        inviteId: '',
+        inviterName: '',
+        chatId: '',
+    };
+    if (!body) return out;
+
+    const pushPeerId = (id) => {
+        const peer = String(id || '').trim();
+        if (/^\d+$/.test(peer)) out.userIds.push(peer);
+    };
+
+    // web_msg: fanRequests {"add":[261755692],"time":...}
+    const fanMatch = body.match(/^fanRequests\s+(\{[\s\S]*\})\s*$/i);
+    if (fanMatch) {
+        try {
+            const payload = JSON.parse(fanMatch[1]);
+            const add = Array.isArray(payload?.add) ? payload.add : [];
+            for (const id of add) pushPeerId(id);
+            out.action = out.userIds.length ? 'created' : '';
+            out.userIds = [...new Set(out.userIds)];
+            return out;
+        } catch {
+            /* fall through */
+        }
+    }
+
+    // web_msg: messageReceived {"from":261755692,"time":...}
+    const messageReceivedMatch = body.match(/^messageReceived\s+(\{[\s\S]*\})\s*$/i);
+    if (messageReceivedMatch) {
+        try {
+            const payload = JSON.parse(messageReceivedMatch[1]);
+            out.action = 'message';
+            pushPeerId(payload?.from || payload?.sender || payload?.userId || payload?.user_id);
+            out.userIds = [...new Set(out.userIds)];
+            return out;
+        } catch {
+            /* fall through */
+        }
+    }
+
+    // web_msg: chatInvite {"inviteId":…,"chatId":…,"partnerId":…,"location":{…},"inviter":{…}}
+    const chatInviteMatch = body.match(/^chatInvite\s+(\{[\s\S]*\})\s*$/i);
+    if (chatInviteMatch) {
+        try {
+            const payload = JSON.parse(chatInviteMatch[1]);
+            out.action = 'created';
+            out.inviteId = String(payload?.inviteId || payload?.invite_id || '').trim();
+            out.chatId = String(payload?.chatId || payload?.chat_id || '').trim();
+            out.roomId = roomIdFromInviteLocation(payload?.location);
+            out.inviterName = String(payload?.inviter?.name || payload?.inviter?.display_name || '').trim();
+            pushPeerId(payload?.partnerId || payload?.partner_id);
+            out.userIds = [...new Set(out.userIds)];
+            return out;
+        } catch {
+            /* fall through */
+        }
+    }
+
+    if (body.startsWith('{') || body.startsWith('[')) {
+        try {
+            const parsed = JSON.parse(body);
+            const payload = Array.isArray(parsed) ? parsed[0] : parsed;
+            if (payload && typeof payload === 'object') {
+                out.action = String(payload.action || '').toLowerCase();
+                const objects = Array.isArray(payload.objects) ? payload.objects : [];
+                out.objects = objects.map((o) => String(o || ''));
+                for (const obj of out.objects) {
+                    const inbound = obj.match(/\/inbound_friend_requests\/user-(\d+)/i);
+                    if (inbound) {
+                        pushPeerId(inbound[1]);
+                        continue;
+                    }
+                    const friend = obj.match(/\/friends\/user-(\d+)/i);
+                    if (friend) {
+                        pushPeerId(friend[1]);
+                        continue;
+                    }
+                    const invite = obj.match(/\/invites\/invite-(\d+)/i);
+                    if (invite) {
+                        out.inviteId = invite[1];
+                        continue;
+                    }
+                    // Prefer the last user- id in the path (peer), not the bot owner segment.
+                    const all = [...obj.matchAll(/\/user-(\d+)/gi)];
+                    if (all.length) pushPeerId(all[all.length - 1][1]);
+                }
+            }
+        } catch {
+            /* fall through */
+        }
+    }
+
+    if (!out.userIds.length) {
+        const inbound = [...body.matchAll(/inbound_friend_requests\/user-(\d+)/gi)];
+        const friends = [...body.matchAll(/friends\/user-(\d+)/gi)];
+        for (const match of inbound.length ? inbound : friends) {
+            pushPeerId(match[1]);
+        }
+    }
+
+    if (!out.inviteId) {
+        const inviteMatch = body.match(/\/invites\/invite-(\d+)/i);
+        if (inviteMatch) out.inviteId = inviteMatch[1];
+    }
+
+    out.userIds = [...new Set(out.userIds)];
+
+    if (!out.action) {
+        if (m === 'edge:inbound_friend_requests' || m === 'edge:friends' || m === 'edge:invites') {
+            out.action = 'created';
+        }
+    }
+
+    return out;
+}
+
 export class ImvuAccountWebSocketClient extends EventEmitter {
     constructor({ spec, session, agents = {}, logger = console, bot = {} }) {
         super();
@@ -95,10 +271,48 @@ export class ImvuAccountWebSocketClient extends EventEmitter {
         this.nextRuntimeOpId = Number(process.env.IMVU_WS_RUNTIME_OP_ID_START || 45);
         this.pingTimer = null;
         this.lastConnectRoomId = '';
+        this.socialSyncEnabled = false;
+        this.socialFloodgatesOpened = false;
+        this.socialSubscribeInFlight = false;
+        this.socialSubscribedQueues = new Set();
+        this.socialOpIds = new Set();
     }
 
     get isOpen() {
         return this.ws?.readyState === WebSocket.OPEN;
+    }
+
+    get #keepAlive() {
+        return this.rooms.size > 0 || this.socialSyncEnabled;
+    }
+
+    #botUserId() {
+        return String(this.bot.imqUserId || this.bot.user_id || this.bot.userId || '').trim();
+    }
+
+    #socialQueueNames() {
+        const userId = this.#botUserId();
+        if (!/^\d+$/.test(userId)) return [];
+        return [`priv:/user/user-${userId}`, `/user/${userId}`, `inv:/user/user-${userId}`, `inv:/profile/${userId}`];
+    }
+
+    #isOurSocialQueue(queue) {
+        const q = String(queue || '');
+        if (!q) return false;
+        if (this.socialSubscribedQueues.has(q)) return true;
+        return this.#socialQueueNames().includes(q);
+    }
+
+    /**
+     * Subscribe to account-level IMQ queues for friend requests / DMs / activity.
+     * Safe to call before or after the socket is open; re-subscribes on reconnect.
+     */
+    setSocialSyncEnabled(enabled) {
+        this.socialSyncEnabled = Boolean(enabled);
+        if (this.socialSyncEnabled && this.isOpen) {
+            void this.#subscribeSocialQueues();
+        }
+        return this.socialSyncEnabled;
     }
 
     createRoomClient(roomId, options = {}) {
@@ -169,9 +383,11 @@ export class ImvuAccountWebSocketClient extends EventEmitter {
                 this.connectedOnce = true;
                 this.#wireSocket(ws);
                 this.logger.log('[IMVU-ACCOUNT-WS] open');
+                this.#resetSocialSubscriptions();
                 this.#sendAccountFrames(this.spec.connectFramesFor(roomId), 'connect');
                 this.#startPing(roomId);
                 this.emit('open');
+                void this.#subscribeSocialQueues();
                 for (const room of this.rooms.values()) {
                     room._handleAccountOpen();
                 }
@@ -225,10 +441,128 @@ export class ImvuAccountWebSocketClient extends EventEmitter {
                 room._resetForReconnect();
                 room.emit('close', code, reasonText);
             }
-            if (!this.closedByUser && this.rooms.size > 0) {
+            if (!this.closedByUser && this.#keepAlive) {
                 void this.#scheduleReconnect(code, reason);
             }
         });
+    }
+
+    #resetSocialSubscriptions() {
+        this.socialFloodgatesOpened = false;
+        this.socialSubscribeInFlight = false;
+        this.socialSubscribedQueues.clear();
+        this.socialOpIds.clear();
+    }
+
+    async #subscribeSocialQueues() {
+        if (!this.socialSyncEnabled || !this.isOpen || this.socialSubscribeInFlight) return;
+        const queues = this.#socialQueueNames();
+        if (!queues.length) {
+            this.logger.warn('[IMVU-ACCOUNT-WS][social] missing bot user id; cannot subscribe');
+            return;
+        }
+
+        this.socialSubscribeInFlight = true;
+        try {
+            const joinDelayMs = Math.max(0, Number(process.env.IMVU_WS_POST_CONNECT_DELAY_MS || 350));
+            if (joinDelayMs) await delay(joinDelayMs);
+            if (!this.socialSyncEnabled || !this.isOpen) return;
+
+            if (!this.socialFloodgatesOpened) {
+                this.sendRaw(JSON.stringify({ record: 'msg_c2g_open_floodgates' }));
+                this.socialFloodgatesOpened = true;
+                if (process.env.WS_DEBUG === '1' || process.env.WS_DEBUG === 'true') {
+                    this.logger.log('[IMVU-ACCOUNT-WS][social] open_floodgates');
+                }
+            }
+
+            for (const name of queues) {
+                if (!this.isOpen || !this.socialSyncEnabled) return;
+                if (this.socialSubscribedQueues.has(name)) continue;
+                const opId = this.allocateOpId(null);
+                this.socialOpIds.add(opId);
+                const frame = JSON.stringify({
+                    record: 'msg_c2g_subscribe',
+                    queues_with_results: [
+                        {
+                            record: 'subscription',
+                            name,
+                            op_id: opId,
+                        },
+                    ],
+                });
+                this.sendRaw(frame);
+                this.socialSubscribedQueues.add(name);
+                this.logger.log(`[IMVU-ACCOUNT-WS][social] subscribe ${name}`);
+            }
+        } catch (error) {
+            this.logger.warn(
+                `[IMVU-ACCOUNT-WS][social] subscribe failed: ${error?.message || error}`
+            );
+        } finally {
+            this.socialSubscribeInFlight = false;
+        }
+    }
+
+    #handleSocialAction(action) {
+        if (!this.socialSyncEnabled || !action || typeof action !== 'object') return false;
+
+        const record = String(action.record || '');
+        const queue = String(action.queue || '');
+        const opId = frameOpId(action);
+
+        if (record === 'msg_g2c_result' && opId != null && this.socialOpIds.has(opId)) {
+            this.socialOpIds.delete(opId);
+            if (action.status !== 0) {
+                this.logger.warn(
+                    `[IMVU-ACCOUNT-WS][social] subscribe result op=${opId} status=${action.status}` +
+                        (action.error_message ? ` ${action.error_message}` : '')
+                );
+            }
+            return true;
+        }
+
+        if (!this.#isOurSocialQueue(queue)) return false;
+
+        if (record === 'msg_g2c_joined_queue') {
+            this.logger.log(`[IMVU-ACCOUNT-WS][social] joined ${queue}`);
+            return true;
+        }
+        if (record === 'msg_g2c_create_mount') {
+            return true;
+        }
+        if (record === 'msg_g2c_left_queue') {
+            this.socialSubscribedQueues.delete(queue);
+            this.logger.warn(`[IMVU-ACCOUNT-WS][social] left ${queue}; will resubscribe`);
+            void this.#subscribeSocialQueues();
+            return true;
+        }
+
+        if (record !== 'msg_g2c_send_message' && record !== 'msg_c2g_send_message') {
+            return true;
+        }
+
+        const mount = String(action.mount || '');
+        if (!SOCIAL_HINT_MOUNTS.has(mount)) return true;
+
+        const decoded = decodeImqPayload(action.message);
+        const kind = classifySocialHint(mount, decoded);
+        const edge = parseSocialEdgePayload(mount, decoded);
+        this.emit('social', {
+            kind,
+            queue,
+            mount,
+            decoded: decoded.slice(0, 300),
+            action: edge.action,
+            userIds: edge.userIds,
+            objects: edge.objects,
+            roomId: edge.roomId || '',
+            inviteId: edge.inviteId || '',
+            inviterName: edge.inviterName || '',
+            chatId: edge.chatId || '',
+            rawAction: action,
+        });
+        return true;
     }
 
     #routeAction(action) {
@@ -240,6 +574,8 @@ export class ImvuAccountWebSocketClient extends EventEmitter {
             owner._handleFrame(action);
             return;
         }
+
+        if (this.#handleSocialAction(action)) return;
 
         const queue = String(action.queue || '');
         const isChatMsg =
@@ -288,7 +624,7 @@ export class ImvuAccountWebSocketClient extends EventEmitter {
             `[IMVU-ACCOUNT-WS] closed ${code} ${reason?.toString?.() || ''}; reconnecting in ${waitMs}ms`
         );
         await delay(waitMs);
-        if (this.closedByUser || this.rooms.size === 0) return;
+        if (this.closedByUser || !this.#keepAlive) return;
         try {
             await this.connect(this.lastConnectRoomId);
         } catch (error) {
@@ -334,7 +670,7 @@ export class ImvuAccountWebSocketClient extends EventEmitter {
         for (const [opId, owner] of [...this.opOwners.entries()]) {
             if (owner === room) this.opOwners.delete(opId);
         }
-        // Keep the account websocket open with zero rooms so DM !join and friend accepts still work.
+        // Keep the account websocket open with zero rooms so DM !join invites and friend accepts still work.
     }
 
     #startPing(roomId) {
@@ -421,6 +757,12 @@ export class ImvuAccountRoomClient extends EventEmitter {
         this.lastParticipantEnsureOkAt = 0;
         this.mediaPlayerQueue = '';
         this.mediaPlayerSubscribed = false;
+        this.liveRoom = false;
+        this.liveContext = null;
+        this.audienceMessageMount = '';
+        this.hangoutQueue = '';
+        this.liveChatId = '';
+        this.liveSubscribeOpId = null;
     }
 
     /** True while WS/visibility repair is running — ignore transient "left room" signals. */
@@ -455,6 +797,12 @@ export class ImvuAccountRoomClient extends EventEmitter {
         this.legacyChatSubscribed = false;
         this.legacyChatOpId = null;
         this.visibilityBootstrapped = false;
+        this.liveRoom = false;
+        this.liveContext = null;
+        this.audienceMessageMount = '';
+        this.hangoutQueue = '';
+        this.liveChatId = '';
+        this.liveSubscribeOpId = null;
         this.visibilityBootstrapPending = false;
         this.testMessageSent = false;
         this.joined = false;
@@ -476,10 +824,11 @@ export class ImvuAccountRoomClient extends EventEmitter {
         if (!q) return false;
         if (this.mediaPlayerQueue && q === this.mediaPlayerQueue) return true;
         if (this.chatQueue && q === this.chatQueue) return true;
+        if (this.hangoutQueue && q === this.hangoutQueue) return true;
         if (this.chatQueue && isImvuRoomChatQueue(q) && q !== this.chatQueue) {
             return roomQueueBelongsToRoom(q, this.roomId, { knownChatQueue: this.chatQueue });
         }
-        if (q.startsWith('/chat/') || isImvuRoomChatQueue(q)) {
+        if (q.startsWith('/chat/') || q.startsWith('/exp/') || isImvuRoomChatQueue(q)) {
             return roomQueueBelongsToRoom(q, this.roomId, { knownChatQueue: this.chatQueue });
         }
         if (q.includes(this.roomId)) return true;
@@ -501,7 +850,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
         this.emit('open');
         if (this.visibilityEnabled) {
             this.#scheduleForceVisibleRefresh();
-            void this.#discoverLegacyChatQueue();
+            void this.#discoverRoomChat();
         }
     }
 
@@ -547,7 +896,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
             this.discoveringLegacyChat = false;
             this.unknownUserRepairInFlight = false;
             this.#stopVisibilityHeartbeat();
-            void this.#discoverLegacyChatQueue();
+            void this.#discoverRoomChat();
             return;
         }
         if (action.record === 'msg_g2c_result' && action.status === 0 && this.visibilityBootstrapPending) {
@@ -585,8 +934,22 @@ export class ImvuAccountRoomClient extends EventEmitter {
                 this.legacyChatOpId = null;
             }
         }
-        if (queue.startsWith('/chat/') && this._ownsQueue(queue)) {
-            this.chatQueue = queue;
+        if (action.record === 'msg_g2c_result' && action.op_id === this.liveSubscribeOpId) {
+            if (action.status === 0) {
+                this.logger.log(`[IMVU-WS][${this.roomId}] live/audience IMQ subscription accepted`);
+                this.#sendVisibilityBootstrap();
+            } else {
+                this.logger.warn(
+                    `[IMVU-WS][${this.roomId}] live/audience IMQ subscription failed: ${action.error_message || action.status}`
+                );
+                this.legacyChatSubscribed = false;
+                this.liveSubscribeOpId = null;
+            }
+        }
+        if ((queue.startsWith('/chat/') || (this.liveRoom && queue.startsWith('/exp/'))) && this._ownsQueue(queue)) {
+            if (queue.startsWith('/chat/') || queue === this.chatQueue) {
+                this.chatQueue = queue.startsWith('/chat/') ? queue : this.chatQueue || queue;
+            }
             if (action.record === 'msg_g2c_joined_queue') {
                 this.#sendVisibilityBootstrap();
             }
@@ -789,6 +1152,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
 
         const participantReady = await this.#ensureChatParticipantWithRetry();
         if (!participantReady) {
+            await this.#warnIfHangoutJoinBlocked();
             this.#scheduleVisibleRetry('participant edge missing');
             return false;
         }
@@ -810,12 +1174,17 @@ export class ImvuAccountRoomClient extends EventEmitter {
         return true;
     }
 
-    async #discoverLegacyChatQueue() {
-        if (!this.visibilityEnabled || this.discoveringLegacyChat) return;
+    async #discoverLegacyChatQueue(options = {}) {
+        if (!this.visibilityEnabled) return;
         if (this.legacyChatSubscribed || !this.session?.fetchLegacyChatQueue) return;
-        this.discoveringLegacyChat = true;
+        const nested = Boolean(options.nested);
+        if (this.discoveringLegacyChat && !nested) return;
+        const ownedDiscovery = !this.discoveringLegacyChat;
+        if (ownedDiscovery) this.discoveringLegacyChat = true;
         try {
-            const delayMs = Math.max(0, Number(process.env.IMVU_WS_LEGACY_CHAT_DISCOVERY_DELAY_MS || 2000));
+            const delayMs = options.skipInitialDelay
+                ? 0
+                : Math.max(0, Number(process.env.IMVU_WS_LEGACY_CHAT_DISCOVERY_DELAY_MS || 2000));
             if (delayMs) await delay(delayMs);
             if (!this.isOpen || this.legacyChatSubscribed) return;
 
@@ -833,6 +1202,16 @@ export class ImvuAccountRoomClient extends EventEmitter {
 
             const participantReady = await this.#ensureChatParticipantWithRetry();
             if (!participantReady) {
+                // Classic participant denied — try live/audience path (CHAT_PARTICIPANT-005).
+                if (typeof this.session.fetchLiveRoomContext === 'function') {
+                    const live = await this.session.fetchLiveRoomContext(this.roomId, { force: true });
+                    if (live?.isLive) {
+                        await this.#warnIfHangoutJoinBlocked();
+                        await this.#joinLiveAudience(live);
+                        return;
+                    }
+                }
+                await this.#warnIfHangoutJoinBlocked();
                 this.#scheduleVisibleRetry('participant edge missing');
                 return;
             }
@@ -866,8 +1245,104 @@ export class ImvuAccountRoomClient extends EventEmitter {
                 this.#sendVisibilityBootstrap();
             }, bootstrapDelayMs);
         } finally {
+            if (ownedDiscovery) this.discoveringLegacyChat = false;
+        }
+    }
+
+    async #warnIfHangoutJoinBlocked() {
+        if (!this.session?.fetchLiveRoomContext) return;
+        try {
+            const live = await this.session.fetchLiveRoomContext(this.roomId);
+            if (live?.isLive) {
+                this.logger.warn(
+                    `[IMVU-WS][${this.roomId}] hangout/live-style room (mimic_chat=${Boolean(live.mimicChatRoom)}); ` +
+                        `classic chat join was denied — falling back to audience experience join`
+                );
+            }
+        } catch {
+            /* ignore metadata probe failures */
+        }
+    }
+
+    async #discoverRoomChat() {
+        if (!this.visibilityEnabled || this.discoveringLegacyChat) return;
+        if (this.legacyChatSubscribed) return;
+        if (!this.session?.fetchLiveRoomContext && !this.session?.fetchLegacyChatQueue) return;
+
+        this.discoveringLegacyChat = true;
+        try {
+            const delayMs = Math.max(0, Number(process.env.IMVU_WS_LEGACY_CHAT_DISCOVERY_DELAY_MS || 2000));
+            if (delayMs) await delay(delayMs);
+            if (!this.isOpen || this.legacyChatSubscribed) return;
+
+            if (typeof this.session.fetchLiveRoomContext === 'function') {
+                const live = await this.session.fetchLiveRoomContext(this.roomId);
+                if (live?.isLive) {
+                    await this.#joinLiveAudience(live);
+                    return;
+                }
+            }
+
+            await this.#discoverLegacyChatQueue({ skipInitialDelay: true, nested: true });
+        } finally {
             this.discoveringLegacyChat = false;
         }
+    }
+
+    async #joinLiveAudience(liveContext) {
+        if (!this.isOpen || this.closedByUser) return false;
+        const live =
+            liveContext?.isLive
+                ? liveContext
+                : await this.session.fetchLiveRoomContext?.(this.roomId);
+        if (!live?.isLive || !live.audienceQueue) {
+            this.logger.warn(
+                `[IMVU-WS][${this.roomId}] live room missing audience queue; cannot join as audience`
+            );
+            this.#scheduleVisibleRetry('live audience queue missing');
+            return false;
+        }
+
+        const joined = await this.session.ensureAudienceJoin?.(this.roomId, live);
+        if (!joined) {
+            this.logger.warn(`[IMVU-WS][${this.roomId}] audience experience join failed`);
+            this.#scheduleVisibleRetry('audience join failed');
+            return false;
+        }
+
+        this.liveRoom = true;
+        this.liveContext = live;
+        this.audienceMessageMount = live.audienceMessageMount || 'audience_message_mount';
+        this.hangoutQueue = live.hangoutQueue || '';
+        this.liveChatId = String(live.chatId || '');
+        this.chatQueue = live.audienceQueue;
+        this.participantReady = true;
+        this.lastParticipantEnsureOkAt = Date.now();
+
+        this.logger.log(
+            `[IMVU-WS][${this.roomId}] live/audience room join via ${live.audienceExperienceUrl} ` +
+                `(queue ${live.audienceQueue}, mount ${this.audienceMessageMount})`
+        );
+
+        const queues = [...new Set([live.audienceQueue, live.hangoutQueue].filter(Boolean))];
+        this.legacyChatSubscribed = true;
+        this.liveSubscribeOpId = this.account.allocateOpId(this);
+        const frame = JSON.stringify({
+            record: 'msg_c2g_subscribe',
+            queues_with_results: queues.map((name, index) => ({
+                record: 'subscription',
+                name,
+                op_id: index === 0 ? this.liveSubscribeOpId : this.account.allocateOpId(this),
+            })),
+        });
+        this.account.sendRoomFrame(this, frame, 'live-audience');
+
+        // Audience presence does not use classic outfit/seat bootstrap.
+        this.visibilityBootstrapPending = false;
+        this.visibilityBootstrapped = true;
+        this.#scheduleVisibilityHeartbeat();
+        this.#scheduleTestMessage();
+        return true;
     }
 
     #sendVisibilityPrepSubscriptions() {
@@ -954,6 +1429,17 @@ export class ImvuAccountRoomClient extends EventEmitter {
         const result = await this.session.ensureChatParticipant(this.roomId, userId, {
             participant: this.participant,
         });
+        if (result?.mode === 'audience' && result.live) {
+            this.liveRoom = true;
+            this.liveContext = result.live;
+            this.audienceMessageMount =
+                result.live.audienceMessageMount || this.audienceMessageMount || 'audience_message_mount';
+            this.hangoutQueue = result.live.hangoutQueue || this.hangoutQueue || '';
+            this.liveChatId = String(result.live.chatId || this.liveChatId || '');
+            if (!this.chatQueue && result.live.audienceQueue) {
+                this.chatQueue = result.live.audienceQueue;
+            }
+        }
         this.#rememberParticipant(result?.participant);
         this.participantReady = Boolean(result);
         if (result) this.lastParticipantEnsureOkAt = Date.now();
@@ -1017,7 +1503,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
             }
         }
         if (!this.chatQueue || !this.legacyChatSubscribed) {
-            void this.#discoverLegacyChatQueue();
+            void this.#discoverRoomChat();
             return false;
         }
         if (softRefresh && this.visibilityBootstrapped && this.participantReady) {
@@ -1038,6 +1524,13 @@ export class ImvuAccountRoomClient extends EventEmitter {
 
     #sendVisibilityBootstrap({ force = false, label = 'visible-join' } = {}) {
         if (!this.visibilityEnabled) return;
+        if (this.liveRoom) {
+            this.visibilityBootstrapPending = false;
+            this.visibilityBootstrapped = true;
+            this.#scheduleVisibilityHeartbeat();
+            this.#scheduleTestMessage();
+            return;
+        }
         if ((!force && this.visibilityBootstrapped) || !this.isOpen || !this.chatQueue.startsWith('/chat/')) return;
         if (!this.participantReady) {
             this.#scheduleVisibleRetry('participant not confirmed');
@@ -1096,9 +1589,20 @@ export class ImvuAccountRoomClient extends EventEmitter {
         setTimeout(() => {
             if (!this.isOpen || !this.chatQueue) return;
             try {
-                const frame = this.spec.sendFrameFor(this.roomId, text, {
+                let frame = this.spec.sendFrameFor(this.roomId, text, {
                     chatQueue: this.chatQueue,
+                    ...(this.liveChatId ? { chatId: this.liveChatId } : {}),
                 });
+                if (this.liveRoom && this.audienceMessageMount) {
+                    try {
+                        const parsed = JSON.parse(frame);
+                        parsed.mount = this.audienceMessageMount;
+                        parsed.queue = this.chatQueue;
+                        frame = JSON.stringify(parsed);
+                    } catch {
+                        /* keep template frame */
+                    }
+                }
                 this.account.sendRoomFrame(this, frame, 'test-message');
                 this.emit('sent', { roomId: this.roomId, text, meta: { autoTest: true } });
                 this.logger.log(`[IMVU-WS][${this.roomId}][test-message] ${text}`);
@@ -1120,10 +1624,22 @@ export class ImvuAccountRoomClient extends EventEmitter {
                     'Wait for /chat/... joined_queue or capture the room chat subscription flow.'
             );
         }
-        const frame = this.spec.sendFrameFor(this.roomId, String(text || ''), {
+        let frame = this.spec.sendFrameFor(this.roomId, String(text || ''), {
             ...meta,
             chatQueue,
+            ...(this.liveChatId ? { chatId: this.liveChatId } : {}),
+            ...(this.audienceMessageMount ? { messageMount: this.audienceMessageMount } : {}),
         });
+        if (this.liveRoom && this.audienceMessageMount) {
+            try {
+                const parsed = JSON.parse(frame);
+                parsed.mount = this.audienceMessageMount;
+                parsed.queue = chatQueue;
+                frame = JSON.stringify(parsed);
+            } catch {
+                /* keep template frame */
+            }
+        }
         this.account.sendRoomFrame(this, frame, 'send-message');
         this.emit('sent', { roomId: this.roomId, text: String(text || ''), meta });
     }

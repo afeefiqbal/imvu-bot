@@ -4,9 +4,22 @@ import { getRoomSettings } from './room-settings/store.js';
 import { getRoomRuntime, trackerRoomKey } from './room-runtime-registry.js';
 import { fetchAndPostDashboardProfile } from './imvu-profile-sync.js';
 import { processPendingVerificationDeliveries } from './imvu-verification-sync.js';
-import { runBotSocialSync, isSocialSyncEnabled } from './bot-social-sync.js';
+import {
+    runBotSocialSync,
+    isSocialSyncEnabled,
+    handleSocialWsFriendHint,
+    handleSocialWsInviteHint,
+    handleSocialWsDmHint,
+} from './bot-social-sync.js';
 
-export { runBotSocialSync, isSocialSyncEnabled };
+export {
+    runBotSocialSync,
+    isSocialSyncEnabled,
+    handleSocialWsFriendHint,
+    handleSocialWsInviteHint,
+    handleSocialWsDmHint,
+};
+export { isSocialWsEnabled } from './bot-social-sync.js';
 
 const BACKEND_URL = backendApiBaseUrl('http://127.0.0.1:8000');
 

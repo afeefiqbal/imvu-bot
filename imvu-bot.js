@@ -21,7 +21,15 @@ import {
     roomQueueBelongsToRoom,
 } from './user-tracker-utils.js';
 import { allRoomRuntimes, trackerRoomKey } from './room-runtime-registry.js';
-import { processSyncActions, runBotSocialSync, isSocialSyncEnabled } from './sync-actions.js';
+import {
+    processSyncActions,
+    runBotSocialSync,
+    isSocialSyncEnabled,
+    isSocialWsEnabled,
+    handleSocialWsFriendHint,
+    handleSocialWsInviteHint,
+    handleSocialWsDmHint,
+} from './sync-actions.js';
 import { resolveBotImvuProfile } from './imvu-profile-sync.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -355,6 +363,11 @@ async function main() {
         });
     }
 
+    const socialWsEnabled = Boolean(accountWs) && isSocialWsEnabled();
+    if (socialWsEnabled) {
+        accountWs.setSocialSyncEnabled(true);
+    }
+
     process.on('unhandledRejection', (reason) => {
         const msg = reason instanceof Error ? reason.message : String(reason);
         console.error(`[${BOT_NAME}] unhandledRejection (bot stays up): ${msg}`);
@@ -565,12 +578,6 @@ async function main() {
         );
     }
 
-    for (const roomId of firstRooms) {
-        await startRoom(roomId).catch((error) => {
-            console.error(`[${BOT_NAME}] Failed to start room ${trackerRoomId(roomId)}: ${error.message}`);
-        });
-    }
-
     const syncBaseMs = Math.max(5000, envInt('IMVU_SYNC_INTERVAL_MS', 25000));
     const syncJitterMs = Math.max(0, envInt('IMVU_SYNC_JITTER_MS', 10000));
     const syncIntervalMs = syncBaseMs + Math.floor(Math.random() * syncJitterMs);
@@ -587,6 +594,9 @@ async function main() {
         get configuredRoomIds() {
             return configuredRoomIds;
         },
+        getConnectedRoomIds() {
+            return [...roomClients.keys()];
+        },
         getPausedRoomIds() {
             return [...locallyPausedRooms];
         },
@@ -600,16 +610,81 @@ async function main() {
         void runBotSocialSync(socialSyncCtx);
     };
 
+    if (socialWsEnabled) {
+        let socialHintTimer = null;
+        accountWs.on('social', (hint) => {
+            const kind = hint?.kind || 'social';
+            const mount = hint?.mount || '';
+            const action = hint?.action ? ` action=${hint.action}` : '';
+            const users =
+                Array.isArray(hint?.userIds) && hint.userIds.length
+                    ? ` users=${hint.userIds.join(',')}`
+                    : '';
+            console.log(
+                `[${BOT_NAME}][SOCIAL-WS] ${kind}` +
+                    (mount ? ` mount=${mount}` : '') +
+                    action +
+                    users +
+                    (hint?.decoded ? ` ${String(hint.decoded).slice(0, 120)}` : '')
+            );
+
+            // Friend accepts: act on the WS object URL immediately (no debounce / REST list).
+            if (kind === 'friend_request') {
+                void handleSocialWsFriendHint(socialSyncCtx, hint);
+                return;
+            }
+
+            // Room invites: chatInvite payload already has room id — join immediately.
+            if (kind === 'invite') {
+                void handleSocialWsInviteHint(socialSyncCtx, hint);
+                return;
+            }
+
+            // DMs: watch sender + process !join invite commands immediately.
+            if (kind === 'dm') {
+                void handleSocialWsDmHint(socialSyncCtx, hint);
+                return;
+            }
+
+            if (socialHintTimer) clearTimeout(socialHintTimer);
+            socialHintTimer = setTimeout(() => {
+                socialHintTimer = null;
+                triggerSocialSync();
+            }, Math.max(100, envInt('IMVU_SOCIAL_WS_DEBOUNCE_MS', 400)));
+        });
+
+        await accountWs.connect().catch((error) => {
+            console.warn(
+                `[${BOT_NAME}] social websocket connect failed (will retry with rooms): ${error?.message || error}`
+            );
+        });
+        console.log(
+            `[${BOT_NAME}] IMVU social WS on (friend/DM/activity queues). Polling kept as fallback.`
+        );
+    }
+
     if (isSocialSyncEnabled()) {
         void runBotSocialSync(socialSyncCtx);
 
+        const pollMs = socialWsEnabled
+            ? Math.max(socialPollMs, envInt('IMVU_SOCIAL_SYNC_FALLBACK_MS', 30000))
+            : socialPollMs;
         setInterval(() => {
             void runBotSocialSync(socialSyncCtx);
-        }, socialPollMs);
+        }, pollMs);
+        if (socialWsEnabled) {
+            console.log(`[${BOT_NAME}] IMVU social REST fallback every ${pollMs}ms`);
+        }
     } else {
         console.log(
             `[${BOT_NAME}] IMVU social sync off (invites/DM/friend polling disabled). Set IMVU_SOCIAL_SYNC_ENABLED=1 to enable.`
         );
+    }
+
+    for (const roomId of firstRooms) {
+        await startRoom(roomId).catch((error) => {
+            console.error(`[${BOT_NAME}] Failed to start room ${trackerRoomId(roomId)}: ${error.message}`);
+        });
     }
 
     setInterval(() => {

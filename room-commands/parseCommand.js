@@ -1,6 +1,7 @@
 import { canonicalCommand } from './catalog.js';
 
-export const JOIN_COMMAND_USAGE = 'Usage: !join <room-id>';
+export const JOIN_COMMAND_USAGE =
+    'Usage: !join <room-id> — bot invites you to that room (bot must already be there)';
 
 /**
  * Parse `!command` / `*command` room chat lines (case-insensitive command word).

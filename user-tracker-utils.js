@@ -42,15 +42,17 @@ export const isImvuMessagesMount = (mount) => {
     const m = String(mount || '').toLowerCase();
     if (!m) return false;
     if (m === 'messages' || m === 'edge:messages') return true;
-    if (m.endsWith(':messages')) return true;
+    if (m === 'audience_message_mount' || m === 'scene_message_mount') return true;
+    if (m.endsWith(':messages') || m.endsWith('_message_mount')) return true;
     return false;
 };
 
-/** Room chat WS queue: legacy `/chat/123` or Next `inv:/chat/chat-roomId-instance`. */
+/** Room chat WS queue: legacy `/chat/123`, Next `inv:/chat/...`, or live `/exp/{id}/...`. */
 export const isImvuRoomChatQueue = (queue) => {
     const q = String(queue || '');
     if (!q) return false;
     if (q.startsWith('/chat/')) return true;
+    if (q.startsWith('/exp/')) return true;
     if (/^inv:\/chat\//i.test(q)) return true;
     return false;
 };
@@ -121,8 +123,8 @@ export const narrowChatFrameTargets = (queue, targets) => {
         if (filtered.length) return filtered;
     }
 
-    // Legacy numeric /chat/123456 queues: keep only rooms whose subscribed queue matches exactly.
-    if (q.startsWith('/chat/')) {
+    // Legacy numeric /chat/123 or live /exp/{id}/... queues: keep only rooms whose subscribed queue matches exactly.
+    if (q.startsWith('/chat/') || q.startsWith('/exp/')) {
         const filtered = targets.filter((room) => String(room?.chatQueue || '') === q);
         if (filtered.length) return filtered;
     }
