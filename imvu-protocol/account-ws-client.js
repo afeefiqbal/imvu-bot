@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events';
 import WebSocket from 'ws';
+import { introMessageDelayMs, resolveIntroMessage } from '../introMessages.js';
 import {
     roomQueueBelongsToRoom,
     isImvuRoomChatQueue,
@@ -736,7 +737,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
         this.legacySeatMessage = '';
         this.seatNumber = '';
         this.seatFurniId = 0;
-        this.testMessageSent = false;
+        this.introMessageSent = false;
         this.joined = false;
         this.closedByUser = false;
         this.discoveringLegacyChat = false;
@@ -804,7 +805,6 @@ export class ImvuAccountRoomClient extends EventEmitter {
         this.liveChatId = '';
         this.liveSubscribeOpId = null;
         this.visibilityBootstrapPending = false;
-        this.testMessageSent = false;
         this.joined = false;
         this.discoveringLegacyChat = false;
         this.participantReady = false;
@@ -1341,7 +1341,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
         this.visibilityBootstrapPending = false;
         this.visibilityBootstrapped = true;
         this.#scheduleVisibilityHeartbeat();
-        this.#scheduleTestMessage();
+        this.#scheduleIntroMessage();
         return true;
     }
 
@@ -1528,7 +1528,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
             this.visibilityBootstrapPending = false;
             this.visibilityBootstrapped = true;
             this.#scheduleVisibilityHeartbeat();
-            this.#scheduleTestMessage();
+            this.#scheduleIntroMessage();
             return;
         }
         if ((!force && this.visibilityBootstrapped) || !this.isOpen || !this.chatQueue.startsWith('/chat/')) return;
@@ -1578,14 +1578,18 @@ export class ImvuAccountRoomClient extends EventEmitter {
         }
 
         this.#scheduleVisibilityHeartbeat();
-        this.#scheduleTestMessage();
+        this.#scheduleIntroMessage();
     }
 
-    #scheduleTestMessage() {
-        const text = String(process.env.IMVU_WS_TEST_MESSAGE || '').trim();
-        if (!text || this.testMessageSent) return;
-        this.testMessageSent = true;
-        const delayMs = Math.max(0, Number(process.env.IMVU_WS_TEST_MESSAGE_DELAY_MS || 1500));
+    #scheduleIntroMessage() {
+        if (this.introMessageSent) return;
+        const botName =
+            String(this.bot.profile || this.bot.name || this.bot.username || process.env.BOT_NAME || '').trim() ||
+            'the bot';
+        const text = resolveIntroMessage({ bot: botName, room: 'the room' });
+        if (!text) return;
+        this.introMessageSent = true;
+        const delayMs = Math.max(0, introMessageDelayMs());
         setTimeout(() => {
             if (!this.isOpen || !this.chatQueue) return;
             try {
@@ -1603,11 +1607,11 @@ export class ImvuAccountRoomClient extends EventEmitter {
                         /* keep template frame */
                     }
                 }
-                this.account.sendRoomFrame(this, frame, 'test-message');
-                this.emit('sent', { roomId: this.roomId, text, meta: { autoTest: true } });
-                this.logger.log(`[IMVU-WS][${this.roomId}][test-message] ${text}`);
+                this.account.sendRoomFrame(this, frame, 'intro-message');
+                this.emit('sent', { roomId: this.roomId, text, meta: { autoIntro: true } });
+                this.logger.log(`[IMVU-WS][${this.roomId}][intro-message] ${text}`);
             } catch (error) {
-                this.logger.warn(`[IMVU-WS][${this.roomId}] test message failed: ${error.message}`);
+                this.logger.warn(`[IMVU-WS][${this.roomId}] intro message failed: ${error.message}`);
             }
         }, delayMs);
     }
