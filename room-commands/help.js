@@ -1,4 +1,5 @@
 import { COMMAND_CATALOG, canonicalCommand, commandsForCategory, commandInfo } from './catalog.js';
+import { botDiscordInviteUrl } from './discordInvite.js';
 
 function formatCommandLine(names) {
     return names.join(' - ');
@@ -17,7 +18,7 @@ export function buildHelpMessages(opts = {}) {
         `Admin command list:\n${formatCommandLine(admin)}`,
     ];
 
-    const discordUrl = String(opts.discordUrl || process.env.BOT_DISCORD_INVITE_URL || '').trim();
+    const discordUrl = botDiscordInviteUrl(opts.discordUrl);
     const botLabel = String(opts.botName || 'the bot').trim();
     let footer =
         "Type '!info !command' to see more about a specific command. " +

@@ -1,4 +1,5 @@
 import { isLurkEnabledForRoom } from '../room-settings/store.js';
+import { botDiscordInviteUrl } from './discordInvite.js';
 import { parseOnOff } from './parseCommand.js';
 import { seatFromParticipant } from './move.js';
 
@@ -378,8 +379,7 @@ export async function runFunCommand(cmd, args, ctx) {
             return true;
         }
         case 'discord': {
-            const url = String(process.env.BOT_DISCORD_INVITE_URL || '').trim();
-            await reply(url ? `Discord: ${url}` : 'Discord invite URL is not configured on this bot.');
+            await reply(`Discord: ${botDiscordInviteUrl()}`);
             return true;
         }
         case 'timer': {
