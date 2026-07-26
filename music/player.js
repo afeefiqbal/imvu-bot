@@ -601,6 +601,7 @@ export function createRoomPlayer(opts) {
 
     const playNow = (track) => {
         playEpoch += 1;
+        const epoch = playEpoch;
         stopFlag = false;
         paused = false;
         pausedTrack = null;
@@ -615,6 +616,7 @@ export function createRoomPlayer(opts) {
             if (gap > 0) await new Promise((r) => setTimeout(r, gap));
             void ensureDrain();
         })();
+        return epoch;
     };
 
     return {
@@ -726,6 +728,15 @@ export function createRoomPlayer(opts) {
         getQueue: () => queue,
 
         isPlaying: () => ffProc != null,
+
+        /** Current play generation — bumps on !play / !skip. */
+        getPlayEpoch: () => playEpoch,
+
+        /**
+         * True after !stop, or when a newer !play/!skip replaced the sync that captured `epoch`.
+         * @param {number} epoch
+         */
+        isSyncSuperseded: (epoch) => stopFlag || playEpoch !== Number(epoch),
 
         /**
          * After enqueue, wait until Icecast serves this mount (source connected).

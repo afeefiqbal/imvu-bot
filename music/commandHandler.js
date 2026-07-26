@@ -74,7 +74,17 @@ async function loadPublicStreamConfig(loadConfig, player, reply) {
     return { cfgNow, pubNow };
 }
 
-async function syncLiveStreamToRoom({ player, page, sessionClient, roomId, loadConfig, track, reply, statusPrefix }) {
+async function syncLiveStreamToRoom({
+    player,
+    page,
+    sessionClient,
+    roomId,
+    loadConfig,
+    track,
+    reply,
+    statusPrefix,
+    playEpoch,
+}) {
     const stream = await loadPublicStreamConfig(loadConfig, player, reply);
     if (!stream) return false;
     const { cfgNow, pubNow } = stream;
@@ -84,6 +94,12 @@ async function syncLiveStreamToRoom({ player, page, sessionClient, roomId, loadC
         8000,
         parseInt(String(process.env.MUSIC_CHAT_WAIT_MOUNT_MS || '25000'), 10) || 25000
     );
+    const epoch =
+        playEpoch != null
+            ? Number(playEpoch)
+            : typeof player.getPlayEpoch === 'function'
+              ? player.getPlayEpoch()
+              : null;
 
     try {
         // Own the room-URL update so the player does not push a 404 at MUSIC_DOM_STREAM_DELAY_MS.
@@ -92,13 +108,12 @@ async function syncLiveStreamToRoom({ player, page, sessionClient, roomId, loadC
         // Wait for a real Icecast SOURCE before touching IMVU radio URL (early 404 → RADIO STREAM ERROR).
         const mountLive = await player.waitForMountLive(cfgNow, mountWaitMs);
         if (!mountLive) {
-            // !stop / !play replace: FFmpeg already dead or another track is current — don't spam chat.
-            const cur = player.getQueue?.()?.getCurrent?.() || null;
-            const wantUrl = String(track?.url || '').trim();
-            const curUrl = String(cur?.url || '').trim();
-            const ffmpegGone = typeof player.isPlaying === 'function' ? !player.isPlaying() : false;
-            const trackReplaced = Boolean(wantUrl) && curUrl !== wantUrl;
-            if (ffmpegGone || trackReplaced) {
+            // !stop cleared the queue, or a newer !play/!skip replaced this sync — stay silent.
+            if (
+                epoch != null &&
+                typeof player.isSyncSuperseded === 'function' &&
+                player.isSyncSuperseded(epoch)
+            ) {
                 return false;
             }
             if (urlLooksLikeNgrokFree(pubNow)) {
@@ -320,7 +335,7 @@ export async function createMusicRoomChatCommandHandler(opts) {
 
             try {
                 await player.prepareStreamForNextTrack();
-                player.playNow({
+                const playEpoch = player.playNow({
                     title: one.title,
                     url: one.url,
                 });
@@ -334,6 +349,7 @@ export async function createMusicRoomChatCommandHandler(opts) {
                         track: one,
                         reply,
                         statusPrefix: 'playing ',
+                        playEpoch,
                     }),
                 ).catch((e) => {
                     console.warn('[music] live play failed:', e?.message || e);
@@ -375,6 +391,8 @@ export async function createMusicRoomChatCommandHandler(opts) {
                 title: one.title,
                 url: one.url,
             });
+            const playEpoch =
+                typeof player.getPlayEpoch === 'function' ? player.getPlayEpoch() : null;
 
             void queueMediaSync(() =>
                 syncLiveStreamToRoom({
@@ -384,6 +402,7 @@ export async function createMusicRoomChatCommandHandler(opts) {
                     roomId,
                     loadConfig,
                     track: one,
+                    playEpoch,
                     reply,
                     statusPrefix: 'Added — now playing: ',
                 }),
