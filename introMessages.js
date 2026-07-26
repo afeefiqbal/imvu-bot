@@ -5,46 +5,58 @@
 
 const introTemplates = [
     (bot, room) =>
-        `*clears throat* Behold: ${bot} has entered ${room}. Chat me with .hi (or say sugar). Commands: !help.`,
+        `*clears throat* Behold: ${bot} has entered ${room}. To chat, use "." (e.g. .hi) or say sugar. Commands: !help.`,
     (bot, room) =>
-        `${bot} just crashed the party in ${room}. Talk to me with a leading . — like .hi — or say sugar. !help for commands.`,
+        `${bot} just crashed the party in ${room}. To chat, use "." — like .hi — or say sugar. !help for commands.`,
     (bot, room) =>
-        `Breaking news from ${room}: ${bot} is in chat. Start with . to talk (e.g. .how's it going) · or say sugar · !help`,
+        `Breaking news from ${room}: ${bot} is in chat. To talk to me, use "." (e.g. .how's it going) · or say sugar · !help`,
     (bot, room) =>
-        `${bot} spawned in ${room}. Side quest: type .hi to chat, or sugar, or !help before chaos finds you.`,
+        `${bot} spawned in ${room}. To chat, use "." (.hi), say sugar, or type !help before chaos finds you.`,
     (bot, room) =>
-        `Plot twist — ${bot} walked into ${room}. Yes I'm real. Whisper .hey or say sugar to chat · !help for cmds.`,
+        `Plot twist — ${bot} walked into ${room}. Yes I'm real. To chat, use "." or say sugar · !help for cmds.`,
     (bot, room) =>
-        `${room}, meet ${bot}. Chat with . (silent ask, like .hi) or say sugar. Or, y'know… type !help.`,
+        `${room}, meet ${bot}. To chat, use "." (silent ask, like .hi) or say sugar. Or type !help.`,
     (bot, room) =>
-        `I, ${bot}, arrived in ${room} fashionably late. Poke me with .hi / sugar — commands via !help.`,
+        `I, ${bot}, arrived in ${room} fashionably late. To chat, use "." / sugar — commands via !help.`,
     (bot, room) =>
-        `${bot} slid into ${room} with no script. Start a line with . to talk to me, or say sugar. !help works too.`,
+        `${bot} slid into ${room} with no script. To chat, use "." at the start of your line, or say sugar. !help works too.`,
     (bot, room) =>
-        `Attention ${room}: ${bot} is online. Chat: .hi or sugar. Commands: !help. Therapy not included.`,
+        `Attention ${room}: ${bot} is online. To chat, use "." (e.g. .hi) or sugar. Commands: !help.`,
     (bot, room) =>
-        `${bot} bootstrapped into ${room}. If I glow, that's vibes. Chat me with . or sugar · !help for the menu.`,
+        `${bot} bootstrapped into ${room}. If I glow, that's vibes. To chat, use "." or sugar · !help for the menu.`,
     (bot, room) =>
-        `Guess who joined ${room}? ${bot}. No autographs — try .hi, say sugar, or !help.`,
+        `Guess who joined ${room}? ${bot}. No autographs — to chat, use "." (.hi), say sugar, or !help.`,
     (bot, room) =>
-        `${bot} entered ${room} so hard the furniture flinched. Chat: leading . (e.g. .sup) or sugar · !help`,
+        `${bot} entered ${room} so hard the furniture flinched. To chat, use "." (e.g. .sup) or sugar · !help`,
     (bot, room) =>
-        `Hello ${room}, it's ${bot}. I bring .chat (start with .), sugar mentions, chaos, and !help.`,
+        `Hello ${room}, it's ${bot}. To chat, use "." or say sugar. Commands: !help.`,
     (bot, room) =>
-        `${bot} clocked into ${room}. Fun mode on. Talk with .hi / sugar · commands with !help.`,
+        `${bot} clocked into ${room}. Fun mode on. To chat, use "." / sugar · commands with !help.`,
     (bot, room) =>
-        `A wild ${bot} appeared in ${room}! It used .hi. You can also say sugar or !help. Super effective.`,
+        `A wild ${bot} appeared in ${room}! To chat, use "." (.hi), say sugar, or !help. Super effective.`,
     (bot, room) =>
-        `${room} upgrade: ${bot} is here. Start with . to chat silently, or say sugar. !help for commands.`,
+        `${room} upgrade: ${bot} is here. To chat, use "." for a silent ask, or say sugar. !help for commands.`,
     (bot, room) =>
-        `It's me, ${bot}, barging into ${room}. Rent is entertainment — pay with .hi, sugar, or !help.`,
+        `It's me, ${bot}, barging into ${room}. To chat, use "." (.hi), sugar, or !help.`,
     (bot, room) =>
-        `${bot} arrived in ${room} with snacks + sarcasm. Chat: .message or sugar · menu: !help.`,
+        `${bot} arrived in ${room} with snacks + sarcasm. To chat, use "." or sugar · menu: !help.`,
     (bot, room) =>
-        `Did somebody order a bot? Too late — ${bot} delivered to ${room}. Try .hi, sugar, or !help.`,
+        `Did somebody order a bot? Too late — ${bot} delivered to ${room}. To chat, use "." , sugar, or !help.`,
     (bot, room) =>
-        `${bot} is live in ${room}. Can't do taxes. Can do .hi / sugar chat and !help.`,
+        `${bot} is live in ${room}. Can't do taxes. To chat, use "." / sugar — or !help.`,
 ];
+
+/** Always appended so custom intros still teach the wake. */
+const DOT_CHAT_TIP = ' To chat, use "." (e.g. .hi) or say sugar.';
+
+function ensureDotChatTip(message) {
+    const text = String(message || '').trim();
+    if (!text) return null;
+    if (/\buse\s+"?\."?/i.test(text) || /leading\s+\./i.test(text) || /\.hi\b/i.test(text)) {
+        return text.slice(0, 500);
+    }
+    return `${text}${DOT_CHAT_TIP}`.slice(0, 500);
+}
 
 const random = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
@@ -55,10 +67,11 @@ const random = (arr) => arr[Math.floor(Math.random() * arr.length)];
 export function formatIntroMessage(template, { bot = 'the bot', room = 'the room' } = {}) {
     const t = String(template || '').trim();
     if (!t) return null;
-    return t
-        .replace(/\{bot\}/gi, bot || 'the bot')
-        .replace(/\{room\}/gi, room || 'the room')
-        .slice(0, 500);
+    return ensureDotChatTip(
+        t
+            .replace(/\{bot\}/gi, bot || 'the bot')
+            .replace(/\{room\}/gi, room || 'the room')
+    );
 }
 
 /**
@@ -83,7 +96,7 @@ export function resolveIntroMessage(vars = {}) {
     const custom = String(process.env.IMVU_WS_INTRO_MESSAGE || '').trim();
     if (custom) return formatIntroMessage(custom, { bot, room });
 
-    return random(introTemplates)(bot, room);
+    return ensureDotChatTip(random(introTemplates)(bot, room));
 }
 
 export function introMessageDelayMs() {
