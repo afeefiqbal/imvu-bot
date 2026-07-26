@@ -19,13 +19,12 @@ export function buildHelpMessages(opts = {}) {
     ];
 
     const discordUrl = botDiscordInviteUrl(opts.discordUrl);
-    const botLabel = String(opts.botName || 'the bot').trim();
     let footer =
         "Chat with me: start your message with . (e.g. .hi) or say sugar. " +
         "Type '!info !command' to see more about a specific command. " +
         "For example: '!info !mystats'. Commands can also be sent in a whisper.";
     if (discordUrl) {
-        footer += ` Check out ${botLabel}'s Discord for even more information:\n${discordUrl}`;
+        footer += ` Connect with him for more:\n${discordUrl}`;
     }
     messages.push(footer);
     return messages;
