@@ -86,6 +86,9 @@ async function syncLiveStreamToRoom({ player, page, sessionClient, roomId, loadC
     );
 
     try {
+        // Own the room-URL update so the player does not push a 404 at MUSIC_DOM_STREAM_DELAY_MS.
+        player.notifyRoomMediaSynced();
+
         // Wait for a real Icecast SOURCE before touching IMVU radio URL (early 404 → RADIO STREAM ERROR).
         const mountLive = await player.waitForMountLive(cfgNow, mountWaitMs);
         if (!mountLive) {
@@ -94,12 +97,8 @@ async function syncLiveStreamToRoom({ player, page, sessionClient, roomId, loadC
                     'Stream tunnel is ngrok free tier — IMVU gets HTML instead of MP3 (ERR_NGROK_6024). Set CLOUDFLARE_TUNNEL_AUTO=1 in .env and restart.',
                 );
             } else {
-                const cookieHint =
-                    process.env.YTDLP_COOKIES_FROM_BROWSER || process.env.YTDLP_COOKIES_FILE
-                        ? ''
-                        : ' If logs show YouTube “not a bot”, add YTDLP_COOKIES_FROM_BROWSER=chrome to .env and restart.';
                 await reply(
-                    `Track queued, but live stream is not ready yet. Check Icecast source/tunnel.${cookieHint}`,
+                    'Track queued, but live stream is not ready yet. If logs show YouTube “not a bot”, refresh youtube-cookies.txt on the server. Otherwise check Icecast source/tunnel.',
                 );
             }
             return false;

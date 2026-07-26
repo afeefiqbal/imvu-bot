@@ -511,22 +511,39 @@ export function createRoomPlayer(opts) {
                     console.warn(
                         `[music] Icecast has no SOURCE on ${mountPath} at ${loopHost}:${icePort} ~12s after start — ` +
                             'nothing is registered on that mount (listeners/ngrok get 404). ' +
-                            'Compare ICECAST_SOURCE_USER / ICECAST_SOURCE_PASSWORD in .env with icecast.xml <source-password>, ' +
-                            'and ICECAST_PORT (Docker host is usually 8001). Watch [music] ffmpeg: lines above for auth/connection errors.',
+                            'Often yt-dlp/YouTube bot-block (refresh YTDLP_COOKIES_FILE). Also compare ICECAST_SOURCE_PASSWORD with icecast.xml.',
                     );
                 } else {
                     console.log(`[music] Icecast confirms source on ${mountPath} (${loopHost}:${icePort}).`);
                 }
             }, 12000);
 
-            const ms = Math.max(500, parseInt(String(process.env.MUSIC_DOM_STREAM_DELAY_MS || '2500'), 10) || 2500);
+            // Never push the room radio URL on a fixed delay — that was the first-play 404 / RADIO STREAM ERROR.
+            // Wait until Icecast actually has a SOURCE (or commandHandler already synced and set skipMountDomPush).
+            const waitMs = Math.max(
+                12000,
+                parseInt(String(process.env.MUSIC_CHAT_WAIT_MOUNT_MS || '50000'), 10) || 50000,
+            );
+            const initialDelay = Math.max(
+                500,
+                parseInt(String(process.env.MUSIC_DOM_STREAM_DELAY_MS || '2500'), 10) || 2500,
+            );
             domPushTimer = setTimeout(() => {
                 domPushTimer = null;
-                if (!skipMountDomPush) {
-                    void pushDomUrl(cfg);
-                }
-                console.log('[music] Mount should be live — listeners can use HTTPS stream URL (reload if you saw 404).');
-            }, ms);
+                void (async () => {
+                    if (skipMountDomPush || playEpoch !== committedEpoch) return;
+                    const live = await waitForIcecastMountLive(cfg, waitMs);
+                    if (skipMountDomPush || playEpoch !== committedEpoch) return;
+                    if (!live) {
+                        console.warn(
+                            '[music] Mount never went live — not pushing room radio URL (avoids IMVU caching 404).',
+                        );
+                        return;
+                    }
+                    await pushDomUrl(cfg);
+                    console.log('[music] Mount live — room radio URL pushed / HTTPS stream ready.');
+                })();
+            }, initialDelay);
 
             await new Promise((resolve) => {
                 proc.once('exit', (code, sig) => {
