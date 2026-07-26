@@ -4,26 +4,46 @@
  */
 
 const introTemplates = [
-    (bot, room) => `*clears throat* Behold: ${bot} has entered ${room}. Applause is optional. Tips are encouraged.`,
-    (bot, room) => `${bot} just crashed the party in ${room}. Don't worry — I only bite if you skip !help.`,
-    (bot, room) => `Breaking news from ${room}: ${bot} is officially in the chat. Remaining calm is your problem.`,
-    (bot, room) => `${bot} has spawned in ${room}. Side quest unlocked: try !help before chaos finds you.`,
-    (bot, room) => `Plot twist — ${bot} just walked into ${room}. Yes, the rumors are true. The bot is real.`,
-    (bot, room) => `${room}, meet ${bot}. ${bot}, meet ${room}. Now kiss. Or, y'know… type !help.`,
-    (bot, room) => `I, ${bot}, have arrived in ${room} fashionably late and emotionally unprepared.`,
-    (bot, room) => `${bot} slid into ${room} like a main character with no script. Someone hand me !help.`,
-    (bot, room) => `Attention ${room}: ${bot} is online and slightly unhinged. Commands via !help. Therapy not included.`,
-    (bot, room) => `${bot} just bootstrapped into ${room}. If I start glowing, that's not a feature — that's vibes.`,
-    (bot, room) => `Guess who just joined ${room}? It's ${bot}. No autographs. Maybe !help though.`,
-    (bot, room) => `${bot} entered ${room} so hard the furniture flinched. Type !help before I start freestyling.`,
-    (bot, room) => `Hello ${room}, it's ${bot}. I bring commands, chaos, and approximately zero chill.`,
-    (bot, room) => `${bot} has clocked into ${room}. Manager mode: disabled. Fun mode: dangerously enabled.`,
-    (bot, room) => `A wild ${bot} appeared in ${room}! It used !help. It's super effective.`,
-    (bot, room) => `${room} just got an upgrade: ${bot} is here. Your Wi-Fi may feel judged.`,
-    (bot, room) => `It's me, ${bot}, barging into ${room} like rent is due and the rent is entertainment.`,
-    (bot, room) => `${bot} arrived in ${room} with snacks, sarcasm, and a full command menu (!help).`,
-    (bot, room) => `Did somebody order a bot? Too late — ${bot} already delivered myself to ${room}.`,
-    (bot, room) => `${bot} is live in ${room}. I can't do your taxes, but I can do !help.`,
+    (bot, room) =>
+        `*clears throat* Behold: ${bot} has entered ${room}. Chat me with .hi (or say sugar). Commands: !help.`,
+    (bot, room) =>
+        `${bot} just crashed the party in ${room}. Talk to me with a leading . — like .hi — or say sugar. !help for commands.`,
+    (bot, room) =>
+        `Breaking news from ${room}: ${bot} is in chat. Start with . to talk (e.g. .how's it going) · or say sugar · !help`,
+    (bot, room) =>
+        `${bot} spawned in ${room}. Side quest: type .hi to chat, or sugar, or !help before chaos finds you.`,
+    (bot, room) =>
+        `Plot twist — ${bot} walked into ${room}. Yes I'm real. Whisper .hey or say sugar to chat · !help for cmds.`,
+    (bot, room) =>
+        `${room}, meet ${bot}. Chat with . (silent ask, like .hi) or say sugar. Or, y'know… type !help.`,
+    (bot, room) =>
+        `I, ${bot}, arrived in ${room} fashionably late. Poke me with .hi / sugar — commands via !help.`,
+    (bot, room) =>
+        `${bot} slid into ${room} with no script. Start a line with . to talk to me, or say sugar. !help works too.`,
+    (bot, room) =>
+        `Attention ${room}: ${bot} is online. Chat: .hi or sugar. Commands: !help. Therapy not included.`,
+    (bot, room) =>
+        `${bot} bootstrapped into ${room}. If I glow, that's vibes. Chat me with . or sugar · !help for the menu.`,
+    (bot, room) =>
+        `Guess who joined ${room}? ${bot}. No autographs — try .hi, say sugar, or !help.`,
+    (bot, room) =>
+        `${bot} entered ${room} so hard the furniture flinched. Chat: leading . (e.g. .sup) or sugar · !help`,
+    (bot, room) =>
+        `Hello ${room}, it's ${bot}. I bring .chat (start with .), sugar mentions, chaos, and !help.`,
+    (bot, room) =>
+        `${bot} clocked into ${room}. Fun mode on. Talk with .hi / sugar · commands with !help.`,
+    (bot, room) =>
+        `A wild ${bot} appeared in ${room}! It used .hi. You can also say sugar or !help. Super effective.`,
+    (bot, room) =>
+        `${room} upgrade: ${bot} is here. Start with . to chat silently, or say sugar. !help for commands.`,
+    (bot, room) =>
+        `It's me, ${bot}, barging into ${room}. Rent is entertainment — pay with .hi, sugar, or !help.`,
+    (bot, room) =>
+        `${bot} arrived in ${room} with snacks + sarcasm. Chat: .message or sugar · menu: !help.`,
+    (bot, room) =>
+        `Did somebody order a bot? Too late — ${bot} delivered to ${room}. Try .hi, sugar, or !help.`,
+    (bot, room) =>
+        `${bot} is live in ${room}. Can't do taxes. Can do .hi / sugar chat and !help.`,
 ];
 
 const random = (arr) => arr[Math.floor(Math.random() * arr.length)];
