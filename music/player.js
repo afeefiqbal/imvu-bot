@@ -35,6 +35,12 @@ async function openYoutubeAudioStream(trackUrl, isStale, onSpawn) {
 /** @returns {Promise<number>} HTTP status (0 on failure). */
 function httpGetStatus(host, port, path) {
     return new Promise((resolve) => {
+        let settled = false;
+        const finish = (code) => {
+            if (settled) return;
+            settled = true;
+            resolve(code);
+        };
         const req = http.request(
             {
                 hostname: host,
@@ -42,22 +48,23 @@ function httpGetStatus(host, port, path) {
                 family: icecastConnectFamily(host),
                 path: path.startsWith('/') ? path : `/${path}`,
                 method: 'GET',
-                timeout: 2800,
+                timeout: 4000,
             },
             (res) => {
                 const code = res.statusCode || 0;
+                // Streaming mounts never "end"; status headers are enough.
                 try {
                     res.destroy();
                 } catch {}
-                resolve(code);
+                finish(code);
             },
         );
-        req.on('error', () => resolve(0));
+        req.on('error', () => finish(0));
         req.on('timeout', () => {
             try {
                 req.destroy();
             } catch {}
-            resolve(0);
+            finish(0);
         });
         req.end();
     });
@@ -495,7 +502,7 @@ export function createRoomPlayer(opts) {
                 const up = await icecastStatusJsonShowsSource(loopHost, icePort, mountPath);
                 if (!up) {
                     console.warn(
-                        `[music] Icecast has no SOURCE on ${mountPath} at ${loopHost}:${icePort} ~5s after start — ` +
+                        `[music] Icecast has no SOURCE on ${mountPath} at ${loopHost}:${icePort} ~12s after start — ` +
                             'nothing is registered on that mount (listeners/ngrok get 404). ' +
                             'Compare ICECAST_SOURCE_USER / ICECAST_SOURCE_PASSWORD in .env with icecast.xml <source-password>, ' +
                             'and ICECAST_PORT (Docker host is usually 8001). Watch [music] ffmpeg: lines above for auth/connection errors.',
@@ -503,7 +510,7 @@ export function createRoomPlayer(opts) {
                 } else {
                     console.log(`[music] Icecast confirms source on ${mountPath} (${loopHost}:${icePort}).`);
                 }
-            }, 5000);
+            }, 12000);
 
             const ms = Math.max(500, parseInt(String(process.env.MUSIC_DOM_STREAM_DELAY_MS || '2500'), 10) || 2500);
             domPushTimer = setTimeout(() => {

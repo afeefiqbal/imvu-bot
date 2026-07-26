@@ -80,16 +80,20 @@ async function syncLiveStreamToRoom({ player, page, sessionClient, roomId, loadC
     const { cfgNow, pubNow } = stream;
     const mediaOpts = { sessionClient, roomId, stationName: String(track?.title || '').trim() };
     const liveUrl = cfgNow?.perPlayMount ? pubNow : cacheBustHttpsStreamUrl(pubNow);
+    const mountWaitMs = Math.max(
+        12000,
+        parseInt(String(process.env.MUSIC_CHAT_WAIT_MOUNT_MS || '50000'), 10) || 50000
+    );
 
     try {
-        // Apply radio URL first so host/mod failures return in ~1s (don't wait for Icecast).
+        // Fast host/mod check only — do not leave IMVU on this URL yet (mount may still be 404).
         const earlyApplied = await applyRoomMediaStreamUrl(page, liveUrl, mediaOpts);
         if (!earlyApplied.ok && roomMediaNotModerator(earlyApplied)) {
             await replyRoomMediaFailure(reply, earlyApplied);
             return false;
         }
 
-        const mountLive = await player.waitForMountLive(cfgNow, 12000);
+        const mountLive = await player.waitForMountLive(cfgNow, mountWaitMs);
         if (!mountLive) {
             if (urlLooksLikeNgrokFree(pubNow)) {
                 await reply(
@@ -114,9 +118,9 @@ async function syncLiveStreamToRoom({ player, page, sessionClient, roomId, loadC
             );
             return false;
         }
-        const applied = earlyApplied.ok
-            ? earlyApplied
-            : await applyRoomMediaStreamUrl(page, liveUrl, mediaOpts);
+
+        // Always re-apply after the mount is live so IMVU does not stick on an early 404.
+        const applied = await applyRoomMediaStreamUrl(page, liveUrl, mediaOpts);
         if (!applied.ok) {
             await replyRoomMediaFailure(reply, applied);
             return false;
