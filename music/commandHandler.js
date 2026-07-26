@@ -79,9 +79,17 @@ async function syncLiveStreamToRoom({ player, page, sessionClient, roomId, loadC
     if (!stream) return false;
     const { cfgNow, pubNow } = stream;
     const mediaOpts = { sessionClient, roomId, stationName: String(track?.title || '').trim() };
+    const liveUrl = cfgNow?.perPlayMount ? pubNow : cacheBustHttpsStreamUrl(pubNow);
 
     try {
-        const mountLive = await player.waitForMountLive(cfgNow, 30000);
+        // Apply radio URL first so host/mod failures return in ~1s (don't wait for Icecast).
+        const earlyApplied = await applyRoomMediaStreamUrl(page, liveUrl, mediaOpts);
+        if (!earlyApplied.ok && roomMediaNotModerator(earlyApplied)) {
+            await replyRoomMediaFailure(reply, earlyApplied);
+            return false;
+        }
+
+        const mountLive = await player.waitForMountLive(cfgNow, 12000);
         if (!mountLive) {
             if (urlLooksLikeNgrokFree(pubNow)) {
                 await reply(
@@ -99,7 +107,6 @@ async function syncLiveStreamToRoom({ player, page, sessionClient, roomId, loadC
             return false;
         }
 
-        const liveUrl = cfgNow?.perPlayMount ? pubNow : cacheBustHttpsStreamUrl(pubNow);
         const imvuProbe = await probePublicStreamForImvu(liveUrl, 8000);
         if (isImvuBlockingStreamProbe(imvuProbe, liveUrl)) {
             await reply(
@@ -107,7 +114,9 @@ async function syncLiveStreamToRoom({ player, page, sessionClient, roomId, loadC
             );
             return false;
         }
-        const applied = await applyRoomMediaStreamUrl(page, liveUrl, mediaOpts);
+        const applied = earlyApplied.ok
+            ? earlyApplied
+            : await applyRoomMediaStreamUrl(page, liveUrl, mediaOpts);
         if (!applied.ok) {
             await replyRoomMediaFailure(reply, applied);
             return false;
@@ -290,13 +299,16 @@ export async function createMusicRoomChatCommandHandler(opts) {
                 return true;
             }
 
+            // ACK immediately so room chat isn't blocked on Icecast/yt-dlp/mod checks.
+            await reply(`Playing ${one.title}…`);
+
             try {
                 await player.prepareStreamForNextTrack();
                 player.playNow({
                     title: one.title,
                     url: one.url,
                 });
-                await queueMediaSync(() =>
+                void queueMediaSync(() =>
                     syncLiveStreamToRoom({
                         player,
                         page,
@@ -307,7 +319,10 @@ export async function createMusicRoomChatCommandHandler(opts) {
                         reply,
                         statusPrefix: 'playing ',
                     }),
-                );
+                ).catch((e) => {
+                    console.warn('[music] live play failed:', e?.message || e);
+                    void reply(`Could not start live stream right now: ${e?.message || 'unknown error'}`);
+                });
             } catch (e) {
                 console.warn('[music] live play failed:', e?.message || e);
                 await reply(`Could not start live stream right now: ${e?.message || 'unknown error'}`);
@@ -328,29 +343,29 @@ export async function createMusicRoomChatCommandHandler(opts) {
             }
 
             const wasActive = hasActivePlayback(player);
+            await reply(wasActive ? `Added: ${one.title}` : `Playing ${one.title}…`);
+
             await player.prepareStreamForNextTrack();
             player.enqueue({
                 title: one.title,
                 url: one.url,
             });
 
-            try {
-                await queueMediaSync(() =>
-                    syncLiveStreamToRoom({
-                        player,
-                        page,
-                        sessionClient,
-                        roomId,
-                        loadConfig,
-                        track: one,
-                        reply,
-                        statusPrefix: wasActive ? 'playing ' : 'Added — now playing: ',
-                    }),
-                );
-            } catch (e) {
+            void queueMediaSync(() =>
+                syncLiveStreamToRoom({
+                    player,
+                    page,
+                    sessionClient,
+                    roomId,
+                    loadConfig,
+                    track: one,
+                    reply,
+                    statusPrefix: wasActive ? 'playing ' : 'Added — now playing: ',
+                }),
+            ).catch((e) => {
                 console.warn('[music] add failed:', e?.message || e);
-                await reply(`Could not start live stream right now: ${e?.message || 'unknown error'}`);
-            }
+                void reply(`Could not start live stream right now: ${e?.message || 'unknown error'}`);
+            });
             return true;
         }
 
