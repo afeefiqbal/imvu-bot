@@ -17,6 +17,8 @@ let dmHintPendingCtx = null;
 /** user ids from recent web_msg messageReceived hints */
 const dmHintPendingSenderIds = new Set();
 let dmHintRetryTimer = null;
+/** After boot, first full inbox scan only baselines IDs — no invites for already-read history. */
+let dmJoinBaselineDone = false;
 
 function rememberFriendAccept(userId) {
     const id = String(userId || '').trim();
@@ -351,12 +353,17 @@ async function processDirectMessageJoinCommandsInner(ctx, options = {}) {
             }
         }
 
+        // Keep the pull small — we only ever act on each sender's newest message.
+        const fetchLimit = options.preferOnly ? 8 : 20;
         let conversations = [];
         if (
             preferUserIds.length &&
             typeof session.listRecentDirectMessagesFromUsers === 'function'
         ) {
-            conversations = await session.listRecentDirectMessagesFromUsers(preferUserIds, 40);
+            conversations = await session.listRecentDirectMessagesFromUsers(
+                preferUserIds,
+                fetchLimit
+            );
             logger.log(
                 `${logPrefix} fetched ${conversations.length} msg(s) for sender(s) ${preferUserIds.join(',')}`
             );
@@ -366,16 +373,42 @@ async function processDirectMessageJoinCommandsInner(ctx, options = {}) {
             /^!join\b/i.test(String(entry?.text || ''))
         );
         if (!hasJoin && !options.preferOnly) {
-            conversations = await session.listRecentDirectMessages(40, { preferUserIds });
+            conversations = await session.listRecentDirectMessages(fetchLimit, { preferUserIds });
         }
 
         if (!conversations.length) {
             logger.log(`${logPrefix} no inbound DM commands (${watchedDmUserIdsLabel(session)})`);
+            if (!options.preferOnly) dmJoinBaselineDone = true;
             return { joinCommands: 0 };
         }
 
         // Newest first when possible — historical !join spam should not all fire.
         conversations = [...conversations].reverse();
+
+        // First full inbox pass after boot: remember existing DMs, do not invite.
+        // Users must send a fresh !join after the bot starts (or after PM2 restart).
+        if (!dmJoinBaselineDone && !options.preferOnly) {
+            for (const conversation of conversations) {
+                const id = String(conversation.messageId || '').trim();
+                if (id) processedDmMessageIds.add(id);
+            }
+            dmJoinBaselineDone = true;
+            logger.log(
+                `${logPrefix} startup baseline — ignoring ${conversations.length} existing DM(s); only new !join will invite`
+            );
+            return { joinCommands: 0 };
+        }
+
+        // Only the newest inbound message per sender (skip older already-read !joins).
+        const newestBySender = new Map();
+        for (const conversation of conversations) {
+            const sid =
+                String(conversation.senderUserId || '').trim() ||
+                `msg:${String(conversation.messageId || '')}`;
+            if (!sid || newestBySender.has(sid)) continue;
+            newestBySender.set(sid, conversation);
+        }
+        conversations = [...newestBySender.values()];
 
         for (const conversation of conversations) {
             const messageId = String(conversation.messageId || '');
@@ -395,6 +428,7 @@ async function processDirectMessageJoinCommandsInner(ctx, options = {}) {
                 session.watchDirectMessageUser(senderUserId);
             }
 
+            // Newest message for this sender must itself be !join — ignore buried history.
             if (!/^!join\b/i.test(text)) continue;
             joinCommands += 1;
 

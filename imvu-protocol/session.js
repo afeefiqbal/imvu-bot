@@ -2256,29 +2256,30 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
             const opened = await openDirectConversationWithUser(botId, userId, headers);
             if (!opened) continue;
 
-            const inbound = Array.isArray(opened.inboundMessages) ? opened.inboundMessages : [];
-            if (inbound.length) {
-                for (const parsed of inbound) {
-                    if (!parsed || seenMessageIds.has(parsed.messageId)) continue;
-                    seenMessageIds.add(parsed.messageId);
-                    if (parsed.senderUserId) watchDirectMessageUser(parsed.senderUserId);
-                    messages.push(parsed);
-                    if (messages.length >= limit) break;
-                }
-                continue;
-            }
-
-            const parsed = conversationMessageFromData(
+            // Prefer conversation last_message — that is the newest text (skip buried history).
+            const parsedLast = conversationMessageFromData(
                 opened.data,
                 botId,
                 opened.detailDenorm,
                 opened.convKey
             );
-            if (!parsed || seenMessageIds.has(parsed.messageId)) continue;
+            if (parsedLast && !seenMessageIds.has(parsedLast.messageId)) {
+                seenMessageIds.add(parsedLast.messageId);
+                if (parsedLast.senderUserId) watchDirectMessageUser(parsedLast.senderUserId);
+                messages.push(parsedLast);
+                continue;
+            }
 
-            seenMessageIds.add(parsed.messageId);
-            if (parsed.senderUserId) watchDirectMessageUser(parsed.senderUserId);
-            messages.push(parsed);
+            const inbound = Array.isArray(opened.inboundMessages) ? opened.inboundMessages : [];
+            if (inbound.length) {
+                // API order varies; take the last entry as newest fallback.
+                const parsed = inbound[inbound.length - 1];
+                if (!parsed || seenMessageIds.has(parsed.messageId)) continue;
+                seenMessageIds.add(parsed.messageId);
+                if (parsed.senderUserId) watchDirectMessageUser(parsed.senderUserId);
+                messages.push(parsed);
+                continue;
+            }
         }
 
         return messages;
