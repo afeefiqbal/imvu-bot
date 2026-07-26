@@ -202,8 +202,11 @@ export const createIncomingMessageHandler = (ctx) => {
             : normalizeImvuUsername(String(name));
 
         ctx.announceJoinQueuePresence(avatarId, label);
-        if (ctx.lastSpokeAt && !ctx.isSelfId(avatarId)) {
-            ctx.lastSpokeAt.set(String(avatarId), Date.now());
+        if (!ctx.isSelfId(avatarId)) {
+            const id = String(avatarId);
+            if (ctx.joinedAt && !ctx.joinedAt.has(id)) {
+                ctx.joinedAt.set(id, Date.now());
+            }
         }
 
         const scheduled = ctx.scheduleWelcomeForAvatar(avatarId, label, {
@@ -312,6 +315,7 @@ export const createIncomingMessageHandler = (ctx) => {
                             ctx.activeJoinSessions.delete(avatarId);
                             ctx.cancelPendingWelcome?.(avatarId);
                             ctx.processedJoins.delete(avatarId);
+                            ctx.clearSessionActivity?.(avatarId);
                             if (username && typeof ctx.onLeave === 'function') ctx.onLeave(username);
                         }
                         return;
@@ -512,6 +516,7 @@ export const createIncomingMessageHandler = (ctx) => {
                     ctx.activeJoinSessions.delete(avatarId);
                     ctx.cancelPendingWelcome?.(avatarId);
                     ctx.processedJoins.delete(avatarId);
+                    ctx.clearSessionActivity?.(avatarId);
                     if (username) ctx.onLeave(username);
                     ctx.triggerCountUpdate();
                 }
@@ -549,6 +554,7 @@ export const createIncomingMessageHandler = (ctx) => {
                         ctx.activeJoinSessions.delete(avatarId);
                         ctx.cancelPendingWelcome?.(avatarId);
                         ctx.processedJoins.delete(avatarId);
+                        ctx.clearSessionActivity?.(avatarId);
                         if (username && !ctx.isSelfId(avatarId)) ctx.onLeave(username);
                         continue;
                     }
@@ -658,7 +664,14 @@ export const createIncomingMessageHandler = (ctx) => {
                         record === 'msg_c2g_send_message' || ctx.isSelfId(senderId) ? 'OUT' : 'IN';
                     const trimmed = text.trim();
                     if (direction === 'IN' && senderId != null && !ctx.isSelfId(senderId)) {
-                        ctx.lastSpokeAt?.set(String(senderId), Date.now());
+                        const id = String(senderId);
+                        ctx.lastSpokeAt?.set(id, Date.now());
+                        if (ctx.joinedAt && !ctx.joinedAt.has(id)) {
+                            ctx.joinedAt.set(id, Date.now());
+                        }
+                        if (ctx.messageCount) {
+                            ctx.messageCount.set(id, (ctx.messageCount.get(id) || 0) + 1);
+                        }
                     }
                     if (
                         direction === 'IN' &&

@@ -595,6 +595,17 @@ export async function startUserTracking(page, roomId, options = {}) {
     const kickInflight = new Set();
     const freshAccountChecks = new Map();
     const lastSpokeAt = new Map();
+    /** @type {Map<string, number>} avatarId -> first seen / joined ms */
+    const joinedAt = new Map();
+    /** @type {Map<string, number>} avatarId -> chat message count this visit */
+    const messageCount = new Map();
+    const clearSessionActivity = (avatarId) => {
+        const id = String(avatarId || '');
+        if (!id) return;
+        lastSpokeAt.delete(id);
+        joinedAt.delete(id);
+        messageCount.delete(id);
+    };
     const minAgeWarned = new Set();
     const scalerWarnedAt = new Map();
     const roomCommandsEnabled = envFlag('IMVU_ROOM_COMMANDS_ENABLED', true);
@@ -694,6 +705,7 @@ export async function startUserTracking(page, roomId, options = {}) {
         joinQueueBackendAnnounced.delete(avatarId);
         activeJoinSessions.delete(avatarId);
         processedJoins.delete(avatarId);
+        clearSessionActivity(avatarId);
         if (label && !isSelfId(avatarId)) void onLeave(label);
         triggerCountUpdate();
     };
@@ -1087,6 +1099,8 @@ export async function startUserTracking(page, roomId, options = {}) {
             getRoomModerators: async () => sessionClient?.fetchRoomModerators?.(roomId) || [],
             lastUserMap,
             lastSpokeAt,
+            joinedAt,
+            messageCount,
             minAgeWarned,
             scalerWarnedAt,
         });
@@ -1138,6 +1152,9 @@ export async function startUserTracking(page, roomId, options = {}) {
         roomKickCommandHandler: handleKickCommand,
         autoBootMessageHandler: handleAutoBootMessage,
         lastSpokeAt,
+        joinedAt,
+        messageCount,
+        clearSessionActivity,
         roomId,
         getRoomChatQueue: () => protocolClient?.chatQueue || '',
         isPresenceRepairInFlight: () => Boolean(protocolClient?.presenceRepairInFlight),

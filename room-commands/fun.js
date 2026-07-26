@@ -70,6 +70,17 @@ function parseDurationMs(raw) {
     return n * 60 * 1000;
 }
 
+/** @param {number} ms */
+function formatElapsed(ms) {
+    const totalSec = Math.max(0, Math.floor(ms / 1000));
+    if (totalSec < 60) return `${totalSec}s`;
+    const totalMin = Math.floor(totalSec / 60);
+    if (totalMin < 60) return `${totalMin}m`;
+    const h = Math.floor(totalMin / 60);
+    const m = totalMin % 60;
+    return m ? `${h}h ${m}m` : `${h}h`;
+}
+
 function splitPickList(args) {
     return String(args || '')
         .split(',')
@@ -117,6 +128,8 @@ export async function runFunCommand(cmd, args, ctx) {
         reply,
         lastUserMap,
         lastSpokeAt,
+        joinedAt,
+        messageCount,
         sessionClient,
         getRoomName = () => 'the room',
         getRoomModerators,
@@ -393,32 +406,37 @@ export async function runFunCommand(cmd, args, ctx) {
             return true;
         }
         case 'mystats': {
-            const spoke = uid ? lastSpokeAt.get(uid) : null;
-            const ago =
-                spoke != null
-                    ? `${Math.max(0, Math.round((Date.now() - spoke) / 60000))}m ago`
-                    : 'never this session';
+            const now = Date.now();
+            const spoke = uid ? lastSpokeAt?.get(uid) : null;
+            const joined = uid ? joinedAt?.get(uid) : null;
+            const msgs = uid ? messageCount?.get(uid) || 0 : 0;
+            const lastSpoke =
+                spoke != null ? `${formatElapsed(now - spoke)} ago` : 'never this visit';
+            const inRoom = joined != null ? formatElapsed(now - joined) : 'unknown';
             const st = uid ? statusMap(roomId).get(uid) : null;
             await reply(
-                `${name} · last spoke: ${ago}${st ? ` · status: ${st}` : ''} · room: ${roomKey(roomId)}`
+                `${name} · msgs: ${msgs} · in room: ${inRoom} · last spoke: ${lastSpoke}${st ? ` · status: ${st}` : ''} · room: ${roomKey(roomId)}`
             );
             return true;
         }
         case 'leaderboard': {
-            const rows = [...lastSpokeAt.entries()]
-                .map(([id, ts]) => ({
+            const counts = messageCount instanceof Map ? messageCount : new Map();
+            const rows = [...counts.entries()]
+                .map(([id, msgs]) => ({
                     label: lastUserMap.get(id) || id,
-                    ts,
+                    msgs: Number(msgs) || 0,
+                    spoke: lastSpokeAt?.get(id) || 0,
                 }))
-                .sort((a, b) => b.ts - a.ts)
+                .filter((r) => r.msgs > 0)
+                .sort((a, b) => b.msgs - a.msgs || b.spoke - a.spoke)
                 .slice(0, 10);
             if (!rows.length) {
-                await reply('No activity tracked yet.');
+                await reply('No chat activity tracked yet.');
                 return true;
             }
             await reply(
-                'Most recently active:\n' +
-                    rows.map((r, i) => `${i + 1}. ${r.label}`).join('\n')
+                'Top chatters:\n' +
+                    rows.map((r, i) => `${i + 1}. ${r.label} (${r.msgs})`).join('\n')
             );
             return true;
         }

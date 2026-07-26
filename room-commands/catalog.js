@@ -53,11 +53,11 @@ export const COMMAND_CATALOG = {
     rate: { category: 'general', summary: 'Rate something 1–10.', usage: '!rate pizza' },
     mystats: {
         category: 'general',
-        summary: 'Your activity in this room this session.',
+        summary: 'Your msgs, time in room, and last spoke this visit.',
         usage: '!mystats',
         aliases: ['stats'],
     },
-    leaderboard: { category: 'general', summary: 'Most recently active users in the room.', usage: '!leaderboard' },
+    leaderboard: { category: 'general', summary: 'Top chatters in the room this visit.', usage: '!leaderboard' },
     nopick: { category: 'general', summary: 'Opt out of !pick1/!pick2 (on/off).', usage: '!nopick on' },
     help: {
         category: 'general',

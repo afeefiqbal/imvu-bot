@@ -33,6 +33,8 @@ const SCALE_CHECK_INTERVAL_MS = Math.max(
  * @param {{ fetchChatParticipant?: Function, updateChatParticipantSeat?: Function, fetchUserProfile?: Function, apiGetWearableNames?: Function } | null} [opts.sessionClient]
  * @param {Map<string, string>} opts.lastUserMap
  * @param {Map<string, number>} opts.lastSpokeAt
+ * @param {Map<string, number>} [opts.joinedAt]
+ * @param {Map<string, number>} [opts.messageCount]
  * @param {Set<string>} opts.minAgeWarned
  * @param {Map<string, number>} [opts.scalerWarnedAt]
  * @param {() => Promise<Array<{ username?: string, avatarname?: string, display_name?: string, legacy_cid?: number }>>} [opts.getRoomModerators]
@@ -50,6 +52,8 @@ export function createRoomChatCommandHandler(opts) {
         sessionClient = null,
         lastUserMap,
         lastSpokeAt,
+        joinedAt,
+        messageCount,
         minAgeWarned,
         scalerWarnedAt: scalerWarnedAtOpt,
         getRoomModerators,
@@ -274,6 +278,8 @@ export function createRoomChatCommandHandler(opts) {
             reply,
             lastUserMap,
             lastSpokeAt,
+            joinedAt,
+            messageCount,
             sessionClient,
             getRoomName,
             getRoomModerators,
