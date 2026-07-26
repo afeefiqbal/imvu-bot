@@ -12,9 +12,9 @@ const endOfChain = new Map();
 function reconnectDelayMs() {
     const raw = process.env.MUSIC_ICECAST_RECONNECT_MS;
     if (raw === '0' || raw === 'false') return 0;
-    if (raw == null || String(raw).trim() === '') return 800;
+    if (raw == null || String(raw).trim() === '') return 1000;
     const v = parseInt(String(raw), 10);
-    return Number.isFinite(v) && v >= 0 ? v : 800;
+    return Number.isFinite(v) && v >= 0 ? v : 1000;
 }
 
 /**

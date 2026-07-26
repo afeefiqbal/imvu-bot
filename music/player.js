@@ -399,7 +399,10 @@ export function createRoomPlayer(opts) {
         const baseCfg = cachedConfig || (await loadConfig());
         cachedConfig = baseCfg;
         if (!baseCfg?.enabled) return;
-        if (!activeStreamCfg?.perPlayMount) {
+        // Prefer mount prepared by !play; otherwise mint a fresh one (skip / queue advance).
+        if (activeStreamCfg?.perPlayMount && activeStreamCfg.consumeOnPlay) {
+            activeStreamCfg.consumeOnPlay = false;
+        } else {
             activeStreamCfg = withPerPlayStreamMount(baseCfg, roomId, Date.now());
         }
         const cfg = activeStreamCfg;
@@ -561,6 +564,8 @@ export function createRoomPlayer(opts) {
         cachedConfig = baseCfg;
         if (!baseCfg?.enabled) return null;
         activeStreamCfg = withPerPlayStreamMount(baseCfg, roomId, Date.now());
+        // playOne consumes this once so !play sync + encode share the same mount.
+        activeStreamCfg.consumeOnPlay = true;
         return activeStreamCfg;
     };
 
@@ -572,7 +577,14 @@ export function createRoomPlayer(opts) {
         queue.clearAll();
         queue.enqueue(track);
         killFf();
-        void ensureDrain();
+        void (async () => {
+            const gap = Math.max(
+                0,
+                parseInt(String(process.env.MUSIC_ICECAST_RECONNECT_MS || '1000'), 10) || 1000
+            );
+            if (gap > 0) await new Promise((r) => setTimeout(r, gap));
+            void ensureDrain();
+        })();
     };
 
     return {
@@ -587,17 +599,9 @@ export function createRoomPlayer(opts) {
         prepareStreamForNextTrack,
 
         enqueue: (track) => {
-            const active =
-                ffProc != null ||
-                ytdlpProc != null ||
-                setupYtdlpProc != null ||
-                queue.getCurrent() != null ||
-                drainLock;
-            if (active) {
-                playNow(track);
-                return;
-            }
+            // Real queue: never steal the current encode (!add while playing).
             stopFlag = false;
+            paused = false;
             queue.enqueue(track);
             void ensureDrain();
         },
@@ -609,8 +613,16 @@ export function createRoomPlayer(opts) {
         skip: () => {
             paused = false;
             pausedTrack = null;
+            playEpoch += 1;
             killFf();
-            void ensureDrain();
+            void (async () => {
+                const gap = Math.max(
+                    0,
+                    parseInt(String(process.env.MUSIC_ICECAST_RECONNECT_MS || '1000'), 10) || 1000
+                );
+                if (gap > 0) await new Promise((r) => setTimeout(r, gap));
+                void ensureDrain();
+            })();
         },
 
         /** Stop encoding; keep queue + current song for !resume (restarts current from beginning). */

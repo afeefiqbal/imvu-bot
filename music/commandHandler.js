@@ -208,10 +208,21 @@ export async function createMusicRoomChatCommandHandler(opts) {
 
     player.kickAutoplayDrain();
 
-    /** Serialize room-radio API updates so rapid !play does not overlap stop/start pulses. */
+    /** Serialize room-radio API updates; drop superseded syncs when !play races. */
     let mediaSyncTail = Promise.resolve();
+    let mediaSyncGen = 0;
     const queueMediaSync = (fn) => {
-        const next = mediaSyncTail.then(fn, fn);
+        const gen = ++mediaSyncGen;
+        const next = mediaSyncTail.then(
+            async () => {
+                if (gen !== mediaSyncGen) return false;
+                return fn();
+            },
+            async () => {
+                if (gen !== mediaSyncGen) return false;
+                return fn();
+            },
+        );
         mediaSyncTail = next.catch(() => {});
         return next;
     };
@@ -347,8 +358,17 @@ export async function createMusicRoomChatCommandHandler(opts) {
             }
 
             const wasActive = hasActivePlayback(player);
-            await reply(wasActive ? `Added: ${one.title}` : `Playing ${one.title}…`);
+            if (wasActive) {
+                // Queue only — do not kill the current Icecast encode or change the radio URL.
+                player.enqueue({
+                    title: one.title,
+                    url: one.url,
+                });
+                await reply(`Added: ${one.title}`);
+                return true;
+            }
 
+            await reply(`Playing ${one.title}…`);
             await player.prepareStreamForNextTrack();
             player.enqueue({
                 title: one.title,
@@ -364,7 +384,7 @@ export async function createMusicRoomChatCommandHandler(opts) {
                     loadConfig,
                     track: one,
                     reply,
-                    statusPrefix: wasActive ? 'playing ' : 'Added — now playing: ',
+                    statusPrefix: 'Added — now playing: ',
                 }),
             ).catch((e) => {
                 console.warn('[music] add failed:', e?.message || e);
