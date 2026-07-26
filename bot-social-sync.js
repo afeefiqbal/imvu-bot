@@ -561,6 +561,7 @@ function isPermanentInviteReject(message) {
     const text = String(message || '');
     return (
         /Only the room owner or a moderator/i.test(text) ||
+        /Only public rooms can invite/i.test(text) ||
         /No active IMVU bot/i.test(text)
     );
 }
