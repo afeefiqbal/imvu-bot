@@ -86,13 +86,7 @@ async function syncLiveStreamToRoom({ player, page, sessionClient, roomId, loadC
     );
 
     try {
-        // Fast host/mod check only — do not leave IMVU on this URL yet (mount may still be 404).
-        const earlyApplied = await applyRoomMediaStreamUrl(page, liveUrl, mediaOpts);
-        if (!earlyApplied.ok && roomMediaNotModerator(earlyApplied)) {
-            await replyRoomMediaFailure(reply, earlyApplied);
-            return false;
-        }
-
+        // Wait for a real Icecast SOURCE before touching IMVU radio URL (early 404 → RADIO STREAM ERROR).
         const mountLive = await player.waitForMountLive(cfgNow, mountWaitMs);
         if (!mountLive) {
             if (urlLooksLikeNgrokFree(pubNow)) {
@@ -119,7 +113,6 @@ async function syncLiveStreamToRoom({ player, page, sessionClient, roomId, loadC
             return false;
         }
 
-        // Always re-apply after the mount is live so IMVU does not stick on an early 404.
         const applied = await applyRoomMediaStreamUrl(page, liveUrl, mediaOpts);
         if (!applied.ok) {
             await replyRoomMediaFailure(reply, applied);

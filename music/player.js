@@ -189,10 +189,14 @@ async function waitForIcecastMountLive(cfg, timeoutMs) {
     const port = Number(cfg.icecastPort) || 8001;
     const deadline = Date.now() + Math.max(3000, timeoutMs);
     let lastGet = 0;
+    // Require status-json SOURCE — GET 200 alone can race / false-positive and still leave IMVU on a dead link.
+    const requireJson =
+        !/^(0|false|no|off)$/i.test(String(process.env.MUSIC_REQUIRE_ICECAST_SOURCE_JSON ?? '1').trim());
     while (Date.now() < deadline) {
         const fromJson = await icecastStatusJsonShowsSource(loopHost, port, mount);
         lastGet = await httpGetStatus(loopHost, port, mount);
-        if (fromJson || lastGet === 200) {
+        const mountOk = requireJson ? fromJson : fromJson || lastGet === 200;
+        if (mountOk) {
             const pub = String(cfg.publicStreamUrl || '').trim();
             if (/^https:\/\//i.test(pub)) {
                 const httpsOk = await waitForPublicHttpsStream(pub, 22000);
