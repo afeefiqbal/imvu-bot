@@ -2,7 +2,7 @@ import {
     defaultGreetingText,
     formatGreeting,
 } from '../room-settings/defaults.js';
-import { getRoomSettings, isLurkEnabledForRoom, patchRoomSettingsLocal } from '../room-settings/store.js';
+import { getRoomSettings, isLurkEnabledForRoom, isWelcomeEnabledForRoom, patchRoomSettingsLocal } from '../room-settings/store.js';
 import { patchRoomSettingsRemote } from './api.js';
 import { buildHelpMessages, buildInfoMessage } from './help.js';
 import { getMaxKbsForRoom, runFunCommand, setMaxKbsForRoom } from './fun.js';
@@ -246,6 +246,9 @@ export function createRoomChatCommandHandler(opts) {
             'minage',
             'maxoccupancy',
             'nolurk',
+            'roommusic',
+            'commands',
+            'intro',
             'maxkbs',
             'outfit',
             'seat',
@@ -282,7 +285,7 @@ export function createRoomChatCommandHandler(opts) {
             const s = getRoomSettings(roomId);
             const maxKbs = getMaxKbsForRoom(roomId);
             await reply(
-                `greeting=${s.greeting ? `"${s.greeting.slice(0, 80)}${s.greeting.length > 80 ? '…' : ''}"` : '(default)'} | auto_greet=${s.auto_greet} | scale=${s.auto_scale_check}@${s.max_scaler}% | min_age=${s.min_age ?? 'off'} | lurk=${s.lurk_enabled} | max_occ=${s.max_occupancy ?? '—'} | max_kbs=${maxKbs ?? '—'}`
+                `greeting=${s.greeting ? `"${s.greeting.slice(0, 80)}${s.greeting.length > 80 ? '…' : ''}"` : '(default)'} | welcome=${s.auto_greet} | ai=${s.lurk_enabled} | music=${s.music_enabled} | cmds=${s.commands_enabled} | intro=${s.intro_enabled} | scale=${s.auto_scale_check}@${s.max_scaler}% | min_age=${s.min_age ?? 'off'} | max_occ=${s.max_occupancy ?? '—'} | max_kbs=${maxKbs ?? '—'}`
             );
             return true;
         }
@@ -359,6 +362,34 @@ export function createRoomChatCommandHandler(opts) {
             return true;
         }
 
+        if (cmd === 'roommusic') {
+            const toggle = parseOnOff(args);
+            const next = toggle ?? !settings.music_enabled;
+            await persist({ music_enabled: next });
+            await reply(`Music commands for this room are now ${next ? 'ON' : 'OFF'}.`);
+            return true;
+        }
+
+        if (cmd === 'commands') {
+            const toggle = parseOnOff(args);
+            const next = toggle ?? !settings.commands_enabled;
+            await persist({ commands_enabled: next });
+            await reply(
+                next
+                    ? 'Room/mod commands are now ON.'
+                    : 'Room/mod commands are now OFF for this room. Re-enable from the admin panel if needed.'
+            );
+            return true;
+        }
+
+        if (cmd === 'intro') {
+            const toggle = parseOnOff(args);
+            const next = toggle ?? !settings.intro_enabled;
+            await persist({ intro_enabled: next });
+            await reply(`Bot intro for this room is now ${next ? 'ON' : 'OFF'}.`);
+            return true;
+        }
+
         if (cmd === 'scale') {
             const toggle = parseOnOff(args);
             const next = toggle ?? !settings.auto_scale_check;
@@ -428,8 +459,8 @@ export function createRoomChatCommandHandler(opts) {
  * @param {string} roomName
  */
 export function buildWelcomeText(roomId, displayName, roomName) {
+    if (!isWelcomeEnabledForRoom(roomId)) return null;
     const settings = getRoomSettings(roomId);
-    if (!settings.auto_greet) return null;
     if (settings.greeting) {
         return formatGreeting(settings.greeting, { user: displayName, room: roomName }) || null;
     }

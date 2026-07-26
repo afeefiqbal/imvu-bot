@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import WebSocket from 'ws';
 import { introMessageDelayMs, resolveIntroMessage } from '../introMessages.js';
+import { isIntroEnabledForRoom } from '../room-settings/store.js';
 import {
     roomQueueBelongsToRoom,
     isImvuRoomChatQueue,
@@ -1583,6 +1584,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
 
     #scheduleIntroMessage() {
         if (this.introMessageSent) return;
+        if (!isIntroEnabledForRoom(this.roomId)) return;
         const botName =
             String(this.bot.profile || this.bot.name || this.bot.username || process.env.BOT_NAME || '').trim() ||
             'the bot';

@@ -7,6 +7,9 @@
  * @property {number | null} min_age
  * @property {number | null} max_occupancy
  * @property {boolean} lurk_enabled
+ * @property {boolean} music_enabled
+ * @property {boolean} commands_enabled
+ * @property {boolean} intro_enabled
  * @property {string | null} description
  * @property {string | null} music_url
  * @property {boolean} autoboot_on_kick
@@ -22,6 +25,9 @@ export function defaultRoomSettings() {
         min_age: null,
         max_occupancy: null,
         lurk_enabled: true,
+        music_enabled: true,
+        commands_enabled: true,
+        intro_enabled: true,
         description: null,
         music_url: null,
         autoboot_on_kick: false,
@@ -57,6 +63,9 @@ export function normalizeRoomSettings(raw) {
         if (Number.isFinite(n) && n > 0) base.max_occupancy = Math.min(100, Math.round(n));
     }
     if (o.lurk_enabled != null) base.lurk_enabled = Boolean(o.lurk_enabled);
+    if (o.music_enabled != null) base.music_enabled = Boolean(o.music_enabled);
+    if (o.commands_enabled != null) base.commands_enabled = Boolean(o.commands_enabled);
+    if (o.intro_enabled != null) base.intro_enabled = Boolean(o.intro_enabled);
     if (o.description != null) {
         const d = String(o.description).trim();
         base.description = d.length ? d.slice(0, 500) : null;

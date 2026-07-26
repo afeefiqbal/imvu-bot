@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { backendApiBaseUrl } from './env-app-url.js';
-import { getRoomSettings } from './room-settings/store.js';
+import { getRoomSettings, isMusicEnabledForRoom } from './room-settings/store.js';
 import { getRoomRuntime, trackerRoomKey } from './room-runtime-registry.js';
 import { fetchAndPostDashboardProfile } from './imvu-profile-sync.js';
 import { processPendingVerificationDeliveries } from './imvu-verification-sync.js';
@@ -138,6 +138,11 @@ export async function processSyncActions(data, ctx) {
             const roomId = trackerRoomKey(item.room_id);
             const action = String(item.action || 'start').trim().toLowerCase();
             if (!roomId) continue;
+
+            if (!isMusicEnabledForRoom(roomId) && action !== 'stop') {
+                logger.log(`${logPrefix} music start skipped — music disabled for ${roomId}`);
+                continue;
+            }
 
             if (action === 'stop') {
                 if (typeof ctx.session?.stopRoomRadioStream !== 'function') {

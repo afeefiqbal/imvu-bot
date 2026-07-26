@@ -13,7 +13,7 @@ import { createImvuSessionClient } from './imvu-protocol/session.js';
 import { ImvuAccountWebSocketClient } from './imvu-protocol/account-ws-client.js';
 import { ImvuRoomWebSocketClient } from './imvu-protocol/ws-client.js';
 import { startProtocolUserTracking } from './user-tracker.js';
-import { applySyncRoomSettings, patchRoomSettingsLocal, setGlobalLurkDefault } from './room-settings/store.js';
+import { applyBotFeatureFlags, applySyncRoomSettings, patchRoomSettingsLocal, setGlobalLurkDefault } from './room-settings/store.js';
 import {
     decodeChatEnvelope,
     decodeId,
@@ -74,24 +74,14 @@ function applyMutedRooms(mutedRooms) {
     }
 }
 
-function applyBotAiEnabled(data) {
-    if (data?.bot_ai_enabled == null) return;
-    const on =
-        data.bot_ai_enabled === true ||
-        data.bot_ai_enabled === 1 ||
-        String(data.bot_ai_enabled).trim().toLowerCase() === 'true' ||
-        String(data.bot_ai_enabled).trim() === '1';
-    setGlobalLurkDefault(on && !envDisabled('IMVU_LURK_ENABLED'));
+function envDisabled(key) {
+    const v = String(process.env[key] ?? '').trim().toLowerCase();
+    return v === '0' || v === 'false' || v === 'no' || v === 'off';
 }
 
 function envTruthy(key) {
     const v = String(process.env[key] ?? '').trim().toLowerCase();
     return v === '1' || v === 'true' || v === 'yes' || v === 'on';
-}
-
-function envDisabled(key) {
-    const v = String(process.env[key] ?? '').trim().toLowerCase();
-    return v === '0' || v === 'false' || v === 'no' || v === 'off';
 }
 
 function isDmJoinEnabled() {
@@ -262,14 +252,17 @@ async function main() {
     console.log(`[${BOT_NAME}] Pure WebSocket runtime starting; Chromium/Puppeteer is not used.`);
 
     const bot = await fetchBotSettings(BOT_NAME);
-    const aiEnabledRaw = bot.ai_enabled;
-    const aiGloballyOn =
-        aiEnabledRaw == null ||
-        aiEnabledRaw === true ||
-        aiEnabledRaw === 1 ||
-        String(aiEnabledRaw).trim().toLowerCase() === 'true' ||
-        String(aiEnabledRaw).trim() === '1';
-    setGlobalLurkDefault(aiGloballyOn && !envDisabled('IMVU_LURK_ENABLED'));
+    applyBotFeatureFlags({
+        bot_ai_enabled: bot.ai_enabled,
+        bot_music_enabled: bot.music_enabled,
+        bot_commands_enabled: bot.commands_enabled,
+        bot_welcome_enabled: bot.welcome_enabled,
+        bot_intro_enabled: bot.intro_enabled,
+    });
+    // Legacy: if API omits ai_enabled, keep previous default-on behavior with env kill-switch.
+    if (bot.ai_enabled == null) {
+        setGlobalLurkDefault(!envDisabled('IMVU_LURK_ENABLED'));
+    }
     const parsedProxy = parseProxyFromProcessEnv({ fallbackRaw: bot.proxy });
     const agents = createProxyAgents(parsedProxy);
     const session = createImvuSessionClient({ bot, agents });
@@ -545,7 +538,7 @@ async function main() {
     });
     applySyncRoomSettings(initial.room_settings);
     applyMutedRooms(initial.muted_rooms);
-    applyBotAiEnabled(initial);
+    applyBotFeatureFlags(initial);
     rememberRoomDiscordChannels(initial, roomDiscordChannelIds);
     if (Array.isArray(initial.paused_room_ids)) {
         for (const raw of initial.paused_room_ids) {
@@ -703,7 +696,7 @@ async function main() {
             }
             applySyncRoomSettings(data.room_settings);
             applyMutedRooms(data.muted_rooms);
-            applyBotAiEnabled(data);
+            applyBotFeatureFlags(data);
             rememberRoomDiscordChannels(data, roomDiscordChannelIds);
 
             activeSpamRooms = Array.isArray(data.spam_targets) ? data.spam_targets.map(trackerRoomId) : [];

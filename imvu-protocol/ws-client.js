@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import WebSocket from 'ws';
 import { introMessageDelayMs, resolveIntroMessage } from '../introMessages.js';
+import { isIntroEnabledForRoom } from '../room-settings/store.js';
 import { isEphemeralLegacyChatQueue } from '../user-tracker-utils.js';
 
 function parseFrame(raw) {
@@ -482,6 +483,7 @@ export class ImvuRoomWebSocketClient extends EventEmitter {
 
     #scheduleIntroMessage() {
         if (this.introMessageSent) return;
+        if (!isIntroEnabledForRoom(this.roomId)) return;
         const botName =
             String(this.bot.profile || this.bot.name || this.bot.username || process.env.BOT_NAME || '').trim() ||
             'the bot';

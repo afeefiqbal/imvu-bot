@@ -76,6 +76,9 @@ export const COMMAND_CATALOG = {
     minage: { category: 'admin', summary: 'Minimum profile age for the room.', usage: '!minage 18' },
     maxoccupancy: { category: 'admin', summary: 'Max room population for invites.', usage: '!maxoccupancy 12' },
     nolurk: { category: 'admin', summary: 'Turn Lurk/AI replies on or off.', usage: '!nolurk off' },
+    roommusic: { category: 'admin', summary: 'Turn music commands on or off for this room.', usage: '!roommusic off' },
+    commands: { category: 'admin', summary: 'Turn mod/room commands on or off for this room.', usage: '!commands off' },
+    intro: { category: 'admin', summary: 'Turn bot join intro on or off for this room.', usage: '!intro off' },
     roomcheck: { category: 'admin', summary: 'Users quiet longer than N minutes.', usage: '!roomcheck 10' },
     roomsettings: {
         category: 'admin',
@@ -102,7 +105,10 @@ COMMAND_ALIASES.autgreet = 'autogreet';
 COMMAND_ALIASES.room_id = 'roomid';
 COMMAND_ALIASES.maxsclar = 'maxscaler';
 COMMAND_ALIASES.maxscalar = 'maxscaler';
-COMMAND_ALIASES.maxscalar = 'maxscaler';
+COMMAND_ALIASES.room_music = 'roommusic';
+COMMAND_ALIASES.roomcmds = 'commands';
+COMMAND_ALIASES.roomcommands = 'commands';
+COMMAND_ALIASES.botintro = 'intro';
 
 export function canonicalCommand(name) {
     const key = String(name || '').trim().toLowerCase().replace(/^[!*]/, '');

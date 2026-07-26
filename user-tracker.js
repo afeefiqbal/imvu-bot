@@ -26,7 +26,12 @@ import {
     maybeWarnMinAgeOnJoin,
     maybeWarnScalerOnJoin,
 } from './room-commands/index.js';
-import { getRoomSettings } from './room-settings/store.js';
+import {
+    getRoomSettings,
+    isCommandsEnabledForRoom,
+    isMusicEnabledForRoom,
+    isWelcomeEnabledForRoom,
+} from './room-settings/store.js';
 import { registerRoomRuntime, unregisterRoomRuntime } from './room-runtime-registry.js';
 import { tryVerificationCodeFromChat } from './imvu-verification-sync.js';
 
@@ -957,7 +962,12 @@ export async function startUserTracking(page, roomId, options = {}) {
         const settingsForWelcome = buildWelcomeText(roomId, displayName, ROOM_NAME);
         if (!settingsForWelcome) {
             const settings = getRoomSettings(roomId);
-            const reason = settings.auto_greet ? 'empty greeting' : 'auto_greet off — use !autogreet on';
+            let reason = 'auto_greet off — use !autogreet on';
+            if (!isWelcomeEnabledForRoom(roomId) && settings.auto_greet) {
+                reason = 'welcome disabled globally on bot';
+            } else if (settings.auto_greet) {
+                reason = 'empty greeting';
+            }
             console.log(`${syncLogPrefix} welcome skipped for ${displayName || avatarId} (${reason})`);
             activeJoinSessions.delete(avatarId);
             void maybeWarnMinAgeOnJoin({
@@ -1085,11 +1095,11 @@ export async function startUserTracking(page, roomId, options = {}) {
 
     if (musicCommandHandler || roomCommandsHandler) {
         roomChatCommandHandler = async (ctx) => {
-            if (typeof musicCommandHandler === 'function') {
+            if (typeof musicCommandHandler === 'function' && isMusicEnabledForRoom(roomId)) {
                 const musicHandled = await musicCommandHandler(ctx);
                 if (musicHandled) return true;
             }
-            if (typeof roomCommandsHandler === 'function') {
+            if (typeof roomCommandsHandler === 'function' && isCommandsEnabledForRoom(roomId)) {
                 return Boolean(await roomCommandsHandler(ctx));
             }
             return false;
