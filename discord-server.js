@@ -64,7 +64,17 @@ async function registerRoomChannelWithBackend(room_id, room_name, roomChannel) {
         });
     } catch (error) {
         global.registeredBackendChannels.delete(key);
-        console.warn(`[DISCORD] Could not register channel with backend: ${error.message}`);
+        const status = error.response?.status;
+        const body = error.response?.data;
+        const detail =
+            typeof body === 'string'
+                ? body.slice(0, 200)
+                : body?.message || (body ? JSON.stringify(body).slice(0, 200) : '');
+        console.warn(
+            `[DISCORD] Could not register channel with backend: ${error.message}` +
+                (status ? ` (HTTP ${status})` : '') +
+                (detail ? ` — ${detail}` : '')
+        );
     }
 }
 
