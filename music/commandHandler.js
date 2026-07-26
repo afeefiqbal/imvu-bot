@@ -92,6 +92,15 @@ async function syncLiveStreamToRoom({ player, page, sessionClient, roomId, loadC
         // Wait for a real Icecast SOURCE before touching IMVU radio URL (early 404 → RADIO STREAM ERROR).
         const mountLive = await player.waitForMountLive(cfgNow, mountWaitMs);
         if (!mountLive) {
+            // !stop / !play replace: FFmpeg already dead or another track is current — don't spam chat.
+            const cur = player.getQueue?.()?.getCurrent?.() || null;
+            const wantUrl = String(track?.url || '').trim();
+            const curUrl = String(cur?.url || '').trim();
+            const ffmpegGone = typeof player.isPlaying === 'function' ? !player.isPlaying() : false;
+            const trackReplaced = Boolean(wantUrl) && curUrl !== wantUrl;
+            if (ffmpegGone || trackReplaced) {
+                return false;
+            }
             if (urlLooksLikeNgrokFree(pubNow)) {
                 await reply(
                     'Stream tunnel is ngrok free tier — IMVU gets HTML instead of MP3 (ERR_NGROK_6024). Set CLOUDFLARE_TUNNEL_AUTO=1 in .env and restart.',
