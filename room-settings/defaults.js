@@ -27,7 +27,7 @@ export function defaultRoomSettings() {
         lurk_enabled: true,
         music_enabled: true,
         commands_enabled: true,
-        intro_enabled: true,
+        intro_enabled: false,
         description: null,
         music_url: null,
         autoboot_on_kick: false,

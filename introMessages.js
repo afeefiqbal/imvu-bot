@@ -76,7 +76,7 @@ export function formatIntroMessage(template, { bot = 'the bot', room = 'the room
 
 /**
  * Resolve the chat line to send after visibility bootstrap.
- * - IMVU_WS_INTRO_ENABLED=0 → disabled
+ * - Off by default (empty). Set IMVU_WS_INTRO_ENABLED=1 to send join intros.
  * - IMVU_WS_INTRO_MESSAGE set → custom template ({bot}, {room})
  * - else a built-in intro template
  *
@@ -84,7 +84,7 @@ export function formatIntroMessage(template, { bot = 'the bot', room = 'the room
  * @returns {string | null}
  */
 export function resolveIntroMessage(vars = {}) {
-    const enabledRaw = String(process.env.IMVU_WS_INTRO_ENABLED ?? '1').trim().toLowerCase();
+    const enabledRaw = String(process.env.IMVU_WS_INTRO_ENABLED ?? '0').trim().toLowerCase();
     if (enabledRaw === '0' || enabledRaw === 'false' || enabledRaw === 'off' || enabledRaw === 'no') {
         return null;
     }

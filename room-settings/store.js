@@ -60,7 +60,7 @@ let globalLurkDefault = true;
 let globalMusicDefault = true;
 let globalCommandsDefault = true;
 let globalWelcomeDefault = true;
-let globalIntroDefault = true;
+let globalIntroDefault = false;
 
 /** @param {boolean} enabled */
 export function setGlobalLurkDefault(enabled) {
@@ -111,8 +111,10 @@ export function applyBotFeatureFlags(data) {
     }
     if (data.bot_intro_enabled != null) {
         setGlobalIntroDefault(
-            asBool(data.bot_intro_enabled, true) && !envDisabled('IMVU_WS_INTRO_ENABLED')
+            asBool(data.bot_intro_enabled, false) && !envDisabled('IMVU_WS_INTRO_ENABLED')
         );
+    } else if (envDisabled('IMVU_WS_INTRO_ENABLED')) {
+        setGlobalIntroDefault(false);
     }
 }
 
