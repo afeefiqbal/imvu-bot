@@ -3,15 +3,23 @@
  * @returns {string[]}
  */
 export function ytDlpExtraArgs() {
+    /** @type {string[]} */
+    const args = [];
+    // YouTube “n” challenge — without a JS runtime yt-dlp often only sees images.
+    const jsRuntime = String(process.env.YTDLP_JS_RUNTIMES || 'node').trim();
+    if (jsRuntime && jsRuntime !== '0' && jsRuntime.toLowerCase() !== 'off') {
+        args.push('--js-runtimes', jsRuntime);
+    }
     const cookiesFile = String(process.env.YTDLP_COOKIES_FILE || '').trim();
     if (cookiesFile) {
-        return ['--cookies', cookiesFile];
+        args.push('--cookies', cookiesFile);
+    } else {
+        const fromBrowser = String(process.env.YTDLP_COOKIES_FROM_BROWSER || '').trim();
+        if (fromBrowser) {
+            args.push('--cookies-from-browser', fromBrowser);
+        }
     }
-    const fromBrowser = String(process.env.YTDLP_COOKIES_FROM_BROWSER || '').trim();
-    if (fromBrowser) {
-        return ['--cookies-from-browser', fromBrowser];
-    }
-    return [];
+    return args;
 }
 
 /** @param {string} text */
