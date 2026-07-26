@@ -7,3 +7,5 @@ profiles/
 *.bak
 *.png
 dom-debug-*.html
+youtube-cookies.txt
+*cookies*.txt

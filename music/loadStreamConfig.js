@@ -150,6 +150,24 @@ async function loadStreamConfigInner({ apiBaseUrl, roomId }) {
             validateStatus: (s) => s < 500,
         });
         const d = res.data || {};
+        // Bot .env wins when music + ICECAST_HOST are set (OCI split deploy often
+        // has stale Laravel Render config pointing at an old Icecast IP).
+        const preferBotEnv =
+            truthyEnvFlag('MUSIC_PREFER_BOT_ENV') ||
+            (truthyProcessEnvMusicEnabled() &&
+                String(process.env.ICECAST_HOST || '').trim() !== '');
+        if (preferBotEnv) {
+            const fromEnv = streamConfigFromProcessEnv(rid);
+            if (fromEnv) {
+                const apiHost = String(d.icecast_host || '').trim();
+                if (d.enabled && apiHost && apiHost !== fromEnv.icecastHost) {
+                    console.warn(
+                        `[music] Ignoring Laravel icecast_host=${apiHost}; using bot ICECAST_HOST=${fromEnv.icecastHost}`
+                    );
+                }
+                return fromEnv;
+            }
+        }
         if (d.enabled) {
             return {
                 enabled: true,
