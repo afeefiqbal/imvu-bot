@@ -81,8 +81,8 @@ async function syncLiveStreamToRoom({ player, page, sessionClient, roomId, loadC
     const mediaOpts = { sessionClient, roomId, stationName: String(track?.title || '').trim() };
     const liveUrl = cfgNow?.perPlayMount ? pubNow : cacheBustHttpsStreamUrl(pubNow);
     const mountWaitMs = Math.max(
-        12000,
-        parseInt(String(process.env.MUSIC_CHAT_WAIT_MOUNT_MS || '50000'), 10) || 50000
+        8000,
+        parseInt(String(process.env.MUSIC_CHAT_WAIT_MOUNT_MS || '25000'), 10) || 25000
     );
 
     try {

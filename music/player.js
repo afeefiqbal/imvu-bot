@@ -275,11 +275,14 @@ export function createRoomPlayer(opts) {
 
     /** When commandHandler already synced room media for this track, skip the delayed player push. */
     let skipMountDomPush = false;
+    /** Survives playOne start — commandHandler often claims sync before drain begins. */
+    let skipMountDomPushForNextPlay = false;
     /** @type {ReturnType<typeof setTimeout> | null} */
     let domPushTimer = null;
 
     const notifyRoomMediaSynced = () => {
         skipMountDomPush = true;
+        skipMountDomPushForNextPlay = true;
         if (domPushTimer) {
             clearTimeout(domPushTimer);
             domPushTimer = null;
@@ -399,7 +402,13 @@ export function createRoomPlayer(opts) {
     };
 
     const playOne = async () => {
-        skipMountDomPush = false;
+        // Honor commandHandler claim from before drain started (do not wipe skipMountDomPush).
+        if (skipMountDomPushForNextPlay) {
+            skipMountDomPush = true;
+            skipMountDomPushForNextPlay = false;
+        } else {
+            skipMountDomPush = false;
+        }
         const baseCfg = cachedConfig || (await loadConfig());
         cachedConfig = baseCfg;
         if (!baseCfg?.enabled) return;
@@ -521,8 +530,8 @@ export function createRoomPlayer(opts) {
             // Never push the room radio URL on a fixed delay — that was the first-play 404 / RADIO STREAM ERROR.
             // Wait until Icecast actually has a SOURCE (or commandHandler already synced and set skipMountDomPush).
             const waitMs = Math.max(
-                12000,
-                parseInt(String(process.env.MUSIC_CHAT_WAIT_MOUNT_MS || '50000'), 10) || 50000,
+                8000,
+                parseInt(String(process.env.MUSIC_CHAT_WAIT_MOUNT_MS || '25000'), 10) || 25000,
             );
             const initialDelay = Math.max(
                 500,
@@ -534,7 +543,7 @@ export function createRoomPlayer(opts) {
                     if (skipMountDomPush || playEpoch !== committedEpoch) return;
                     const live = await waitForIcecastMountLive(cfg, waitMs);
                     if (skipMountDomPush || playEpoch !== committedEpoch) return;
-                    if (!live) {
+                    if (!live || !ffProc) {
                         console.warn(
                             '[music] Mount never went live — not pushing room radio URL (avoids IMVU caching 404).',
                         );
@@ -720,11 +729,22 @@ export function createRoomPlayer(opts) {
 
         /**
          * After enqueue, wait until Icecast serves this mount (source connected).
+         * Also requires FFmpeg still running — dead encode + stale probe used to claim "live".
          * @param {NonNullable<Awaited<ReturnType<typeof loadConfig>>>} cfg
          * @param {number} [timeoutMs]
          * @returns {Promise<boolean>}
          */
-        waitForMountLive: (cfg, timeoutMs) => waitForIcecastMountLive(cfg, timeoutMs),
+        waitForMountLive: async (cfg, timeoutMs) => {
+            const ok = await waitForIcecastMountLive(cfg, timeoutMs);
+            if (!ok) return false;
+            if (!ffProc) {
+                console.warn(
+                    '[music] Icecast probe looked ready but FFmpeg already exited — not treating mount as live.',
+                );
+                return false;
+            }
+            return true;
+        },
 
         /** Skip the delayed mount-time room media push (commandHandler already synced). */
         notifyRoomMediaSynced,
