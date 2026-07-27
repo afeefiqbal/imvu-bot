@@ -57,38 +57,50 @@ function parseInlinePlaylistFromEnv(raw) {
     }
 }
 
+/** Process-wide cache — every room used to expand the same YouTube playlist independently. */
+/** @type {Promise<{ title: string, url: string }[]> | null} */
+let cachedLoadPromise = null;
+
+async function loadAutoplayTracksFromEnvUncached() {
+    const inlineJson = String(process.env.MUSIC_AUTOPLAY_TRACKS_JSON || '').trim();
+    if (inlineJson) {
+        return parseInlinePlaylistFromEnv(inlineJson);
+    }
+
+    const jsonPrimary = String(process.env.MUSIC_AUTOPLAY_TRACKS_JSON_URL || '').trim();
+    const legacyList = String(process.env.MUSIC_PLAYLIST_URL || '').trim();
+    const ytOnly = String(process.env.MUSIC_AUTOPLAY_PLAYLIST_URL || '').trim();
+
+    if (jsonPrimary) {
+        return await fetchJsonPlaylist(jsonPrimary);
+    }
+
+    const ytCandidate = ytOnly || legacyList;
+    if (ytCandidate && isYoutubePlaylistUrl(ytCandidate)) {
+        return await expandYoutubePlaylist(ytCandidate);
+    }
+
+    if (legacyList && !isYoutubePlaylistUrl(legacyList)) {
+        return await fetchJsonPlaylist(legacyList);
+    }
+
+    return [];
+}
+
 /**
  * Tracks when the queue is idle — loaded only from process env / `.env` (not from users).
  * Precedence: MUSIC_AUTOPLAY_TRACKS_JSON → MUSIC_AUTOPLAY_TRACKS_JSON_URL → YouTube playlist URL → MUSIC_PLAYLIST_URL (JSON or YouTube).
  * @returns {Promise<{ title: string, url: string }[]>}
  */
 export async function loadAutoplayTracksFromEnv() {
-    try {
-        const inlineJson = String(process.env.MUSIC_AUTOPLAY_TRACKS_JSON || '').trim();
-        if (inlineJson) {
-            return parseInlinePlaylistFromEnv(inlineJson);
-        }
-
-        const jsonPrimary = String(process.env.MUSIC_AUTOPLAY_TRACKS_JSON_URL || '').trim();
-        const legacyList = String(process.env.MUSIC_PLAYLIST_URL || '').trim();
-        const ytOnly = String(process.env.MUSIC_AUTOPLAY_PLAYLIST_URL || '').trim();
-
-        if (jsonPrimary) {
-            return await fetchJsonPlaylist(jsonPrimary);
-        }
-
-        const ytCandidate = ytOnly || legacyList;
-        if (ytCandidate && isYoutubePlaylistUrl(ytCandidate)) {
-            return await expandYoutubePlaylist(ytCandidate);
-        }
-
-        if (legacyList && !isYoutubePlaylistUrl(legacyList)) {
-            return await fetchJsonPlaylist(legacyList);
-        }
-
-        return [];
-    } catch (e) {
-        console.warn('[music] autoplay playlist load:', e?.message || e);
-        return [];
+    if (!cachedLoadPromise) {
+        cachedLoadPromise = loadAutoplayTracksFromEnvUncached()
+            .then((rows) => (Array.isArray(rows) ? rows.filter((r) => r?.url) : []))
+            .catch((e) => {
+                console.warn('[music] autoplay playlist load:', e?.message || e);
+                cachedLoadPromise = null;
+                return [];
+            });
     }
+    return cachedLoadPromise;
 }

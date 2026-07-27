@@ -8,8 +8,28 @@ import { cacheBustHttpsStreamUrl, withPerPlayStreamMount } from './loadStreamCon
 import { icecastConnectFamily } from './resolvedIcecastHost.js';
 import { canonicalYoutubeWatchUrl } from './resolvePlay.js';
 import { withIcecastMountEncodeLock } from './icecastMountLock.js';
+import { withYtEncodeGate } from './ytEncodeGate.js';
 import { loadAutoplayTracksFromEnv } from './autoplayPlaylist.js';
 import { probePublicStreamForImvu, isImvuBlockingStreamProbe } from './verifyImvuStreamUrl.js';
+
+function envFlagTrue(name, defaultOn = false) {
+    const raw = process.env[name];
+    if (raw == null || String(raw).trim() === '') return defaultOn;
+    return !/^(0|false|no|off)$/i.test(String(raw).trim());
+}
+
+/** Optional comma/space allowlist — empty means any room may use autoplay once armed. */
+function roomAllowedForAutoplay(roomId) {
+    const raw = String(process.env.MUSIC_AUTOPLAY_ROOMS || '').trim();
+    if (!raw) return true;
+    const want = new Set(
+        raw
+            .split(/[,\s]+/)
+            .map((s) => s.trim())
+            .filter(Boolean),
+    );
+    return want.has(String(roomId || '').trim());
+}
 
 /**
  * @param {string} trackUrl
@@ -20,6 +40,67 @@ import { probePublicStreamForImvu, isImvuBlockingStreamProbe } from './verifyImv
 async function openYoutubeAudioStream(trackUrl, isStale, onSpawn) {
     const { proc: yp, stdout } = spawnYtDlpAudioStdout(trackUrl);
     onSpawn?.(yp);
+    if (isStale()) {
+        try {
+            yp.kill('SIGKILL');
+        } catch {}
+        try {
+            stdout.destroy?.();
+        } catch {}
+        throw new Error('play replaced');
+    }
+    // Wait until yt-dlp has audio ready (readable) without consuming bytes — keeps the
+    // process-wide encode gate held until this download is actually flowing.
+    const readyMs = Math.max(
+        5000,
+        parseInt(String(process.env.MUSIC_YT_READY_MS || '90000'), 10) || 90000,
+    );
+    try {
+        await new Promise((resolve, reject) => {
+            let settled = false;
+            const finish = (err) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                try {
+                    stdout.off('readable', onReadable);
+                } catch {}
+                try {
+                    yp.off('error', onErr);
+                } catch {}
+                try {
+                    yp.off('exit', onExit);
+                } catch {}
+                if (err) reject(err);
+                else resolve();
+            };
+            const onReadable = () => finish();
+            const onErr = (e) => finish(e || new Error('yt-dlp error'));
+            const onExit = (code) => {
+                if (!settled && code !== 0 && code != null) {
+                    finish(new Error(`yt-dlp exited before audio (code=${code})`));
+                }
+            };
+            const timer = setTimeout(() => finish(new Error('yt-dlp audio ready timeout')), readyMs);
+            if (isStale()) {
+                finish(new Error('play replaced'));
+                return;
+            }
+            stdout.once('readable', onReadable);
+            yp.once('error', onErr);
+            yp.once('exit', onExit);
+            // Already buffered?
+            if (stdout.readableLength > 0) finish();
+        });
+    } catch (e) {
+        try {
+            yp.kill('SIGKILL');
+        } catch {}
+        try {
+            stdout.destroy?.();
+        } catch {}
+        throw e;
+    }
     if (isStale()) {
         try {
             yp.kill('SIGKILL');
@@ -272,6 +353,22 @@ export function createRoomPlayer(opts) {
     let autoplayLoadPromise = null;
     /** Next index into autoplayTracks for idle playback (0-based). */
     let nextAutoplayIndex = 0;
+    /**
+     * Idle playlist only after user music activity (!play/!add/…) or MUSIC_AUTOPLAY_ON_JOIN.
+     * Prevents every joined room from starting yt-dlp at once when the bot boots.
+     */
+    let autoplayArmed = false;
+
+    const armAutoplay = (reason) => {
+        if (!roomAllowedForAutoplay(roomId)) return false;
+        if (!autoplayArmed) {
+            autoplayArmed = true;
+            if (reason) {
+                console.log(`[music] autoplay armed (${roomId}): ${reason}`);
+            }
+        }
+        return true;
+    };
 
     /** When commandHandler already synced room media for this track, skip the delayed player push. */
     let skipMountDomPush = false;
@@ -340,6 +437,10 @@ export function createRoomPlayer(opts) {
     const maybeEnqueueAutoplayTrack = async () => {
         if (queue.peek()) return;
         if (stopFlag || paused) return;
+        // Master off switch (default on when playlist URL is set). Set MUSIC_AUTOPLAY=0 to disable.
+        if (!envFlagTrue('MUSIC_AUTOPLAY', true)) return;
+        if (!autoplayArmed) return;
+        if (!roomAllowedForAutoplay(roomId)) return;
         const cfg = await loadConfig();
         if (!cfg?.enabled) return;
         await ensureAutoplayTracksLoaded();
@@ -453,12 +554,15 @@ export function createRoomPlayer(opts) {
         /** @type {import('stream').Readable | null} */
         let audioIn = null;
         try {
-            const opened = await openYoutubeAudioStream(
-                track.url,
-                () => playEpoch !== committedEpoch,
-                (proc) => {
-                    setupYtdlpProc = proc;
-                },
+            // One yt-dlp spawn at a time — concurrent downloads from OCI starve each other.
+            const opened = await withYtEncodeGate(() =>
+                openYoutubeAudioStream(
+                    track.url,
+                    () => playEpoch !== committedEpoch,
+                    (proc) => {
+                        setupYtdlpProc = proc;
+                    },
+                ),
             );
             setupYtdlpProc = null;
             if (abortIfStale(committedEpoch)) return;
@@ -605,6 +709,7 @@ export function createRoomPlayer(opts) {
         stopFlag = false;
         paused = false;
         pausedTrack = null;
+        armAutoplay('!play');
         queue.clearAll();
         queue.enqueue(track);
         killFf();
@@ -634,6 +739,7 @@ export function createRoomPlayer(opts) {
             // Real queue: never steal the current encode (!add while playing).
             stopFlag = false;
             paused = false;
+            armAutoplay('!add');
             queue.enqueue(track);
             void ensureDrain();
         },
@@ -646,6 +752,7 @@ export function createRoomPlayer(opts) {
             paused = false;
             pausedTrack = null;
             playEpoch += 1;
+            armAutoplay('!skip');
             killFf();
             void (async () => {
                 const gap = Math.max(
@@ -682,6 +789,7 @@ export function createRoomPlayer(opts) {
         resume: () => {
             if (!paused) return;
             paused = false;
+            armAutoplay('!resume');
             const rest = queue.pending();
             queue.clearPending();
             if (pausedTrack) {
@@ -717,12 +825,35 @@ export function createRoomPlayer(opts) {
                 track: null,
                 state: 'stopped',
             });
+            // Resume idle playlist only in rooms that already used music (armed).
+            const afterStop = envFlagTrue('MUSIC_AUTOPLAY_AFTER_STOP', true);
+            if (afterStop && autoplayArmed && roomAllowedForAutoplay(roomId)) {
+                const delay = Math.max(
+                    500,
+                    parseInt(String(process.env.MUSIC_AUTOPLAY_AFTER_STOP_MS || '2500'), 10) || 2500,
+                );
+                setTimeout(() => {
+                    if (!stopFlag) return;
+                    stopFlag = false;
+                    void ensureDrain();
+                }, delay);
+            }
         },
 
-        /** Start idle autoplay / drain loop (call once when the room music handler mounts). */
+        /**
+         * Start idle autoplay / drain. Default: no-op until a user !play/!add arms this room
+         * (avoids every joined room encoding the playlist at boot). Set MUSIC_AUTOPLAY_ON_JOIN=1
+         * to restore old “autoplay as soon as the room mounts” behavior.
+         */
         kickAutoplayDrain: () => {
-            void ensureDrain();
+            if (envFlagTrue('MUSIC_AUTOPLAY_ON_JOIN', false)) {
+                if (armAutoplay('on join')) void ensureDrain();
+                return;
+            }
+            // Do not start encoding just because the bot entered the room.
         },
+
+        armAutoplay: () => armAutoplay('manual'),
 
         /** @returns {ReturnType<createTrackQueue>} */
         getQueue: () => queue,
