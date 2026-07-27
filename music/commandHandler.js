@@ -121,9 +121,7 @@ async function syncLiveStreamToRoom({
                     'Stream tunnel is ngrok free tier — IMVU gets HTML instead of MP3 (ERR_NGROK_6024). Set CLOUDFLARE_TUNNEL_AUTO=1 in .env and restart.',
                 );
             } else {
-                await reply(
-                    'Track queued, but live stream is not ready yet. If logs show YouTube “not a bot”, refresh youtube-cookies.txt on the server. Otherwise check Icecast source/tunnel.',
-                );
+                await reply('Could not find that track.');
             }
             return false;
         }

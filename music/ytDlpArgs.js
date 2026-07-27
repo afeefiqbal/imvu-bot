@@ -27,6 +27,35 @@ function cookiesFileLooksValid(path) {
     }
 }
 
+function envFlagTrue(name, defaultOn = false) {
+    const raw = process.env[name];
+    if (raw == null || String(raw).trim() === '') return defaultOn;
+    return !/^(0|false|no|off)$/i.test(String(raw).trim());
+}
+
+/**
+ * PO Token / player client extractor-args for YouTube bot checks.
+ * Requires bgutil-ytdlp-pot-provider plugin + HTTP server (default :4416).
+ * @returns {string[]}
+ */
+function youtubePoTokenExtractorArgs() {
+    if (!envFlagTrue('YTDLP_PO_TOKEN', false) && !String(process.env.YTDLP_BGUTIL_BASE_URL || '').trim()) {
+        return [];
+    }
+    /** @type {string[]} */
+    const out = [];
+    const baseUrl = String(process.env.YTDLP_BGUTIL_BASE_URL || 'http://127.0.0.1:4416').trim();
+    if (baseUrl) {
+        out.push('--extractor-args', `youtubepot-bgutilhttp:base_url=${baseUrl}`);
+    }
+    // Prefer mweb + default; PO plugin supplies tokens when required.
+    const client = String(process.env.YTDLP_YOUTUBE_PLAYER_CLIENT || 'default,mweb').trim();
+    if (client) {
+        out.push('--extractor-args', `youtube:player_client=${client}`);
+    }
+    return out;
+}
+
 /**
  * Shared yt-dlp CLI flags (cookies, etc.) for resolve + stream.
  * Call `ensureYtDlpProxy()` before spawning when using Webshare auto-proxy.
@@ -44,6 +73,7 @@ export function ytDlpExtraArgs() {
     if (proxy) {
         args.push('--proxy', proxy);
     }
+    args.push(...youtubePoTokenExtractorArgs());
     const cookiesFile = String(process.env.YTDLP_COOKIES_FILE || '').trim();
     if (cookiesFile && cookiesFileLooksValid(cookiesFile)) {
         args.push('--cookies', cookiesFile);
