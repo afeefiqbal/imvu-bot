@@ -4,6 +4,7 @@ import { createFfmpegIcecastPipe } from './ffmpegIcecast.js';
 import { notifyImvuMusicState } from './notifyImvuMusicApi.js';
 import { applyRoomMediaStreamUrl } from './imvuRoomMediaDom.js';
 import { spawnYtDlpAudioStdout } from './ytDlpAudioStdout.js';
+import { clearYtDlpProxyCache, ensureYtDlpProxy } from './ytDlpArgs.js';
 import { cacheBustHttpsStreamUrl, withPerPlayStreamMount } from './loadStreamConfig.js';
 import { icecastConnectFamily } from './resolvedIcecastHost.js';
 import { canonicalYoutubeWatchUrl } from './resolvePlay.js';
@@ -37,7 +38,7 @@ function roomAllowedForAutoplay(roomId) {
  * @param {(proc: import('child_process').ChildProcess) => void} [onSpawn]
  * @returns {Promise<{ audioIn: import('stream').Readable, decoder: string, ytdlpProc: import('child_process').ChildProcess }>}
  */
-async function openYoutubeAudioStream(trackUrl, isStale, onSpawn) {
+async function openYoutubeAudioStreamOnce(trackUrl, isStale, onSpawn) {
     const { proc: yp, stdout } = spawnYtDlpAudioStdout(trackUrl);
     onSpawn?.(yp);
     if (isStale()) {
@@ -111,6 +112,30 @@ async function openYoutubeAudioStream(trackUrl, isStale, onSpawn) {
         throw new Error('play replaced');
     }
     return { audioIn: stdout, decoder: 'yt-dlp', ytdlpProc: yp };
+}
+
+/**
+ * @param {string} trackUrl
+ * @param {() => boolean} isStale
+ * @param {(proc: import('child_process').ChildProcess) => void} [onSpawn]
+ * @returns {Promise<{ audioIn: import('stream').Readable, decoder: string, ytdlpProc: import('child_process').ChildProcess }>}
+ */
+async function openYoutubeAudioStream(trackUrl, isStale, onSpawn) {
+    await ensureYtDlpProxy();
+    try {
+        return await openYoutubeAudioStreamOnce(trackUrl, isStale, onSpawn);
+    } catch (e) {
+        const msg = String(e?.message || e);
+        if (isStale() || msg === 'play replaced') throw e;
+        const retryable = /youtube-bot-block|exited before audio|audio ready timeout|yt-dlp error/i.test(
+            msg,
+        );
+        if (!retryable) throw e;
+        console.warn('[music] yt-dlp stream failed — rotating Webshare/proxy and retrying once');
+        clearYtDlpProxyCache();
+        await ensureYtDlpProxy();
+        return await openYoutubeAudioStreamOnce(trackUrl, isStale, onSpawn);
+    }
 }
 
 /** @returns {Promise<number>} HTTP status (0 on failure). */

@@ -1,7 +1,7 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { canonicalYoutubeWatchUrl } from './resolvePlay.js';
-import { ytDlpExtraArgs } from './ytDlpArgs.js';
+import { ensureYtDlpProxy, ytDlpExtraArgs } from './ytDlpArgs.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -44,6 +44,7 @@ function autoplayMaxItems() {
  */
 async function expandViaYtDlp(listUrl, maxItems) {
     const bin = String(process.env.YTDLP_PATH || 'yt-dlp').trim() || 'yt-dlp';
+    await ensureYtDlpProxy();
     const { stdout } = await execFileAsync(
         bin,
         [

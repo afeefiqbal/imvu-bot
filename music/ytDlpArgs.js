@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { getYtDlpProxyUrlSync } from './ytDlpProxy.js';
 
 /**
  * Netscape cookie jar usable by yt-dlp (non-empty, not wiped to 0 bytes).
@@ -28,6 +29,7 @@ function cookiesFileLooksValid(path) {
 
 /**
  * Shared yt-dlp CLI flags (cookies, etc.) for resolve + stream.
+ * Call `ensureYtDlpProxy()` before spawning when using Webshare auto-proxy.
  * @returns {string[]}
  */
 export function ytDlpExtraArgs() {
@@ -37,6 +39,10 @@ export function ytDlpExtraArgs() {
     const jsRuntime = String(process.env.YTDLP_JS_RUNTIMES || 'node').trim();
     if (jsRuntime && jsRuntime !== '0' && jsRuntime.toLowerCase() !== 'off') {
         args.push('--js-runtimes', jsRuntime);
+    }
+    const proxy = getYtDlpProxyUrlSync();
+    if (proxy) {
+        args.push('--proxy', proxy);
     }
     const cookiesFile = String(process.env.YTDLP_COOKIES_FILE || '').trim();
     if (cookiesFile && cookiesFileLooksValid(cookiesFile)) {
@@ -60,3 +66,5 @@ export function isYoutubeBotBlockMessage(text) {
     const s = String(text || '');
     return /sign in to confirm you.?re not a bot|confirm you.?re not a bot/i.test(s);
 }
+
+export { ensureYtDlpProxy, clearYtDlpProxyCache } from './ytDlpProxy.js';

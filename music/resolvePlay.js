@@ -1,6 +1,6 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { ytDlpExtraArgs } from './ytDlpArgs.js';
+import { ensureYtDlpProxy, ytDlpExtraArgs } from './ytDlpArgs.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -140,6 +140,7 @@ async function resolveViaYtDlp(queryOrUrl) {
     const bin = String(process.env.YTDLP_PATH || 'yt-dlp').trim() || 'yt-dlp';
     const raw = String(queryOrUrl || '').trim();
     if (!raw) return null;
+    await ensureYtDlpProxy();
     if (/^https?:\/\//i.test(raw)) {
         try {
             const { stdout } = await execFileAsync(
