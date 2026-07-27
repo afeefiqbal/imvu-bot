@@ -39,7 +39,8 @@ function envFlagTrue(name, defaultOn = false) {
  * @returns {string[]}
  */
 function youtubePoTokenExtractorArgs() {
-    if (!envFlagTrue('YTDLP_PO_TOKEN', false) && !String(process.env.YTDLP_BGUTIL_BASE_URL || '').trim()) {
+    // Only when explicitly enabled — a leftover YTDLP_BGUTIL_BASE_URL must not force mweb.
+    if (!envFlagTrue('YTDLP_PO_TOKEN', false)) {
         return [];
     }
     /** @type {string[]} */
