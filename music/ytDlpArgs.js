@@ -44,7 +44,7 @@ export function ytDlpExtraArgs() {
     } else {
         if (cookiesFile) {
             console.warn(
-                `[music] YTDLP_COOKIES_FILE is missing/empty/invalid (${cookiesFile}) — skipping --cookies. Export a Netscape cookies.txt and chmod 444 it.`,
+                `[music] YTDLP_COOKIES_FILE is missing/empty/invalid (${cookiesFile}) — skipping --cookies. Export a Netscape cookies.txt (must stay writable — yt-dlp updates it on exit).`,
             );
         }
         const fromBrowser = String(process.env.YTDLP_COOKIES_FROM_BROWSER || '').trim();
