@@ -19,14 +19,27 @@ function roomMediaNotModerator(result) {
     );
 }
 
-async function replyRoomMediaFailure(reply, result) {
+function formatTrackLabel(track) {
+    const title = String(track?.title || '').trim() || 'Unknown track';
+    const artist = String(track?.artistName || '').trim();
+    return artist ? `${title} — ${artist}` : title;
+}
+
+async function replyRoomMediaFailure(reply, result, track = null) {
+    const label = track ? formatTrackLabel(track) : '';
     if (roomMediaNotModerator(result)) {
         await reply(
-            'Music is queued, but I need host or mod in this room to change the radio URL. Ask the room owner to mod me.',
+            label
+                ? `Queued “${label}”, but I need host or mod in this room to change the radio URL. Ask the room owner to mod me.`
+                : 'Music is queued, but I need host or mod in this room to change the radio URL. Ask the room owner to mod me.',
         );
         return;
     }
-    await reply('Could not update the room radio URL right now.');
+    await reply(
+        label
+            ? `Found “${label}”, but could not update the room radio URL right now.`
+            : 'Could not update the room radio URL right now.',
+    );
 }
 
 const HELP_VIBEVERSE = `Music: !play/!p · !add/!a · !queue/!q · !skip/!next · !stop · !pause · !resume · !music`;
@@ -217,7 +230,7 @@ export async function createMusicRoomChatCommandHandler(opts) {
 
     if (useVibeverse) {
         console.log(
-            `[music] VibeVerse mode — API ${String(process.env.VIBEVERSE_API_URL).replace(/\/$/, '')}`,
+            `[music] stream API mode — ${String(process.env.VIBEVERSE_API_URL).replace(/\/$/, '')}`,
         );
         return createVibeverseCommandHandler({
             page,
@@ -229,7 +242,7 @@ export async function createMusicRoomChatCommandHandler(opts) {
         });
     }
 
-    console.log('[music] Icecast mode (set VIBEVERSE_API_URL to use VibeVerse Option A)');
+    console.log('[music] Icecast mode (set VIBEVERSE_API_URL for stream API mode)');
     return createIcecastCommandHandler(opts);
 }
 
@@ -296,7 +309,7 @@ function createVibeverseCommandHandler({
                     return;
                 }
                 const t = result.track;
-                await reply(`Skipped → playing ${t.title}${t.artistName ? ` — ${t.artistName}` : ''}`);
+                await reply(`Now playing: ${formatTrackLabel(t)}`);
             });
             return true;
         }
@@ -338,7 +351,7 @@ function createVibeverseCommandHandler({
                     return;
                 }
                 const t = result.track || player.getQueue().getCurrent();
-                await reply(`Resumed: ${t?.title || 'track'}`);
+                await reply(`Now playing: ${formatTrackLabel(t)}`);
             });
             return true;
         }
@@ -359,12 +372,11 @@ function createVibeverseCommandHandler({
             await queueMediaSync(async () => {
                 const result = await player.playNow(one);
                 if (!result?.ok) {
-                    await replyRoomMediaFailure(reply, result);
+                    await replyRoomMediaFailure(reply, result, one);
                     return;
                 }
-                await reply(
-                    `playing ${one.title}${one.artistName ? ` — ${one.artistName}` : ''}`,
-                );
+                const playing = result.track || one;
+                await reply(`Now playing: ${formatTrackLabel(playing)}`);
             });
             return true;
         }
@@ -375,7 +387,7 @@ function createVibeverseCommandHandler({
                 return true;
             }
 
-            await reply(`Adding “${rest}”…`);
+            await reply(`Looking up “${rest}”…`);
             const one = await resolveVibeversePlayable(rest);
             if (!one) {
                 await reply('Could not find that track.');
@@ -386,17 +398,18 @@ function createVibeverseCommandHandler({
             await queueMediaSync(async () => {
                 const result = await player.enqueue(one);
                 if (result?.queued) {
-                    await reply(`Added to queue: ${one.title}`);
+                    await reply(`Added to queue: ${formatTrackLabel(one)}`);
                     return;
                 }
                 if (!result?.ok) {
-                    await replyRoomMediaFailure(reply, result);
+                    await replyRoomMediaFailure(reply, result, one);
                     return;
                 }
+                const playing = result.track || one;
                 await reply(
                     wasActive
-                        ? `Added — now playing: ${one.title}`
-                        : `playing ${one.title}${one.artistName ? ` — ${one.artistName}` : ''}`,
+                        ? `Added — now playing: ${formatTrackLabel(playing)}`
+                        : `Now playing: ${formatTrackLabel(playing)}`,
                 );
             });
             return true;

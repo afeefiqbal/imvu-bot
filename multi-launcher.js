@@ -594,7 +594,7 @@ async function run() {
 
     if (String(process.env.VIBEVERSE_API_URL || '').trim()) {
         console.log(
-            `[MULTI-LAUNCHER] VibeVerse music mode — skipping Icecast/tunnel ingress (${String(process.env.VIBEVERSE_API_URL).replace(/\/$/, '')})`,
+            `[MULTI-LAUNCHER] Stream API music mode — skipping Icecast/tunnel ingress (${String(process.env.VIBEVERSE_API_URL).replace(/\/$/, '')})`,
         );
     } else {
         await maybeStartMusicIngressTunnel();
