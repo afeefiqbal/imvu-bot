@@ -1725,7 +1725,7 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                 if (!updateRes.ok) {
                     const detail = summarizeResponseData(updateRes.data);
                     logger.warn(
-                        `[IMVU-SESSION] Could not update room ${roomId} radio URL: POST ${updateRes.status}${detail}`,
+                        `[IMVU-SESSION] Could not update room ${roomId} radio URL: POST ${updateRes.status}${detail} · url=${stationUrl}`,
                     );
                     const errCode = String(updateRes.data?.error || '');
                     const modDenied =
@@ -1777,7 +1777,7 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                 }
 
                 logger.log(
-                    `[IMVU-SESSION] Updated room ${roomId} radio URL via API (stop${flashClear ? ' → clear' : ''} → update → start, status ${startRes.status}).`,
+                    `[IMVU-SESSION] Updated room ${roomId} radio URL via API (stop${flashClear ? ' → clear' : ''} → update → start, status ${startRes.status}): ${stationUrl}`,
                 );
                 return { ok: true, reason: 'api-restart-radio' };
             } catch (error) {

@@ -1075,7 +1075,10 @@ export async function startUserTracking(page, roomId, options = {}) {
                 sendMessage,
             });
             console.log(
-                `${syncLogPrefix} room music commands on (!play/!p · !add · !queue · !skip · !stop · !music)`
+                `${syncLogPrefix} room music commands on (!play/!p · !add · !queue · !skip · !stop · !music)` +
+                    (String(process.env.VIBEVERSE_API_URL || '').trim()
+                        ? ' [VibeVerse]'
+                        : ' [Icecast]'),
             );
         } catch (e) {
             console.warn(`${syncLogPrefix} music init failed:`, e?.message || e);

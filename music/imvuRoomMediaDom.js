@@ -15,9 +15,12 @@ export async function applyRoomMediaStreamUrl(page, publicUrl, opts = null) {
         const result = await sessionClient.setRoomRadioStreamUrl(roomId, url, {
             stationName: String(opts?.stationName || '').trim(),
         });
-        if (result?.ok) return { ok: true, reason: result.reason || 'api' };
+        if (result?.ok) {
+            console.log(`[music/api] room ${roomId} media URL set: ${url}`);
+            return { ok: true, reason: result.reason || 'api' };
+        }
         console.warn(
-            `[music/api] room media URL not updated for ${roomId}: ${result?.reason || 'unknown'}${result?.detail ? ` (${result.detail})` : ''}`,
+            `[music/api] room media URL not updated for ${roomId}: ${result?.reason || 'unknown'}${result?.detail ? ` (${result.detail})` : ''} · url=${url}`,
         );
         return {
             ok: false,

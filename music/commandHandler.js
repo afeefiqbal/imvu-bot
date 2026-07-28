@@ -5,6 +5,8 @@ import { applyRoomMediaStreamUrl, waitForRoomMediaPlayback } from './imvuRoomMed
 import { createRoomPlayer } from './player.js';
 import { cacheBustHttpsStreamUrl } from './loadStreamConfig.js';
 import { probePublicStreamForImvu, urlLooksLikeNgrokFree, isImvuBlockingStreamProbe } from './verifyImvuStreamUrl.js';
+import { resolveVibeversePlayable, vibeverseEnabled } from './vibeverseClient.js';
+import { createVibeverseRoomPlayer } from './vibeverseRoomPlayer.js';
 
 function roomMediaNotModerator(result) {
     const reason = String(result?.reason || '');
@@ -27,7 +29,8 @@ async function replyRoomMediaFailure(reply, result) {
     await reply('Could not update the room radio URL right now.');
 }
 
-const HELP = `Music: !play/!p · !add/!a · !queue/!q · !skip · !stop · !pause · !resume · !music · idle playlist is server .env only (not set by chat)`;
+const HELP_VIBEVERSE = `Music: !play/!p · !add/!a · !queue/!q · !skip/!next · !stop · !pause · !resume · !music`;
+const HELP_ICECAST = `Music: !play/!p · !add/!a · !queue/!q · !skip · !stop · !pause · !resume · !music · idle playlist is server .env only (not set by chat)`;
 
 function parseCmdLine(text) {
     const t = String(text || '').trim();
@@ -210,6 +213,201 @@ function hasActivePlayback(player) {
  */
 export async function createMusicRoomChatCommandHandler(opts) {
     const { page, roomId, apiBaseUrl, sendMessage, sessionClient } = opts;
+    const useVibeverse = vibeverseEnabled();
+
+    if (useVibeverse) {
+        console.log(
+            `[music] VibeVerse mode — API ${String(process.env.VIBEVERSE_API_URL).replace(/\/$/, '')}`,
+        );
+        return createVibeverseCommandHandler({
+            page,
+            roomId,
+            apiBaseUrl,
+            sendMessage,
+            sessionClient,
+            botName: opts.botName,
+        });
+    }
+
+    console.log('[music] Icecast mode (set VIBEVERSE_API_URL to use VibeVerse Option A)');
+    return createIcecastCommandHandler(opts);
+}
+
+function createVibeverseCommandHandler({
+    page,
+    roomId,
+    apiBaseUrl,
+    sendMessage,
+    sessionClient,
+    botName,
+}) {
+    const player = createVibeverseRoomPlayer({
+        roomId,
+        apiBaseUrl,
+        botName,
+        page,
+        sessionClient,
+    });
+
+    let mediaSyncTail = Promise.resolve();
+    const queueMediaSync = (fn) => {
+        const next = mediaSyncTail.then(fn, fn);
+        mediaSyncTail = next.catch(() => {});
+        return next;
+    };
+
+    return async ({ text, senderLabel, senderId, isSelf }) => {
+        if (isSelf) return false;
+        const parsed = parseCmdLine(text);
+        if (!parsed) return false;
+
+        const { cmd, rest } = parsed;
+        const reply = async (msg) => {
+            try {
+                await sendMessage(msg, {
+                    participantUsername: senderLabel ?? undefined,
+                    participantAvatarId: senderId != null ? String(senderId) : undefined,
+                });
+            } catch (e) {
+                console.warn('[music] sendMessage:', e.message);
+            }
+        };
+
+        if (cmd === '*music' || cmd === '*m') {
+            await reply(HELP_VIBEVERSE);
+            return true;
+        }
+
+        if (cmd === '*s' && rest) return false;
+
+        if (cmd === '*skip' || cmd === '*s' || cmd === '*next') {
+            if (!hasActivePlayback(player)) {
+                await reply('Nothing to skip.');
+                return true;
+            }
+            await queueMediaSync(async () => {
+                const result = await player.skip();
+                if (result?.empty) {
+                    await reply('Skipped. Queue empty.');
+                    return;
+                }
+                if (!result?.ok) {
+                    await replyRoomMediaFailure(reply, result);
+                    return;
+                }
+                const t = result.track;
+                await reply(`Skipped → playing ${t.title}${t.artistName ? ` — ${t.artistName}` : ''}`);
+            });
+            return true;
+        }
+
+        if (cmd === '*stop') {
+            if (!hasActivePlayback(player)) {
+                await reply('Nothing playing.');
+                return true;
+            }
+            player.stop();
+            await reply('Stopped. Queue cleared.');
+            return true;
+        }
+
+        if (cmd === '*queue' || cmd === '*q') {
+            await reply(formatQueueReply(player));
+            return true;
+        }
+
+        if (cmd === '*pause' || cmd === '*hold') {
+            if (!hasActivePlayback(player)) {
+                await reply('Nothing playing.');
+                return true;
+            }
+            player.pause();
+            await reply('Paused. Say !resume to continue (track restarts from the beginning).');
+            return true;
+        }
+
+        if (cmd === '*resume' || cmd === '*unpause' || cmd === '*continue') {
+            if (!player.isPaused()) {
+                await reply('Not paused.');
+                return true;
+            }
+            await queueMediaSync(async () => {
+                const result = await player.resume();
+                if (!result?.ok) {
+                    await reply('Could not resume.');
+                    return;
+                }
+                const t = result.track || player.getQueue().getCurrent();
+                await reply(`Resumed: ${t?.title || 'track'}`);
+            });
+            return true;
+        }
+
+        if (cmd === '*play' || cmd === '*p' || cmd === '*playmp3' || cmd === '*mp3') {
+            if (!rest) {
+                await reply('Usage: !play <song or YouTube URL>');
+                return true;
+            }
+
+            await reply(`Looking up “${rest}”…`);
+            const one = await resolveVibeversePlayable(rest);
+            if (!one) {
+                await reply('Could not find that track.');
+                return true;
+            }
+
+            await queueMediaSync(async () => {
+                const result = await player.playNow(one);
+                if (!result?.ok) {
+                    await replyRoomMediaFailure(reply, result);
+                    return;
+                }
+                await reply(
+                    `playing ${one.title}${one.artistName ? ` — ${one.artistName}` : ''}`,
+                );
+            });
+            return true;
+        }
+
+        if (cmd === '*add' || cmd === '*a') {
+            if (!rest) {
+                await reply('Usage: !add <song or YouTube URL>');
+                return true;
+            }
+
+            await reply(`Adding “${rest}”…`);
+            const one = await resolveVibeversePlayable(rest);
+            if (!one) {
+                await reply('Could not find that track.');
+                return true;
+            }
+
+            const wasActive = hasActivePlayback(player);
+            await queueMediaSync(async () => {
+                const result = await player.enqueue(one);
+                if (result?.queued) {
+                    await reply(`Added to queue: ${one.title}`);
+                    return;
+                }
+                if (!result?.ok) {
+                    await replyRoomMediaFailure(reply, result);
+                    return;
+                }
+                await reply(
+                    wasActive
+                        ? `Added — now playing: ${one.title}`
+                        : `playing ${one.title}${one.artistName ? ` — ${one.artistName}` : ''}`,
+                );
+            });
+            return true;
+        }
+
+        return false;
+    };
+}
+
+function createIcecastCommandHandler(opts) {
+    const { page, roomId, apiBaseUrl, sendMessage, sessionClient } = opts;
     const loadConfig = async () => loadStreamConfig({ apiBaseUrl, roomId });
     const player = createRoomPlayer({
         roomId,
@@ -262,7 +460,7 @@ export async function createMusicRoomChatCommandHandler(opts) {
         };
 
         if (cmd === '*music' || cmd === '*m') {
-            await reply(HELP);
+            await reply(HELP_ICECAST);
             return true;
         }
 

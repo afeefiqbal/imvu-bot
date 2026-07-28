@@ -592,7 +592,13 @@ async function run() {
         bots = await fetchAllBots();
     }
 
-    await maybeStartMusicIngressTunnel();
+    if (String(process.env.VIBEVERSE_API_URL || '').trim()) {
+        console.log(
+            `[MULTI-LAUNCHER] VibeVerse music mode — skipping Icecast/tunnel ingress (${String(process.env.VIBEVERSE_API_URL).replace(/\/$/, '')})`,
+        );
+    } else {
+        await maybeStartMusicIngressTunnel();
+    }
 
     console.log(`\n[MULTI-LAUNCHER] 🔥 Preparing to launch ${bots.length} active bots!`);
     console.log(`[MULTI-LAUNCHER] 📝 Bots found: ${bots.map((b) => b.name).join(', ')}`);
