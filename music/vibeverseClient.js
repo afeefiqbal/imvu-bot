@@ -336,10 +336,11 @@ async function fetchVibeverseStatus(trackId) {
     const base = apiBase();
     if (!base || !trackId) return null;
     try {
-        const res = await axios.get(`${base}/tracks/${encodeURIComponent(trackId)}/status`, {
-            timeout: 10_000,
-            validateStatus: () => true,
-        });
+            const res = await axios.get(`${base}/tracks/${encodeURIComponent(trackId)}/status`, {
+                params: { preferMp3: 1, format: 'mp3' },
+                timeout: 10_000,
+                validateStatus: () => true,
+            });
         if (res.status >= 400 || !res.data) return null;
         const status = String(res.data.status || '').toUpperCase();
         if (status === 'FAILED') {
