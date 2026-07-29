@@ -54,6 +54,28 @@ export function createVibeverseRoomPlayer(opts) {
         ffProc = null;
     };
 
+    /** Best-effort: stop IMVU room radio so the current song cuts immediately. */
+    const stopRoomRadioQuiet = () => {
+        if (typeof sessionClient?.stopRoomRadioStream !== 'function') return;
+        void sessionClient.stopRoomRadioStream(roomId).catch(() => {});
+    };
+
+    /**
+     * Invalidate any in-flight encode/wait, kill ffmpeg, drop the queue head/pending.
+     * Used by !play so a new request preempts whatever is currently playing.
+     */
+    const cutForReplace = () => {
+        clearEndTimer();
+        generation += 1;
+        killFf();
+        queue.clearPending();
+        queue.setCurrent(null);
+        playing = false;
+        paused = false;
+        notify(null, 'idle');
+        stopRoomRadioQuiet();
+    };
+
     const notify = (track, state) => {
         void notifyImvuMusicState({
             apiBaseUrl,
@@ -148,11 +170,13 @@ export function createVibeverseRoomPlayer(opts) {
                 artworkUrl: track.artworkUrl,
                 durationMs: track.durationMs,
             });
+            if (gen !== generation) return { ok: false, reason: 'stale' };
             if (fresh) Object.assign(track, fresh);
         }
 
         if (!track.streamUrl) {
             console.warn('[music] skip unplayable track:', track.title);
+            if (gen !== generation) return { ok: false, reason: 'stale' };
             queue.setCurrent(null);
             return playCurrentOrNext();
         }
@@ -160,6 +184,7 @@ export function createVibeverseRoomPlayer(opts) {
         if (gen !== generation) return { ok: false, reason: 'stale' };
 
         const baseCfg = await loadConfig();
+        if (gen !== generation) return { ok: false, reason: 'stale' };
         if (!baseCfg?.enabled) {
             playing = false;
             queue.setCurrent(null);
@@ -199,6 +224,7 @@ export function createVibeverseRoomPlayer(opts) {
             ? activeStreamCfg.icecastMount
             : `/${activeStreamCfg.icecastMount}`;
         const mountLockKey = `${loopHost}:${icePort}${mountPath}`;
+        const isStale = () => gen !== generation;
 
         console.log(
             `[music] live encode: source → Icecast ${mountPath} → ${pub.slice(0, 120)}`,
@@ -210,7 +236,7 @@ export function createVibeverseRoomPlayer(opts) {
         // Serialize connect to this mount; return to chat as soon as the live URL is pushed
         // (do not wait for the whole track — ffmpeg keeps running in the background).
         await withIcecastMountEncodeLock(mountLockKey, async () => {
-            if (gen !== generation) return;
+            if (isStale()) return;
 
             let proc;
             try {
@@ -223,10 +249,18 @@ export function createVibeverseRoomPlayer(opts) {
                 applied = { ok: false, reason: 'ffmpeg-spawn', detail: e?.message || 'ffmpeg failed' };
                 return;
             }
+            if (isStale()) {
+                try {
+                    proc.kill('SIGKILL');
+                } catch {}
+                return;
+            }
             ffProc = proc;
 
             setTimeout(async () => {
+                if (isStale()) return;
                 const up = await icecastStatusJsonShowsSource(loopHost, icePort, mountPath);
+                if (isStale()) return;
                 if (!up) {
                     console.warn(
                         `[music] Icecast has no SOURCE on ${mountPath} at ${loopHost}:${icePort} ~12s after start.`,
@@ -240,8 +274,8 @@ export function createVibeverseRoomPlayer(opts) {
                 8000,
                 parseInt(String(process.env.MUSIC_CHAT_WAIT_MOUNT_MS || '25000'), 10) || 25000,
             );
-            const live = await waitForIcecastMountLive(activeStreamCfg, waitMs);
-            if (gen !== generation) return;
+            const live = await waitForIcecastMountLive(activeStreamCfg, waitMs, { isStale });
+            if (isStale()) return;
             if (!live || !ffProc) {
                 console.warn('[music] Mount never went live — not pushing room radio URL.');
                 killFf();
@@ -254,7 +288,7 @@ export function createVibeverseRoomPlayer(opts) {
             }
 
             applied = await applyPublicUrlToRoom(pub, track);
-            if (gen !== generation) return;
+            if (isStale()) return;
             if (!applied.ok) {
                 killFf();
                 return;
@@ -264,7 +298,7 @@ export function createVibeverseRoomPlayer(opts) {
             scheduleAdvanceOnFfExit(track, gen, proc);
         });
 
-        if (gen !== generation) return { ok: false, reason: 'stale' };
+        if (isStale()) return { ok: false, reason: 'stale' };
         if (!applied.ok) {
             playing = false;
             queue.setCurrent(null);
@@ -292,7 +326,13 @@ export function createVibeverseRoomPlayer(opts) {
         hasActive: () =>
             playing || paused || ffProc != null || queue.getCurrent() != null || queue.peek() != null,
 
-        /** @param {object} track */
+        /**
+         * Stop current encode + radio immediately (keeps nothing queued).
+         * Call at the start of !play so the old song cuts while the new one is looked up.
+         */
+        cutForReplace,
+
+        /** Replace whatever is playing/queued with this track and start it now. */
         async playNow(track) {
             clearEndTimer();
             generation += 1;
@@ -301,6 +341,8 @@ export function createVibeverseRoomPlayer(opts) {
             queue.setCurrent(track);
             playing = false;
             paused = false;
+            stopRoomRadioQuiet();
+            console.log(`[music] !play replace — starting “${track?.title || '?'}”`);
             return playCurrentOrNext();
         },
 
@@ -320,6 +362,7 @@ export function createVibeverseRoomPlayer(opts) {
             playing = false;
             paused = false;
             notify(null, 'idle');
+            stopRoomRadioQuiet();
             return playCurrentOrNext();
         },
 
@@ -331,6 +374,7 @@ export function createVibeverseRoomPlayer(opts) {
             playing = false;
             paused = false;
             notify(null, 'idle');
+            stopRoomRadioQuiet();
         },
 
         pause() {

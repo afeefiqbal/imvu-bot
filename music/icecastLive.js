@@ -122,12 +122,16 @@ export async function icecastStatusJsonShowsSource(loopHost, port, mount) {
 /**
  * @param {string} pubUrl
  * @param {number} timeoutMs
+ * @param {{ isStale?: () => boolean }} [opts]
  */
-export async function waitForPublicHttpsStream(pubUrl, timeoutMs) {
+export async function waitForPublicHttpsStream(pubUrl, timeoutMs, opts = {}) {
+    const isStale = typeof opts.isStale === 'function' ? opts.isStale : () => false;
     const deadline = Date.now() + Math.max(2000, timeoutMs);
     let warnedNgrok = false;
     while (Date.now() < deadline) {
+        if (isStale()) return false;
         const imvu = await probePublicStreamForImvu(pubUrl, 4500);
+        if (isStale()) return false;
         if (imvu.ok && imvu.reason !== 'mount-empty') return true;
         if (isImvuBlockingStreamProbe(imvu, pubUrl)) {
             if (!warnedNgrok) {
@@ -148,9 +152,11 @@ export async function waitForPublicHttpsStream(pubUrl, timeoutMs) {
  * Poll until FFmpeg has connected as a source. If publicStreamUrl is HTTPS, also wait until that URL returns audio.
  * @param {{ enabled?: boolean, icecastHost?: string, icecastPort?: number, icecastMount?: string, publicStreamUrl?: string }} cfg
  * @param {number} timeoutMs
+ * @param {{ isStale?: () => boolean }} [opts]
  */
-export async function waitForIcecastMountLive(cfg, timeoutMs) {
+export async function waitForIcecastMountLive(cfg, timeoutMs, opts = {}) {
     if (!cfg?.enabled) return false;
+    const isStale = typeof opts.isStale === 'function' ? opts.isStale : () => false;
     const loopHost = cfg.icecastHost === '0.0.0.0' ? '127.0.0.1' : String(cfg.icecastHost || '127.0.0.1');
     const mount = cfg.icecastMount.startsWith('/') ? cfg.icecastMount : `/${cfg.icecastMount}`;
     const port = Number(cfg.icecastPort) || 8001;
@@ -159,13 +165,17 @@ export async function waitForIcecastMountLive(cfg, timeoutMs) {
     const requireJson =
         !/^(0|false|no|off)$/i.test(String(process.env.MUSIC_REQUIRE_ICECAST_SOURCE_JSON ?? '1').trim());
     while (Date.now() < deadline) {
+        if (isStale()) return false;
         const fromJson = await icecastStatusJsonShowsSource(loopHost, port, mount);
+        if (isStale()) return false;
         lastGet = await httpGetStatus(loopHost, port, mount);
+        if (isStale()) return false;
         const mountOk = requireJson ? fromJson : fromJson || lastGet === 200;
         if (mountOk) {
             const pub = String(cfg.publicStreamUrl || '').trim();
             if (/^https:\/\//i.test(pub)) {
-                const httpsOk = await waitForPublicHttpsStream(pub, 22000);
+                const httpsOk = await waitForPublicHttpsStream(pub, 22000, { isStale });
+                if (isStale()) return false;
                 if (!httpsOk) {
                     console.warn(
                         '[music] Icecast source is up locally, but HTTPS stream URL still not returning audio. ' +

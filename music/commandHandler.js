@@ -383,6 +383,9 @@ function createVibeverseCommandHandler({
                 return true;
             }
 
+            // Cut current song immediately — !play always replaces, never queues behind.
+            player.cutForReplace();
+
             await reply(`Looking up “${rest}”…`);
             const one = await resolveVibeversePlayable(rest);
             if (!one) {
@@ -393,6 +396,10 @@ function createVibeverseCommandHandler({
             await queueMediaSync(async () => {
                 const result = await player.playNow(one);
                 if (!result?.ok) {
+                    if (result?.reason === 'stale') {
+                        // Superseded by a newer !play — that request will announce itself.
+                        return;
+                    }
                     await replyRoomMediaFailure(reply, result, one);
                     return;
                 }
