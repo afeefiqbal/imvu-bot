@@ -13,7 +13,8 @@ import {
 
 /**
  * Hybrid room player: VibeVerse search/stream URL → ffmpeg → Icecast live mount → IMVU radio.
- * Late joiners hear the current live point (not a progressive file from t=0).
+ * Cold-restarts encode before setting the room URL so new !play starts near t=0; late joiners
+ * still hear the live edge after that.
  *
  * @param {{
  *   roomId: string,
@@ -239,15 +240,40 @@ export function createVibeverseRoomPlayer(opts) {
         await withIcecastMountEncodeLock(mountLockKey, async () => {
             if (isStale()) return;
 
-            let proc;
-            try {
-                ({ proc } = createFfmpegHttpToIcecast({
-                    sourceUrl: track.streamUrl,
-                    icecastDestUrl: iceDest,
-                }));
-            } catch (e) {
-                console.error('[music] ffmpeg http→icecast failed:', e?.message || e);
-                applied = { ok: false, reason: 'ffmpeg-spawn', detail: e?.message || 'ffmpeg failed' };
+            // Remote VibeVerse/trycloudflare sources often need >8s before ffmpeg opens Icecast.
+            // Keep localOnly (no HTTPS probe) for speed; allow enough time for the source connect.
+            const waitMs = Math.max(
+                8000,
+                parseInt(String(process.env.MUSIC_CHAT_WAIT_MOUNT_MS || '20000'), 10) || 20000,
+            );
+            const coldRestart = !/^(0|false|no|off)$/i.test(
+                String(process.env.MUSIC_ICECAST_COLD_RESTART ?? '1').trim(),
+            );
+
+            const spawnEncode = () => {
+                try {
+                    return createFfmpegHttpToIcecast({
+                        sourceUrl: track.streamUrl,
+                        icecastDestUrl: iceDest,
+                    }).proc;
+                } catch (e) {
+                    console.error('[music] ffmpeg http→icecast failed:', e?.message || e);
+                    return null;
+                }
+            };
+
+            const waitMount = (timeout) =>
+                waitForIcecastMountLive(activeStreamCfg, timeout, {
+                    isStale,
+                    localOnly: true,
+                    pollMs: 100,
+                    isEncodeAlive: () =>
+                        Boolean(ffProc) && ffProc.exitCode == null && ffProc.signalCode == null,
+                });
+
+            let proc = spawnEncode();
+            if (!proc) {
+                applied = { ok: false, reason: 'ffmpeg-spawn', detail: 'ffmpeg failed' };
                 return;
             }
             if (isStale()) {
@@ -258,12 +284,6 @@ export function createVibeverseRoomPlayer(opts) {
             }
             ffProc = proc;
 
-            // Remote VibeVerse/trycloudflare sources often need >8s before ffmpeg opens Icecast.
-            // Keep localOnly (no HTTPS probe) for speed; allow enough time for the source connect.
-            const waitMs = Math.max(
-                8000,
-                parseInt(String(process.env.MUSIC_CHAT_WAIT_MOUNT_MS || '20000'), 10) || 20000,
-            );
             const diagAt = Math.min(8000, Math.max(3000, Math.floor(waitMs / 2)));
             setTimeout(async () => {
                 if (isStale()) return;
@@ -280,13 +300,7 @@ export function createVibeverseRoomPlayer(opts) {
                 }
             }, diagAt);
 
-            const live = await waitForIcecastMountLive(activeStreamCfg, waitMs, {
-                isStale,
-                localOnly: true,
-                pollMs: 250,
-                isEncodeAlive: () =>
-                    Boolean(ffProc) && ffProc.exitCode == null && ffProc.signalCode == null,
-            });
+            let live = await waitMount(waitMs);
             if (isStale()) return;
             if (!live || !ffProc) {
                 console.warn('[music] Mount never went live — not pushing room radio URL.');
@@ -297,6 +311,38 @@ export function createVibeverseRoomPlayer(opts) {
                     detail: 'Live Icecast mount did not become ready. Check Icecast and the public HTTPS tunnel.',
                 };
                 return;
+            }
+
+            // Warm-up encode often burns 5–15s before we set IMVU radio → listeners join mid-song.
+            // Kill and restart so the live edge is near t=0 when we push the URL.
+            if (coldRestart && !isStale()) {
+                console.log('[music] cold-restart encode so IMVU radio joins near track start');
+                killFf();
+                await new Promise((r) => setTimeout(r, 200));
+                if (isStale()) return;
+                proc = spawnEncode();
+                if (!proc) {
+                    applied = { ok: false, reason: 'ffmpeg-spawn', detail: 'ffmpeg cold-restart failed' };
+                    return;
+                }
+                ffProc = proc;
+                // Second start usually has CDN/TCP warm; short wait is enough.
+                const restartWait = Math.min(
+                    waitMs,
+                    Math.max(5000, parseInt(String(process.env.MUSIC_ICECAST_COLD_RESTART_WAIT_MS || '12000'), 10) || 12000),
+                );
+                live = await waitMount(restartWait);
+                if (isStale()) return;
+                if (!live || !ffProc) {
+                    console.warn('[music] Cold-restart mount never went live — not pushing room radio URL.');
+                    killFf();
+                    applied = {
+                        ok: false,
+                        reason: 'mount-not-live',
+                        detail: 'Live Icecast mount did not become ready after cold restart.',
+                    };
+                    return;
+                }
             }
 
             applied = await applyPublicUrlToRoom(pub, track);

@@ -10,7 +10,8 @@
         <header-timeout>15</header-timeout>
         <source-timeout>10</source-timeout>
         <burst-on-connect>1</burst-on-connect>
-        <burst-size>65535</burst-size>
+        <!-- ~16s of 128k MP3 so IMVU listeners catch near track start after cold-restart encode -->
+        <burst-size>262144</burst-size>
     </limits>
 
     <authentication>

@@ -5,10 +5,11 @@ function ffmpegVerbose() {
 }
 
 function ffmpegAudioFilter() {
-    /* YouTube pipe (m4a/webm fragments) often has broken DTS; MP3 muxer then floods "non monotonically increasing dts". */
+    /* m4a/AAC (VibeVerse R2) often has broken/negative DTS; lame then skips ("Queue input is backward in time")
+     * and IMVU hears mid-song. Rebuild PTS from sample count after resample. */
     return (
         String(process.env.MUSIC_FFMPEG_AF || '').trim() ||
-        'asetpts=PTS-STARTPTS,aresample=44100:async=1:min_hard_comp=0.1:max_soft_comp=0.9'
+        'aresample=44100:async=1000:first_pts=0,asetpts=N/SR/TB'
     );
 }
 
@@ -32,7 +33,10 @@ function attachFfmpegStderr(proc, { sourceLabel = 'pipe' } = {}) {
         if (low.includes('unsupported format') && low.includes('not officially supported in icecast')) {
             return;
         }
-        if (low.includes('non monotonically increasing dts')) {
+        if (
+            low.includes('non monotonically increasing dts') ||
+            low.includes('queue input is backward in time')
+        ) {
             dtsMuxSpam += 1;
             if (dtsMuxSpam === 1) {
                 console.warn(
@@ -118,9 +122,13 @@ export function createFfmpegHttpToIcecast({ sourceUrl, icecastDestUrl }) {
         '5',
         '-rw_timeout',
         '15000000',
+        // Real-time pace so the Icecast live edge tracks wall clock (not a dump of the whole file).
         '-re',
+        // Ignore broken container DTS from VibeVerse m4a; regenerate PTS (avoids mid-track jumps).
         '-fflags',
-        '+genpts+discardcorrupt',
+        '+genpts+igndts+discardcorrupt',
+        '-avoid_negative_ts',
+        'make_zero',
         '-probesize',
         '65536',
         '-analyzeduration',
