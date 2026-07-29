@@ -713,12 +713,6 @@ async function main() {
                     if (pendingLeaveId) locallyPausedRooms.add(pendingLeaveId);
                 }
             }
-            if (Array.isArray(data.pending_join_rooms)) {
-                for (const raw of data.pending_join_rooms) {
-                    const pendingJoinId = trackerRoomId(raw);
-                    if (pendingJoinId) locallyPausedRooms.delete(pendingJoinId);
-                }
-            }
 
             const targets = new Set((Array.isArray(data.target_rooms) ? data.target_rooms : []).map(trackerRoomId));
             configuredRoomIds = [
