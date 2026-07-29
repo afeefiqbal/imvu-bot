@@ -1426,6 +1426,28 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
     /** Per-room radio op queue — never alias a newer set/stop onto an older in-flight promise. */
     /** @type {Map<string, Promise<unknown>>} */
     const radioUpdateTail = new Map();
+    /** @type {Map<string, number>} roomId → suppress self-rejoin until (ms) */
+    const radioOpQuietUntil = new Map();
+    /** @type {Map<string, { url: string, stationName: string, at: number }>} */
+    const lastAppliedRoomRadio = new Map();
+
+    function markRadioOpQuiet(roomId, extraMs = null) {
+        const key = String(roomId || '').trim();
+        if (!key) return;
+        const base = Math.max(
+            15000,
+            parseInt(String(process.env.IMVU_RADIO_SELF_REJOIN_QUIET_MS || '60000'), 10) || 60000,
+        );
+        const ms = extraMs != null ? Math.max(base, Number(extraMs) || base) : base;
+        const until = Date.now() + ms;
+        const prev = radioOpQuietUntil.get(key) || 0;
+        if (until > prev) radioOpQuietUntil.set(key, until);
+    }
+
+    function isRadioOpQuiet(roomId) {
+        const until = radioOpQuietUntil.get(String(roomId || '').trim()) || 0;
+        return Date.now() < until;
+    }
 
     /**
      * Run radio stop/set ops strictly in order per room.
@@ -1599,6 +1621,7 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
 
     async function stopRoomRadioStream(roomId) {
         return enqueueRoomRadioOp(roomId, async () => {
+            markRadioOpQuiet(roomId);
             const mediaInfo = await fetchRoomRadioMediaInfo(roomId);
             const playerUrl = mediaInfo?.url || null;
             if (!playerUrl) return { ok: false, reason: 'radio-player-not-found' };
@@ -1629,6 +1652,8 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                 if (!stopRes.ok) {
                     return { ok: false, reason: `post-${stopRes.status}` };
                 }
+                lastAppliedRoomRadio.delete(String(roomId || '').trim());
+                markRadioOpQuiet(roomId);
                 logger.log(`[IMVU-SESSION] Stopped room ${roomId} radio.`);
                 return { ok: true, reason: 'stopped' };
             } catch (error) {
@@ -1646,6 +1671,7 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         const stationName = String(options?.stationName || '').trim();
 
         return enqueueRoomRadioOp(roomId, async () => {
+            markRadioOpQuiet(roomId);
             const mediaInfo = await fetchRoomRadioMediaInfo(roomId);
             const playerUrl = mediaInfo?.url || null;
             if (!playerUrl) return { ok: false, reason: 'radio-player-not-found' };
@@ -1786,6 +1812,12 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                     }
                 }
 
+                lastAppliedRoomRadio.set(String(roomId || '').trim(), {
+                    url: stationUrl,
+                    stationName,
+                    at: Date.now(),
+                });
+                markRadioOpQuiet(roomId);
                 logger.log(
                     `[IMVU-SESSION] Updated room ${roomId} radio URL via API (stop${flashClear ? ' → clear' : ''} → update → start, status ${startRes.status}): ${stationUrl}`,
                 );
@@ -1794,6 +1826,34 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                 logger.warn(`[IMVU-SESSION] Room radio URL update failed for ${roomId}: ${error.message}`);
                 return { ok: false, reason: error.message || 'post-failed' };
             }
+        });
+    }
+
+    /**
+     * After a self-removed presence repair, push the last known Icecast URL again.
+     * IMVU often drops room radio when the bot participant is briefly deleted.
+     */
+    async function reapplyRoomRadioAfterPresence(roomId) {
+        const key = String(roomId || '').trim();
+        const saved = lastAppliedRoomRadio.get(key);
+        if (!saved?.url) return { ok: false, reason: 'no-saved-url' };
+        const maxAge = Math.max(
+            60000,
+            parseInt(
+                String(process.env.IMVU_RADIO_REAPPLY_MAX_AGE_MS || String(2 * 60 * 60 * 1000)),
+                10,
+            ) || 2 * 60 * 60 * 1000,
+        );
+        if (Date.now() - saved.at > maxAge) {
+            lastAppliedRoomRadio.delete(key);
+            return { ok: false, reason: 'stale' };
+        }
+        logger.log(
+            `[IMVU-SESSION] Re-applying room ${key} radio after presence repair: ${saved.url}`,
+        );
+        return setRoomRadioStreamUrl(key, saved.url, {
+            stationName: saved.stationName || '',
+            reapply: true,
         });
     }
 
@@ -2820,6 +2880,9 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         fetchRoomMediaPlayerUpdateQueue,
         setRoomRadioStreamUrl,
         stopRoomRadioStream,
+        markRadioOpQuiet,
+        isRadioOpQuiet,
+        reapplyRoomRadioAfterPresence,
         sendFriendRequest,
         sendDirectMessage,
         listInboundFriendRequests,

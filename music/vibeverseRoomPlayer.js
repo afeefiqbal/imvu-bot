@@ -1,7 +1,11 @@
 import { createTrackQueue } from './queue.js';
 import { applyRoomMediaStreamUrl, waitForRoomMediaPlayback } from './imvuRoomMediaDom.js';
 import { notifyImvuMusicState } from './notifyImvuMusicApi.js';
-import { playVibeverseTrack, refreshVibeverseStream } from './vibeverseClient.js';
+import {
+    fetchRandomVibeversePlayable,
+    playVibeverseTrack,
+    refreshVibeverseStream,
+} from './vibeverseClient.js';
 import { createFfmpegFileToIcecast, createFfmpegHttpToIcecast } from './ffmpegIcecast.js';
 import { downloadToTemp } from './downloadToTemp.js';
 import { loadStreamConfig, withPerPlayStreamMount } from './loadStreamConfig.js';
@@ -12,10 +16,33 @@ import {
     waitForIcecastMountLive,
 } from './icecastLive.js';
 
+function envFlagTrue(name, defaultOn = false) {
+    const raw = process.env[name];
+    if (raw == null || String(raw).trim() === '') return defaultOn;
+    return !/^(0|false|no|off)$/i.test(String(raw).trim());
+}
+
+/** Optional comma/space allowlist — empty means any room may use autoplay once armed. */
+function roomAllowedForAutoplay(roomId) {
+    const raw = String(process.env.MUSIC_AUTOPLAY_ROOMS || '').trim();
+    if (!raw) return true;
+    const want = new Set(
+        raw
+            .split(/[,\s]+/)
+            .map((s) => s.trim())
+            .filter(Boolean),
+    );
+    return want.has(String(roomId || '').trim());
+}
+
 /**
  * Hybrid room player: VibeVerse search/stream URL → ffmpeg → Icecast live mount → IMVU radio.
  * Cold-restarts encode before setting the room URL so new !play starts near t=0; late joiners
  * still hear the live edge after that.
+ *
+ * After a user !play/!add arms the room, when the queue empties the player picks a random
+ * VibeVerse track and keeps going until !stop (manual !play replaces the current song and
+ * leaves autoplay armed).
  *
  * @param {{
  *   roomId: string,
@@ -42,6 +69,11 @@ export function createVibeverseRoomPlayer(opts) {
     let generation = 0;
     /** @type {object | null} */
     let activeStreamCfg = null;
+    /** Idle autoplay only after user music activity (!play / !add). */
+    let autoplayArmed = false;
+    /** @type {string[]} */
+    const recentAutoplayIds = [];
+    let autoplayFailStreak = 0;
 
     const clearEndTimer = () => {
         if (endTimer) {
@@ -106,6 +138,67 @@ export function createVibeverseRoomPlayer(opts) {
     };
 
     const loadConfig = () => loadStreamConfig({ apiBaseUrl, roomId });
+
+    const armAutoplay = (reason = 'user') => {
+        if (!autoplayArmed) {
+            autoplayArmed = true;
+            console.log(`[music] autoplay armed (${roomId}): ${reason}`);
+        } else {
+            autoplayArmed = true;
+        }
+    };
+
+    const disarmAutoplay = () => {
+        if (autoplayArmed) {
+            console.log(`[music] autoplay disarmed (${roomId})`);
+        }
+        autoplayArmed = false;
+        autoplayFailStreak = 0;
+    };
+
+    const rememberAutoplayId = (trackId) => {
+        const id = String(trackId || '').trim();
+        if (!id) return;
+        recentAutoplayIds.push(id);
+        while (recentAutoplayIds.length > 24) recentAutoplayIds.shift();
+    };
+
+    /** When the queue is empty and armed, fetch a random READY/trending track. */
+    const maybeEnqueueAutoplayTrack = async () => {
+        if (queue.peek()) return true;
+        if (paused) return false;
+        // Default on for VibeVerse idle fill. Set MUSIC_AUTOPLAY=0 to disable.
+        if (!envFlagTrue('MUSIC_AUTOPLAY', true)) return false;
+        if (!autoplayArmed) return false;
+        if (!roomAllowedForAutoplay(roomId)) return false;
+        if (autoplayFailStreak >= 5) {
+            console.warn(
+                `[music] autoplay paused in ${roomId} after ${autoplayFailStreak} failed picks`,
+            );
+            return false;
+        }
+
+        const pick = await fetchRandomVibeversePlayable({ excludeIds: recentAutoplayIds });
+        if (!pick?.streamUrl) {
+            autoplayFailStreak += 1;
+            console.warn(`[music] autoplay: no playable track for ${roomId}`);
+            return false;
+        }
+
+        autoplayFailStreak = 0;
+        rememberAutoplayId(pick.trackId);
+        console.log(`[music] autoplay → “${pick.title}” (${roomId})`);
+        queue.enqueue({
+            trackId: pick.trackId,
+            title: pick.title,
+            artistName: pick.artistName,
+            artworkUrl: pick.artworkUrl,
+            durationMs: pick.durationMs,
+            streamUrl: pick.streamUrl,
+            autoplay: true,
+        });
+        return true;
+    };
 
     const applyPublicUrlToRoom = async (publicUrl, track) => {
         const url = String(publicUrl || '').trim();
@@ -172,6 +265,13 @@ export function createVibeverseRoomPlayer(opts) {
             if (track) queue.setCurrent(track);
         }
         if (!track) {
+            const filled = await maybeEnqueueAutoplayTrack();
+            if (filled) {
+                track = queue.dequeue();
+                if (track) queue.setCurrent(track);
+            }
+        }
+        if (!track) {
             playing = false;
             paused = false;
             notify(null, 'idle');
@@ -187,7 +287,7 @@ export function createVibeverseRoomPlayer(opts) {
                 durationMs: track.durationMs,
             });
             if (gen !== generation) return { ok: false, reason: 'stale' };
-            if (fresh?.ok && fresh.track) Object.assign(track, fresh.track);
+            if (fresh?.streamUrl) Object.assign(track, fresh);
         }
 
         if (!track.streamUrl) {
@@ -415,6 +515,10 @@ export function createVibeverseRoomPlayer(opts) {
             playing = false;
             queue.setCurrent(null);
             notify(null, 'idle');
+            // Keep filling if autoplay is armed (bad mount / download on one pick).
+            if (autoplayArmed && gen === generation) {
+                return playCurrentOrNext();
+            }
             return applied;
         }
         return { ok: true, track };
@@ -437,15 +541,22 @@ export function createVibeverseRoomPlayer(opts) {
         isPaused: () => paused,
         hasActive: () =>
             playing || paused || ffProc != null || queue.getCurrent() != null || queue.peek() != null,
+        isAutoplayArmed: () => autoplayArmed,
+        armAutoplay: (reason) => armAutoplay(reason || 'manual'),
+        disarmAutoplay,
+        /** After cut/pending lookup failure — drain queue or start idle autoplay if armed. */
+        ensurePlaying: () => enqueueDrain(),
 
         /**
          * Stop current encode + radio immediately (keeps nothing queued).
          * Call at the start of !play so the old song cuts while the new one is looked up.
+         * Does not disarm autoplay — a following !play keeps the idle loop.
          */
         cutForReplace,
 
         /** Replace whatever is playing/queued with this track and start it now. */
         async playNow(track) {
+            armAutoplay('!play');
             clearEndTimer();
             generation += 1;
             killFf();
@@ -461,6 +572,7 @@ export function createVibeverseRoomPlayer(opts) {
         },
 
         async enqueue(track) {
+            armAutoplay('!add');
             const wasIdle =
                 !queue.getCurrent() && !playing && !paused && !ffProc && !queue.peek();
             queue.enqueue(track);
@@ -481,6 +593,7 @@ export function createVibeverseRoomPlayer(opts) {
         },
 
         stop() {
+            disarmAutoplay();
             clearEndTimer();
             generation += 1;
             killFf();

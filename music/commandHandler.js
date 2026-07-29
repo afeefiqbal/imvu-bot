@@ -11,12 +11,6 @@ import {
 } from './vibeverseClient.js';
 import { createVibeverseRoomPlayer } from './vibeverseRoomPlayer.js';
 
-function formatVibeverseLookupFailure(verb = 'play') {
-    const again = verb === 'add' ? '!add' : '!play';
-    if (!vibeverseEnabled()) return 'Music lookup is not configured.';
-    return `Could not find or prepare that track. Try ${again} again in a moment.`;
-}
-
 function roomMediaNotModerator(result) {
     const reason = String(result?.reason || '');
     const detail = String(result?.detail || '');
@@ -72,7 +66,7 @@ async function replyRoomMediaFailure(reply, result, track = null) {
     );
 }
 
-const HELP_VIBEVERSE = `Music: !play/!p · !add/!a · !queue/!q · !skip/!next · !stop · !pause · !resume · !music · radio https://vibeverse-web.vvpz.workers.dev/radio`;
+const HELP_VIBEVERSE = `Music: !play/!p · !add/!a · !queue/!q · !skip/!next · !stop · !pause · !resume · !music · after !play, random songs keep playing until !stop · radio https://vibeverse-web.vvpz.workers.dev/radio`;
 const HELP_ICECAST = `Music: !play/!p · !add/!a · !queue/!q · !skip · !stop · !pause · !resume · !music · idle playlist is server .env only (not set by chat)`;
 
 function parseCmdLine(text) {
@@ -345,12 +339,12 @@ function createVibeverseCommandHandler({
         }
 
         if (cmd === '*stop') {
-            if (!hasActivePlayback(player)) {
+            if (!hasActivePlayback(player) && !player.isAutoplayArmed?.()) {
                 await reply('Nothing playing.');
                 return true;
             }
             player.stop();
-            await reply('Stopped. Queue cleared.');
+            await reply('Stopped. Queue cleared — autoplay off until the next !play.');
             return true;
         }
 
@@ -394,11 +388,25 @@ function createVibeverseCommandHandler({
 
             // Cut current song immediately — !play always replaces, never queues behind.
             player.cutForReplace();
+            player.armAutoplay?.('!play');
 
             await reply(`Looking up “${rest}”…`);
             const one = await resolveVibeversePlayable(rest);
+            if (one?.pending) {
+                // Found, but still caching — keep music going via idle autoplay.
+                void player.ensurePlaying?.();
+                await reply(
+                    'That track is still preparing in the library — keeping music going with another song.',
+                );
+                return true;
+            }
             if (!one?.streamUrl) {
-                await reply(formatVibeverseLookupFailure('play'));
+                if (!vibeverseEnabled()) {
+                    await reply('Music lookup is not configured.');
+                } else {
+                    await reply('Could not find that track.');
+                }
+                void player.ensurePlaying?.();
                 return true;
             }
 
@@ -426,8 +434,20 @@ function createVibeverseCommandHandler({
 
             await reply(`Looking up “${rest}”…`);
             const one = await resolveVibeversePlayable(rest);
+            if (one?.pending) {
+                player.armAutoplay?.('!add');
+                void player.ensurePlaying?.();
+                await reply(
+                    'That track is still preparing — keeping music going meanwhile.',
+                );
+                return true;
+            }
             if (!one?.streamUrl) {
-                await reply(formatVibeverseLookupFailure('add'));
+                if (!vibeverseEnabled()) {
+                    await reply('Music lookup is not configured.');
+                } else {
+                    await reply('Could not find that track.');
+                }
                 return true;
             }
 

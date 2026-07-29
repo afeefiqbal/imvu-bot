@@ -471,6 +471,10 @@ async function main() {
             if (!selfRejoinEnabled || !frameShowsSelfRemovedFromRoom(action, id, bot.imqUserId)) return;
             if (!entry) return;
             if (client.presenceRepairInFlight) return;
+            // stop→clear→update→start radio churn often emits participant-deleted; don't flap-rejoin mid-op.
+            if (typeof session.isRadioOpQuiet === 'function' && session.isRadioOpQuiet(id)) {
+                return;
+            }
             const now = Date.now();
             if (entry.visibleRejoinPausedUntil && now < entry.visibleRejoinPausedUntil) return;
 
@@ -498,12 +502,26 @@ async function main() {
                 entry.selfRejoinTimer = null;
                 if (roomClients.get(id) !== entry) return;
                 if (entry.visibleRejoinPausedUntil && Date.now() < entry.visibleRejoinPausedUntil) return;
+                if (typeof session.isRadioOpQuiet === 'function' && session.isRadioOpQuiet(id)) {
+                    return;
+                }
                 if (typeof client.resetPresenceForRejoin === 'function') {
                     client.resetPresenceForRejoin();
                 }
-                void client.ensureVisible('self-removed').catch((error) => {
-                    console.warn(`[${BOT_NAME}][${id}] self rejoin failed: ${error.message}`);
-                });
+                void client
+                    .ensureVisible('self-removed')
+                    .then(async () => {
+                        if (typeof session.reapplyRoomRadioAfterPresence !== 'function') return;
+                        const reapplied = await session.reapplyRoomRadioAfterPresence(id);
+                        if (reapplied?.ok) {
+                            console.log(
+                                `[${BOT_NAME}][${id}] re-applied room radio after self-rejoin`,
+                            );
+                        }
+                    })
+                    .catch((error) => {
+                        console.warn(`[${BOT_NAME}][${id}] self rejoin failed: ${error.message}`);
+                    });
             }, selfRejoinDelayMs);
         });
         await startProtocolUserTracking(client, id, {
