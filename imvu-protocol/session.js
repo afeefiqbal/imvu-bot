@@ -1683,7 +1683,7 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                 if (stopRes.etag) etag = stopRes.etag;
                 const waitStoppedMs = Math.max(
                     0,
-                    parseInt(String(process.env.IMVU_RADIO_WAIT_STOPPED_MS || '1200'), 10) || 1200,
+                    parseInt(String(process.env.IMVU_RADIO_WAIT_STOPPED_MS || '400'), 10) || 400,
                 );
                 if (waitStoppedMs > 0) {
                     const stopped = await waitForRoomRadioStatus(roomId, 'stopped', waitStoppedMs);
@@ -1714,8 +1714,8 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                             r,
                             Math.max(
                                 0,
-                                parseInt(String(process.env.IMVU_RADIO_URL_FLASH_MS || '300'), 10) ||
-                                    300,
+                                parseInt(String(process.env.IMVU_RADIO_URL_FLASH_MS || '100'), 10) ||
+                                    100,
                             ),
                         ),
                     );
@@ -1767,7 +1767,7 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
 
                 const pulseMs = Math.max(
                     0,
-                    parseInt(String(process.env.IMVU_RADIO_RESTART_DELAY_MS || '700'), 10) || 700,
+                    parseInt(String(process.env.IMVU_RADIO_RESTART_DELAY_MS || '0'), 10) || 0,
                 );
                 if (pulseMs > 0) {
                     await new Promise((r) => setTimeout(r, pulseMs));

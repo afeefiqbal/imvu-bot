@@ -12,9 +12,10 @@ const endOfChain = new Map();
 function reconnectDelayMs() {
     const raw = process.env.MUSIC_ICECAST_RECONNECT_MS;
     if (raw === '0' || raw === 'false') return 0;
-    if (raw == null || String(raw).trim() === '') return 1000;
+    // Per-play mounts are unique — no need for a long Icecast settle gap.
+    if (raw == null || String(raw).trim() === '') return 200;
     const v = parseInt(String(raw), 10);
-    return Number.isFinite(v) && v >= 0 ? v : 1000;
+    return Number.isFinite(v) && v >= 0 ? v : 200;
 }
 
 /**

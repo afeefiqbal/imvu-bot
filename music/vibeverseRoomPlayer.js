@@ -105,11 +105,12 @@ export function createVibeverseRoomPlayer(opts) {
             stationName: String(track?.title || '').trim(),
         });
         if (!applied.ok) return applied;
-        await waitForRoomMediaPlayback(page, {
+        // Don't block chat on IMVU playback confirmation — announce as soon as the URL is set.
+        void waitForRoomMediaPlayback(page, {
             roomId,
             expectedUrl: url,
-            timeoutMs: 12_000,
-            intervalMs: 1500,
+            timeoutMs: 4_000,
+            intervalMs: 1000,
             sessionClient,
         }).catch(() => ({ ok: false }));
         return applied;
@@ -263,18 +264,24 @@ export function createVibeverseRoomPlayer(opts) {
                 if (isStale()) return;
                 if (!up) {
                     console.warn(
-                        `[music] Icecast has no SOURCE on ${mountPath} at ${loopHost}:${icePort} ~12s after start.`,
+                        `[music] Icecast has no SOURCE on ${mountPath} at ${loopHost}:${icePort} ~8s after start.`,
                     );
                 } else {
                     console.log(`[music] Icecast confirms source on ${mountPath} (${loopHost}:${icePort}).`);
                 }
-            }, 12000);
+            }, 8000);
 
+            // Fast path: wait for local Icecast only (tunnel already fronts this host).
+            // Skipping the multi-second public HTTPS probe cuts most of the !play latency.
             const waitMs = Math.max(
-                8000,
-                parseInt(String(process.env.MUSIC_CHAT_WAIT_MOUNT_MS || '25000'), 10) || 25000,
+                2500,
+                parseInt(String(process.env.MUSIC_CHAT_WAIT_MOUNT_MS || '8000'), 10) || 8000,
             );
-            const live = await waitForIcecastMountLive(activeStreamCfg, waitMs, { isStale });
+            const live = await waitForIcecastMountLive(activeStreamCfg, waitMs, {
+                isStale,
+                localOnly: true,
+                pollMs: 200,
+            });
             if (isStale()) return;
             if (!live || !ffProc) {
                 console.warn('[music] Mount never went live — not pushing room radio URL.');

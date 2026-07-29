@@ -149,18 +149,21 @@ export async function waitForPublicHttpsStream(pubUrl, timeoutMs, opts = {}) {
 }
 
 /**
- * Poll until FFmpeg has connected as a source. If publicStreamUrl is HTTPS, also wait until that URL returns audio.
+ * Poll until FFmpeg has connected as a source. If publicStreamUrl is HTTPS, also wait until that URL returns audio
+ * (unless opts.localOnly — preferred for quick !play when the tunnel already points at this Icecast).
  * @param {{ enabled?: boolean, icecastHost?: string, icecastPort?: number, icecastMount?: string, publicStreamUrl?: string }} cfg
  * @param {number} timeoutMs
- * @param {{ isStale?: () => boolean }} [opts]
+ * @param {{ isStale?: () => boolean, localOnly?: boolean, pollMs?: number, publicWaitMs?: number }} [opts]
  */
 export async function waitForIcecastMountLive(cfg, timeoutMs, opts = {}) {
     if (!cfg?.enabled) return false;
     const isStale = typeof opts.isStale === 'function' ? opts.isStale : () => false;
+    const localOnly = opts.localOnly === true;
+    const pollMs = Math.max(100, Number(opts.pollMs) || 200);
     const loopHost = cfg.icecastHost === '0.0.0.0' ? '127.0.0.1' : String(cfg.icecastHost || '127.0.0.1');
     const mount = cfg.icecastMount.startsWith('/') ? cfg.icecastMount : `/${cfg.icecastMount}`;
     const port = Number(cfg.icecastPort) || 8001;
-    const deadline = Date.now() + Math.max(3000, timeoutMs);
+    const deadline = Date.now() + Math.max(2000, timeoutMs);
     let lastGet = 0;
     const requireJson =
         !/^(0|false|no|off)$/i.test(String(process.env.MUSIC_REQUIRE_ICECAST_SOURCE_JSON ?? '1').trim());
@@ -172,9 +175,16 @@ export async function waitForIcecastMountLive(cfg, timeoutMs, opts = {}) {
         if (isStale()) return false;
         const mountOk = requireJson ? fromJson : fromJson || lastGet === 200;
         if (mountOk) {
+            if (localOnly) return true;
             const pub = String(cfg.publicStreamUrl || '').trim();
             if (/^https:\/\//i.test(pub)) {
-                const httpsOk = await waitForPublicHttpsStream(pub, 22000, { isStale });
+                const publicWaitMs = Math.max(
+                    1500,
+                    Number(opts.publicWaitMs) ||
+                        parseInt(String(process.env.MUSIC_PUBLIC_HTTPS_WAIT_MS || '6000'), 10) ||
+                        6000,
+                );
+                const httpsOk = await waitForPublicHttpsStream(pub, publicWaitMs, { isStale });
                 if (isStale()) return false;
                 if (!httpsOk) {
                     console.warn(
@@ -187,7 +197,7 @@ export async function waitForIcecastMountLive(cfg, timeoutMs, opts = {}) {
             }
             return true;
         }
-        await new Promise((r) => setTimeout(r, 450));
+        await new Promise((r) => setTimeout(r, pollMs));
     }
     console.warn(
         `[music] Timed out waiting for Icecast source on http://${loopHost}:${port}${mount} (last GET ${lastGet}).`,
