@@ -341,7 +341,9 @@ export function createVibeverseRoomPlayer(opts) {
             queue.setCurrent(track);
             playing = false;
             paused = false;
-            stopRoomRadioQuiet();
+            // Do not stopRoomRadio here — cutForReplace already stopped it for !play,
+            // and setRoomRadioStreamUrl does stop→clear→update→start when the mount is live.
+            // A second fire-and-forget stop raced the URL set and could swallow it.
             console.log(`[music] !play replace — starting “${track?.title || '?'}”`);
             return playCurrentOrNext();
         },

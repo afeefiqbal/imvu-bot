@@ -1423,7 +1423,30 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
     }
 
     const radioPlayerUrlCache = new Map();
-    const radioUpdateInflight = new Map();
+    /** Per-room radio op queue — never alias a newer set/stop onto an older in-flight promise. */
+    /** @type {Map<string, Promise<unknown>>} */
+    const radioUpdateTail = new Map();
+
+    /**
+     * Run radio stop/set ops strictly in order per room.
+     * Previous "return inflight" logic made setRoomRadioStreamUrl accidentally return a stop result.
+     * @template T
+     * @param {string} roomId
+     * @param {() => Promise<T>} fn
+     * @returns {Promise<T>}
+     */
+    function enqueueRoomRadioOp(roomId, fn) {
+        const key = String(roomId || '').trim();
+        const prev = radioUpdateTail.get(key) ?? Promise.resolve();
+        const next = prev.catch(() => {}).then(fn);
+        radioUpdateTail.set(
+            key,
+            next.finally(() => {
+                if (radioUpdateTail.get(key) === next) radioUpdateTail.delete(key);
+            }),
+        );
+        return next;
+    }
 
     async function fetchRoomRadioMediaInfo(roomId) {
         const normalizedRoomId = String(roomId || '').trim();
@@ -1575,11 +1598,7 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
     }
 
     async function stopRoomRadioStream(roomId) {
-        const normalizedRoomId = String(roomId || '').trim();
-        const inflight = radioUpdateInflight.get(normalizedRoomId);
-        if (inflight) return inflight;
-
-        const work = (async () => {
+        return enqueueRoomRadioOp(roomId, async () => {
             const mediaInfo = await fetchRoomRadioMediaInfo(roomId);
             const playerUrl = mediaInfo?.url || null;
             if (!playerUrl) return { ok: false, reason: 'radio-player-not-found' };
@@ -1616,14 +1635,7 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                 logger.warn(`[IMVU-SESSION] Room radio stop failed for ${roomId}: ${error.message}`);
                 return { ok: false, reason: error.message || 'stop-failed' };
             }
-        })();
-
-        radioUpdateInflight.set(normalizedRoomId, work);
-        try {
-            return await work;
-        } finally {
-            radioUpdateInflight.delete(normalizedRoomId);
-        }
+        });
     }
 
     async function setRoomRadioStreamUrl(roomId, publicUrl, options = {}) {
@@ -1633,11 +1645,7 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         const stationUrl = canonicalRadioStationUrl(url);
         const stationName = String(options?.stationName || '').trim();
 
-        const normalizedRoomId = String(roomId || '').trim();
-        const inflight = radioUpdateInflight.get(normalizedRoomId);
-        if (inflight) return inflight;
-
-        const work = (async () => {
+        return enqueueRoomRadioOp(roomId, async () => {
             const mediaInfo = await fetchRoomRadioMediaInfo(roomId);
             const playerUrl = mediaInfo?.url || null;
             if (!playerUrl) return { ok: false, reason: 'radio-player-not-found' };
@@ -1786,14 +1794,7 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                 logger.warn(`[IMVU-SESSION] Room radio URL update failed for ${roomId}: ${error.message}`);
                 return { ok: false, reason: error.message || 'post-failed' };
             }
-        })();
-
-        radioUpdateInflight.set(normalizedRoomId, work);
-        try {
-            return await work;
-        } finally {
-            radioUpdateInflight.delete(normalizedRoomId);
-        }
+        });
     }
 
     async function apiPost(path, body = {}, options = {}) {
