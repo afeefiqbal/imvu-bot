@@ -2,7 +2,8 @@ import { createTrackQueue } from './queue.js';
 import { applyRoomMediaStreamUrl, waitForRoomMediaPlayback } from './imvuRoomMediaDom.js';
 import { notifyImvuMusicState } from './notifyImvuMusicApi.js';
 import { playVibeverseTrack, refreshVibeverseStream } from './vibeverseClient.js';
-import { createFfmpegHttpToIcecast } from './ffmpegIcecast.js';
+import { createFfmpegFileToIcecast, createFfmpegHttpToIcecast } from './ffmpegIcecast.js';
+import { downloadToTemp } from './downloadToTemp.js';
 import { loadStreamConfig, withPerPlayStreamMount } from './loadStreamConfig.js';
 import { withIcecastMountEncodeLock } from './icecastMountLock.js';
 import {
@@ -32,6 +33,8 @@ export function createVibeverseRoomPlayer(opts) {
     let paused = false;
     /** @type {import('child_process').ChildProcess | null} */
     let ffProc = null;
+    /** @type {(() => Promise<void>) | null} */
+    let tempCleanup = null;
     /** @type {ReturnType<typeof setTimeout> | null} */
     let endTimer = null;
     /** @type {Promise<void>} */
@@ -47,12 +50,22 @@ export function createVibeverseRoomPlayer(opts) {
         }
     };
 
+    const clearTempFile = () => {
+        const fn = tempCleanup;
+        tempCleanup = null;
+        if (fn) void fn().catch(() => {});
+    };
+
     const killFf = () => {
-        if (!ffProc) return;
+        if (!ffProc) {
+            clearTempFile();
+            return;
+        }
         try {
             ffProc.kill('SIGKILL');
         } catch {}
         ffProc = null;
+        clearTempFile();
     };
 
     /** Best-effort: stop IMVU room radio so the current song cuts immediately. */
@@ -138,6 +151,7 @@ export function createVibeverseRoomPlayer(opts) {
                 `[music] live encode ended (code=${code}, signal=${sig || 'none'}): ${track?.title || '?'}`,
             );
             if (ffProc === proc) ffProc = null;
+            clearTempFile();
             clearEndTimer();
             if (paused) return;
             queue.setCurrent(null);
@@ -229,7 +243,7 @@ export function createVibeverseRoomPlayer(opts) {
         const isStale = () => gen !== generation;
 
         console.log(
-            `[music] live encode: VibeVerse → Icecast ${mountPath} → ${pub.slice(0, 120)}`,
+            `[music] live encode: VibeVerse → local file → Icecast ${mountPath} → ${pub.slice(0, 120)}`,
         );
 
         /** @type {{ ok: boolean, reason?: string, detail?: string }} */
@@ -240,8 +254,32 @@ export function createVibeverseRoomPlayer(opts) {
         await withIcecastMountEncodeLock(mountLockKey, async () => {
             if (isStale()) return;
 
-            // Remote VibeVerse/trycloudflare sources often need >8s before ffmpeg opens Icecast.
-            // Keep localOnly (no HTTPS probe) for speed; allow enough time for the source connect.
+            // Download durable URL first so -re never underruns on remote HTTP stalls.
+            /** @type {string | null} */
+            let localFile = null;
+            try {
+                const dl = await downloadToTemp({
+                    url: track.streamUrl,
+                    roomId,
+                    label: 'vv',
+                });
+                if (isStale()) {
+                    await dl.cleanup();
+                    return;
+                }
+                localFile = dl.filePath;
+                tempCleanup = dl.cleanup;
+            } catch (e) {
+                console.error('[music] durable download failed:', e?.message || e);
+                applied = {
+                    ok: false,
+                    reason: 'download-failed',
+                    detail: e?.message || 'Could not download track audio',
+                };
+                return;
+            }
+
+            // Local file opens instantly; keep enough wait for Icecast SOURCE handshake.
             const waitMs = Math.max(
                 8000,
                 parseInt(String(process.env.MUSIC_CHAT_WAIT_MOUNT_MS || '20000'), 10) || 20000,
@@ -252,12 +290,19 @@ export function createVibeverseRoomPlayer(opts) {
 
             const spawnEncode = () => {
                 try {
+                    if (localFile) {
+                        console.log(`[music] live encode: local file → Icecast (${localFile})`);
+                        return createFfmpegFileToIcecast({
+                            filePath: localFile,
+                            icecastDestUrl: iceDest,
+                        }).proc;
+                    }
                     return createFfmpegHttpToIcecast({
                         sourceUrl: track.streamUrl,
                         icecastDestUrl: iceDest,
                     }).proc;
                 } catch (e) {
-                    console.error('[music] ffmpeg http→icecast failed:', e?.message || e);
+                    console.error('[music] ffmpeg →icecast failed:', e?.message || e);
                     return null;
                 }
             };
@@ -273,6 +318,7 @@ export function createVibeverseRoomPlayer(opts) {
 
             let proc = spawnEncode();
             if (!proc) {
+                clearTempFile();
                 applied = { ok: false, reason: 'ffmpeg-spawn', detail: 'ffmpeg failed' };
                 return;
             }
@@ -280,6 +326,7 @@ export function createVibeverseRoomPlayer(opts) {
                 try {
                     proc.kill('SIGKILL');
                 } catch {}
+                clearTempFile();
                 return;
             }
             ffProc = proc;
@@ -315,13 +362,20 @@ export function createVibeverseRoomPlayer(opts) {
 
             // Warm-up encode often burns 5–15s before we set IMVU radio → listeners join mid-song.
             // Kill and restart so the live edge is near t=0 when we push the URL.
+            // Keep the same local temp file across cold-restart (only kill ffmpeg).
             if (coldRestart && !isStale()) {
                 console.log('[music] cold-restart encode so IMVU radio joins near track start');
-                killFf();
+                if (ffProc) {
+                    try {
+                        ffProc.kill('SIGKILL');
+                    } catch {}
+                    ffProc = null;
+                }
                 await new Promise((r) => setTimeout(r, 200));
                 if (isStale()) return;
                 proc = spawnEncode();
                 if (!proc) {
+                    clearTempFile();
                     applied = { ok: false, reason: 'ffmpeg-spawn', detail: 'ffmpeg cold-restart failed' };
                     return;
                 }

@@ -297,8 +297,10 @@ export async function playVibeverseTrack(track) {
  */
 function finishPlayable(resolvedTrack, fallbackTrack, streamUrl) {
     const trackId = String(resolvedTrack.id || fallbackTrack.id);
-    if (/\.m4a(\?|$)/i.test(streamUrl) || /audio\/(mp4|aac|x-m4a)/i.test(streamUrl)) {
-        console.warn(`[vibeverse] stream is m4a/AAC — re-encoding to Icecast MP3 for IMVU.`);
+    if (/\.mp3(\?|$)/i.test(streamUrl) || /audio\/mpeg/i.test(streamUrl)) {
+        console.log(`[vibeverse] durable MP3 ready for IMVU encode.`);
+    } else if (/\.m4a(\?|$)/i.test(streamUrl) || /audio\/(mp4|aac|x-m4a)/i.test(streamUrl)) {
+        console.warn(`[vibeverse] stream is m4a/AAC — downloading locally then re-encoding to Icecast MP3.`);
     }
     console.log(
         `[music] stream URL for “${String(resolvedTrack.title || fallbackTrack.title || trackId)}”: ${streamUrl}`,

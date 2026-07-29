@@ -158,3 +158,54 @@ export function createFfmpegHttpToIcecast({ sourceUrl, icecastDestUrl }) {
     attachFfmpegStderr(proc, { sourceLabel: 'http' });
     return { proc };
 }
+
+/**
+ * Live-encode a local audio file into Icecast (realtime -re, no remote underruns).
+ * @param {{ filePath: string, icecastDestUrl: string }} opts
+ * @returns {{ proc: import('child_process').ChildProcess }}
+ */
+export function createFfmpegFileToIcecast({ filePath, icecastDestUrl }) {
+    const src = String(filePath || '').trim();
+    const dest = String(icecastDestUrl || '').trim();
+    if (!src) {
+        throw new Error('ffmpeg file→icecast requires a local file path');
+    }
+    if (!/^icecast:\/\//i.test(dest)) {
+        throw new Error('ffmpeg file→icecast requires an icecast:// destination');
+    }
+    const af = ffmpegAudioFilter();
+    const args = [
+        '-hide_banner',
+        '-loglevel',
+        ffmpegVerbose() ? 'info' : 'warning',
+        // Real-time pace so the Icecast live edge tracks wall clock.
+        '-re',
+        '-fflags',
+        '+genpts+igndts+discardcorrupt',
+        '-avoid_negative_ts',
+        'make_zero',
+        '-i',
+        src,
+        '-vn',
+        '-sn',
+        '-af',
+        af,
+        '-c:a',
+        'libmp3lame',
+        '-b:a',
+        '128k',
+        '-ar',
+        '44100',
+        '-f',
+        'mp3',
+        dest,
+    ];
+    const proc = spawn('ffmpeg', args, {
+        stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    proc.on('error', (err) => {
+        console.error('[music] ffmpeg spawn failed (is `ffmpeg` installed and on PATH?):', err.message);
+    });
+    attachFfmpegStderr(proc, { sourceLabel: 'file' });
+    return { proc };
+}
