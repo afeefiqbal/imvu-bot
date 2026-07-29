@@ -201,11 +201,27 @@ export function createVibeverseRoomPlayer(opts) {
     /** When the queue is empty and armed, fetch a random READY/trending track. */
     const maybeEnqueueAutoplayTrack = async () => {
         if (queue.peek()) return true;
-        if (paused) return false;
+        if (paused) {
+            console.log(`[music] autoplay skip (${roomId}): paused`);
+            return false;
+        }
         // Default on for VibeVerse idle fill. Set MUSIC_AUTOPLAY=0 to disable.
-        if (!envFlagTrue('MUSIC_AUTOPLAY', true)) return false;
-        if (!autoplayArmed) return false;
-        if (!roomAllowedForAutoplay(roomId)) return false;
+        if (!envFlagTrue('MUSIC_AUTOPLAY', true)) {
+            console.warn(
+                `[music] autoplay skip (${roomId}): MUSIC_AUTOPLAY is off — set MUSIC_AUTOPLAY=1 in .env`,
+            );
+            return false;
+        }
+        if (!autoplayArmed) {
+            console.log(`[music] autoplay skip (${roomId}): not armed (need !play/!add first)`);
+            return false;
+        }
+        if (!roomAllowedForAutoplay(roomId)) {
+            console.warn(
+                `[music] autoplay skip (${roomId}): room not in MUSIC_AUTOPLAY_ROOMS`,
+            );
+            return false;
+        }
         if (autoplayFailStreak >= 5) {
             console.warn(
                 `[music] autoplay paused in ${roomId} after ${autoplayFailStreak} failed picks`,
