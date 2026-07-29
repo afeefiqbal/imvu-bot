@@ -50,10 +50,11 @@ function roomAllowedForAutoplay(roomId) {
  *   botName?: string,
  *   page?: object | null,
  *   sessionClient?: object | null,
+ *   onAnnounce?: (text: string) => void | Promise<void>,
  * }} opts
  */
 export function createVibeverseRoomPlayer(opts) {
-    const { roomId, apiBaseUrl, botName, page, sessionClient } = opts;
+    const { roomId, apiBaseUrl, botName, page, sessionClient, onAnnounce } = opts;
     const queue = createTrackQueue();
 
     let playing = false;
@@ -64,6 +65,8 @@ export function createVibeverseRoomPlayer(opts) {
     let tempCleanup = null;
     /** @type {ReturnType<typeof setTimeout> | null} */
     let endTimer = null;
+    /** @type {ReturnType<typeof setTimeout> | null} */
+    let autoplayRetryTimer = null;
     /** @type {Promise<void>} */
     let drainTail = Promise.resolve();
     let generation = 0;
@@ -80,6 +83,37 @@ export function createVibeverseRoomPlayer(opts) {
             clearTimeout(endTimer);
             endTimer = null;
         }
+    };
+
+    const clearAutoplayRetry = () => {
+        if (autoplayRetryTimer) {
+            clearTimeout(autoplayRetryTimer);
+            autoplayRetryTimer = null;
+        }
+    };
+
+    const scheduleAutoplayRetry = () => {
+        clearAutoplayRetry();
+        if (!autoplayArmed || paused) return;
+        const ms = Math.max(
+            5000,
+            parseInt(String(process.env.MUSIC_AUTOPLAY_RETRY_MS || '15000'), 10) || 15000,
+        );
+        autoplayRetryTimer = setTimeout(() => {
+            autoplayRetryTimer = null;
+            if (!autoplayArmed || paused) return;
+            if (playing || ffProc || queue.getCurrent() || queue.peek()) return;
+            console.log(`[music] autoplay retry (${roomId})`);
+            void enqueueDrain();
+        }, ms);
+    };
+
+    const announce = (text) => {
+        const msg = String(text || '').trim();
+        if (!msg || typeof onAnnounce !== 'function') return;
+        void Promise.resolve(onAnnounce(msg)).catch((e) => {
+            console.warn('[music] autoplay announce:', e?.message || e);
+        });
     };
 
     const clearTempFile = () => {
@@ -154,6 +188,7 @@ export function createVibeverseRoomPlayer(opts) {
         }
         autoplayArmed = false;
         autoplayFailStreak = 0;
+        clearAutoplayRetry();
     };
 
     const rememberAutoplayId = (trackId) => {
@@ -175,19 +210,31 @@ export function createVibeverseRoomPlayer(opts) {
             console.warn(
                 `[music] autoplay paused in ${roomId} after ${autoplayFailStreak} failed picks`,
             );
+            scheduleAutoplayRetry();
             return false;
         }
 
-        const pick = await fetchRandomVibeversePlayable({ excludeIds: recentAutoplayIds });
+        console.log(`[music] autoplay filling empty queue (${roomId})…`);
+        let pick = null;
+        try {
+            pick = await fetchRandomVibeversePlayable({ excludeIds: recentAutoplayIds });
+        } catch (e) {
+            console.warn(`[music] autoplay fetch failed (${roomId}):`, e?.message || e);
+            autoplayFailStreak += 1;
+            scheduleAutoplayRetry();
+            return false;
+        }
         if (!pick?.streamUrl) {
             autoplayFailStreak += 1;
             console.warn(`[music] autoplay: no playable track for ${roomId}`);
+            scheduleAutoplayRetry();
             return false;
         }
 
         autoplayFailStreak = 0;
+        clearAutoplayRetry();
         rememberAutoplayId(pick.trackId);
-        console.log(`[music] autoplay → “${pick.title}” (${roomId})`);
+        console.log(`[music] idle autoplay (${roomId}): ${pick.title}`);
         queue.enqueue({
             trackId: pick.trackId,
             title: pick.title,
@@ -521,14 +568,23 @@ export function createVibeverseRoomPlayer(opts) {
             }
             return applied;
         }
+        if (track?.autoplay) {
+            const label = [track.title, track.artistName].filter(Boolean).join(' — ');
+            announce(`Now playing: ${label || track.title || 'Track'}`);
+        }
         return { ok: true, track };
     };
 
     const enqueueDrain = () => {
         const run = async () => {
-            if (paused) return;
-            if (queue.getCurrent() && playing && ffProc) return;
-            await playCurrentOrNext();
+            try {
+                if (paused) return;
+                if (queue.getCurrent() && playing && ffProc) return;
+                await playCurrentOrNext();
+            } catch (e) {
+                console.warn(`[music] drain error (${roomId}):`, e?.message || e);
+                scheduleAutoplayRetry();
+            }
         };
         const next = drainTail.then(run, run);
         drainTail = next.catch(() => {});

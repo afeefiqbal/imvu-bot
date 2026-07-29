@@ -82,11 +82,17 @@ export async function resolveVibeversePlayable(query) {
  *   artworkUrl?: string,
  *   durationMs?: number,
  * }} track
+ * @param {{ waitMs?: number }} [opts]
+ *   `waitMs: 0` = never poll for PREPARING (autoplay). Default waits up to 90s.
  * @returns {Promise<VibeversePlayable | VibeversePending | null>}
  */
-export async function playVibeverseTrack(track) {
+export async function playVibeverseTrack(track, opts = {}) {
     const base = apiBase();
     if (!base || !track?.id) return null;
+    const waitMs =
+        opts.waitMs != null
+            ? Math.max(0, Number(opts.waitMs) || 0)
+            : 90_000;
 
     const playRes = await axios.post(
         `${base}/play`,
@@ -126,8 +132,8 @@ export async function playVibeverseTrack(track) {
         status === 'DOWNLOADING' ||
         status === 'PENDING';
 
-    if (needsWait) {
-        const ready = await waitForVibeverseReady(trackId, 90_000);
+    if (needsWait && waitMs > 0) {
+        const ready = await waitForVibeverseReady(trackId, waitMs);
         if (ready?.streamUrl) {
             streamUrl = ready.streamUrl;
             status = 'READY';
@@ -136,7 +142,9 @@ export async function playVibeverseTrack(track) {
 
     if (!isPlayableAudioUrl(streamUrl) || isProgressiveExtractorUrl(streamUrl)) {
         // Track exists; durable cache just isn't ready yet — not a "not found".
-        console.warn(`[vibeverse] no durable stream for ${trackId} (status=${status})`);
+        if (waitMs > 0) {
+            console.warn(`[vibeverse] no durable stream for ${trackId} (status=${status})`);
+        }
         return { pending: true, trackId, title };
     }
 
@@ -186,7 +194,8 @@ function shuffleInPlace(arr) {
 
 /**
  * Pick a random playable track for idle autoplay.
- * Prefers VibeVerse READY catalog downloads (already cached), then trending, then search.
+ * Prefers VibeVerse READY catalog downloads (already cached), then trending.
+ * Never waits on PREPARING — skip cold tracks so the room doesn't go silent for minutes.
  *
  * @param {{ excludeIds?: Iterable<string> }} [opts]
  * @returns {Promise<VibeversePlayable | null>}
@@ -198,62 +207,95 @@ export async function fetchRandomVibeversePlayable(opts = {}) {
     const exclude = new Set(
         [...(opts.excludeIds || [])].map((id) => String(id || '').trim()).filter(Boolean),
     );
+    const maxTries = Math.max(
+        3,
+        parseInt(String(process.env.MUSIC_AUTOPLAY_MAX_TRIES || '12'), 10) || 12,
+    );
+    let tries = 0;
 
-    /** @param {object[]} candidates */
-    const tryCandidates = async (candidates) => {
+    /** @param {object[]} candidates @param {string} source */
+    const tryCandidates = async (candidates, source) => {
         for (const raw of candidates) {
+            if (tries >= maxTries) return null;
             const id = String(raw?.id || '').trim();
             if (!id || exclude.has(id)) continue;
-            const playable = await playVibeverseTrack(raw);
-            if (playable?.streamUrl) return playable;
+            tries += 1;
+            // Instant only — never block autoplay on a 90s PREPARING poll.
+            const playable = await playVibeverseTrack(raw, { waitMs: 0 });
+            if (playable?.streamUrl) {
+                console.log(`[music] autoplay pick via ${source}: “${playable.title}”`);
+                return playable;
+            }
         }
         return null;
     };
 
+    console.log('[music] autoplay: fetching READY catalog / trending…');
+
     // 1) READY pinned catalog (best for Icecast — already durable).
     const categories = shuffleInPlace([...AUTOPLAY_CATALOG_CATEGORIES]);
-    for (const category of categories.slice(0, 2)) {
+    for (const category of categories) {
+        if (tries >= maxTries) break;
         try {
-            const page = 1 + Math.floor(Math.random() * 3);
+            const page = 1 + Math.floor(Math.random() * 4);
             const res = await axios.get(`${base}/catalog/downloads`, {
                 params: { category, limit: 24, page },
-                timeout: 15_000,
+                timeout: 12_000,
                 validateStatus: () => true,
             });
             if (res.status < 400 && Array.isArray(res.data?.items) && res.data.items.length) {
                 const tracks = shuffleInPlace(
                     res.data.items.map((row) => row?.track).filter((t) => t?.id),
                 );
-                const hit = await tryCandidates(tracks);
+                const hit = await tryCandidates(tracks, `catalog:${category}`);
                 if (hit) return hit;
+            } else {
+                console.warn(
+                    `[vibeverse] autoplay catalog ${category}: HTTP ${res.status} items=${res.data?.items?.length ?? 0}`,
+                );
             }
         } catch (e) {
             console.warn(`[vibeverse] autoplay catalog ${category}:`, e?.message || e);
         }
     }
 
-    // 2) Trending list.
+    // 2) Trending list (instant READY only).
     try {
         const res = await axios.get(`${base}/tracks/trending`, {
-            timeout: 15_000,
+            timeout: 12_000,
             validateStatus: () => true,
         });
         const tracks = Array.isArray(res.data) ? res.data : [];
         if (tracks.length) {
-            const hit = await tryCandidates(shuffleInPlace([...tracks]));
+            const hit = await tryCandidates(shuffleInPlace([...tracks]), 'trending');
             if (hit) return hit;
         }
     } catch (e) {
         console.warn('[vibeverse] autoplay trending:', e?.message || e);
     }
 
-    // 3) Random generic search.
+    // 3) One quick search — still no long PREPARING wait.
     const queries = shuffleInPlace([...AUTOPLAY_FALLBACK_QUERIES]);
-    for (const q of queries.slice(0, 2)) {
-        const hit = await resolveVibeversePlayable(q);
-        if (hit?.streamUrl && !exclude.has(String(hit.trackId || ''))) return hit;
+    for (const q of queries.slice(0, 1)) {
+        try {
+            const search = await axios.get(`${base}/search`, {
+                params: { q, source: 'youtube' },
+                timeout: 12_000,
+                validateStatus: () => true,
+            });
+            const tracks = Array.isArray(search.data?.tracks) ? search.data.tracks : [];
+            const top = search.data?.top ? [search.data.top, ...tracks] : tracks;
+            const hit = await tryCandidates(
+                top.filter((t) => t?.id),
+                `search:${q}`,
+            );
+            if (hit) return hit;
+        } catch (e) {
+            console.warn(`[vibeverse] autoplay search “${q}”:`, e?.message || e);
+        }
     }
 
+    console.warn(`[music] autoplay: no READY stream after ${tries} tries`);
     return null;
 }
 

@@ -284,6 +284,7 @@ function createVibeverseCommandHandler({
         botName,
         page,
         sessionClient,
+        onAnnounce: (text) => sendMessage(String(text || '').trim()),
     });
 
     let mediaSyncTail = Promise.resolve();
