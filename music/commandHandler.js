@@ -7,10 +7,15 @@ import { cacheBustHttpsStreamUrl } from './loadStreamConfig.js';
 import { probePublicStreamForImvu, urlLooksLikeNgrokFree, isImvuBlockingStreamProbe } from './verifyImvuStreamUrl.js';
 import {
     resolveVibeversePlayable,
-    formatVibeverseResolveFailure,
     vibeverseEnabled,
 } from './vibeverseClient.js';
 import { createVibeverseRoomPlayer } from './vibeverseRoomPlayer.js';
+
+function formatVibeverseLookupFailure(verb = 'play') {
+    const again = verb === 'add' ? '!add' : '!play';
+    if (!vibeverseEnabled()) return 'Music lookup is not configured.';
+    return `Could not find or prepare that track. Try ${again} again in a moment.`;
+}
 
 function roomMediaNotModerator(result) {
     const reason = String(result?.reason || '');
@@ -391,12 +396,11 @@ function createVibeverseCommandHandler({
             player.cutForReplace();
 
             await reply(`Looking up “${rest}”…`);
-            const resolved = await resolveVibeversePlayable(rest);
-            if (!resolved?.ok) {
-                await reply(formatVibeverseResolveFailure(resolved || { ok: false, reason: 'not-ready' }, 'play'));
+            const one = await resolveVibeversePlayable(rest);
+            if (!one?.streamUrl) {
+                await reply(formatVibeverseLookupFailure('play'));
                 return true;
             }
-            const one = resolved.track;
 
             await queueMediaSync(async () => {
                 const result = await player.playNow(one);
@@ -421,12 +425,11 @@ function createVibeverseCommandHandler({
             }
 
             await reply(`Looking up “${rest}”…`);
-            const resolved = await resolveVibeversePlayable(rest);
-            if (!resolved?.ok) {
-                await reply(formatVibeverseResolveFailure(resolved || { ok: false, reason: 'not-ready' }, 'add'));
+            const one = await resolveVibeversePlayable(rest);
+            if (!one?.streamUrl) {
+                await reply(formatVibeverseLookupFailure('add'));
                 return true;
             }
-            const one = resolved.track;
 
             const wasActive = hasActivePlayback(player);
             await queueMediaSync(async () => {
