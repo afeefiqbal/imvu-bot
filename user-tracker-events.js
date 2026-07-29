@@ -22,6 +22,11 @@ import {
     messageStartsNewSivaThread,
     stripSivaCharacterAiTriggers,
 } from './sivaCharacterAi.js';
+import {
+    extractMusicCommandsFromAiReply,
+    resolveMusicIntentCommand,
+    runMusicCommandsFromAi,
+} from './music/aiMusicBridge.js';
 
 export const createImvuHandleResolver = ({ page, sessionClient }) => {
     const imvuAvNameCache = new Map();
@@ -817,6 +822,25 @@ export const createIncomingMessageHandler = (ctx) => {
                             );
                             void (async () => {
                                 try {
+                                    // Clear music intents via sugar/dot ("skip this", "play amsham")
+                                    // run immediately — no need to wait for the model to suggest !skip.
+                                    if (
+                                        sivaHit &&
+                                        typeof ctx.roomChatCommandHandler === 'function'
+                                    ) {
+                                        const intentCmd = resolveMusicIntentCommand(sivaMessage);
+                                        if (intentCmd) {
+                                            const ran = await runMusicCommandsFromAi(
+                                                ctx,
+                                                [intentCmd],
+                                                { senderLabel, senderId },
+                                            );
+                                            if (ran > 0) {
+                                                return;
+                                            }
+                                        }
+                                    }
+
                                     const res = sivaHit
                                         ? await axios.post(`${ctx.API_BASE_URL}/api/siva-chat`, {
                                               message: sivaMessage,
@@ -846,10 +870,25 @@ export const createIncomingMessageHandler = (ctx) => {
                                         if (sivaHit) {
                                             markSivaSessionActive(ctx.roomId, senderId);
                                         }
-                                        await ctx.sendMessage(reply.trim(), {
+                                        const replyText = reply.trim();
+                                        await ctx.sendMessage(replyText, {
                                             participantUsername: senderLabel,
                                             participantAvatarId: avatarForLog ?? undefined,
                                         });
+                                        // Model often embeds !play / !skip in the reply — execute them.
+                                        if (
+                                            sivaHit &&
+                                            typeof ctx.roomChatCommandHandler === 'function'
+                                        ) {
+                                            const fromReply =
+                                                extractMusicCommandsFromAiReply(replyText);
+                                            if (fromReply.length) {
+                                                await runMusicCommandsFromAi(ctx, fromReply, {
+                                                    senderLabel,
+                                                    senderId,
+                                                });
+                                            }
+                                        }
                                     } else {
                                         console.warn(
                                             `[AI-CHAT] empty reply from ${sivaHit ? '/api/siva-chat' : '/api/lurk'} ` +
