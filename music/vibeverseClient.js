@@ -44,41 +44,93 @@ function readyWaitMs() {
 }
 
 /**
- * @param {string} query
- * @returns {Promise<{
+ * @typedef {{
  *   trackId: string,
  *   title: string,
  *   artistName: string,
  *   artworkUrl?: string,
  *   durationMs: number,
  *   streamUrl: string,
- * } | null>}
+ * }} VibeversePlayable
+ */
+
+/**
+ * @typedef {{
+ *   ok: true,
+ *   track: VibeversePlayable,
+ * } | {
+ *   ok: false,
+ *   reason: 'not-found' | 'play-failed' | 'download-failed' | 'not-ready' | 'network' | 'disabled',
+ *   detail?: string,
+ *   title?: string,
+ * }} VibeverseResolveResult
+ */
+
+/**
+ * @param {string} query
+ * @returns {Promise<VibeverseResolveResult>}
  */
 export async function resolveVibeversePlayable(query) {
     const base = apiBase();
-    if (!base) return null;
+    if (!base) return { ok: false, reason: 'disabled' };
     const q = String(query || '').trim();
-    if (!q) return null;
+    if (!q) return { ok: false, reason: 'not-found' };
 
-    const search = await axios.get(`${base}/search`, {
-        params: { q, source: 'youtube' },
-        timeout: 20_000,
-        validateStatus: () => true,
-    });
-    if (search.status >= 400 || !search.data) {
-        console.warn(`[vibeverse] search HTTP ${search.status}`);
-        return null;
+    try {
+        const search = await axios.get(`${base}/search`, {
+            params: { q, source: 'youtube' },
+            timeout: 20_000,
+            validateStatus: () => true,
+        });
+        if (search.status >= 400 || !search.data) {
+            console.warn(`[vibeverse] search HTTP ${search.status}`);
+            return {
+                ok: false,
+                reason: 'play-failed',
+                detail: `search HTTP ${search.status}`,
+            };
+        }
+
+        const tracks = Array.isArray(search.data.tracks) ? search.data.tracks : [];
+        const track =
+            search.data.top ||
+            tracks.find((t) => t?.provider === 'YOUTUBE') ||
+            tracks[0] ||
+            null;
+        if (!track?.id) {
+            console.warn(`[vibeverse] search found no tracks for “${q.slice(0, 80)}”`);
+            return { ok: false, reason: 'not-found' };
+        }
+
+        return playVibeverseTrack(track);
+    } catch (e) {
+        console.warn(`[vibeverse] search/play network error:`, e?.message || e);
+        return { ok: false, reason: 'network', detail: e?.message || 'network error' };
     }
+}
 
-    const tracks = Array.isArray(search.data.tracks) ? search.data.tracks : [];
-    const track =
-        search.data.top ||
-        tracks.find((t) => t?.provider === 'YOUTUBE') ||
-        tracks[0] ||
-        null;
-    if (!track?.id) return null;
-
-    return playVibeverseTrack(track);
+/**
+ * Chat-friendly line for a failed resolve (keeps !play / !add messaging consistent).
+ * @param {Extract<VibeverseResolveResult, { ok: false }>} result
+ * @param {'play' | 'add'} [verb]
+ */
+export function formatVibeverseResolveFailure(result, verb = 'play') {
+    const again = verb === 'add' ? '!add' : '!play';
+    switch (result?.reason) {
+        case 'not-found':
+            return 'Could not find that track.';
+        case 'download-failed':
+            return `VibeVerse could not download that track${result.detail ? ` (${result.detail})` : ''}. Try another version or ${again} again later.`;
+        case 'network':
+            return 'Music lookup failed (network). Try again in a moment.';
+        case 'disabled':
+            return 'Music lookup is not configured.';
+        case 'play-failed':
+            return `Could not start that track on VibeVerse. Try ${again} again in a moment.`;
+        case 'not-ready':
+        default:
+            return `VibeVerse has not finished preparing that track yet. Try ${again} again in a moment.`;
+    }
 }
 
 /**
@@ -89,35 +141,72 @@ export async function resolveVibeversePlayable(query) {
  *   artworkUrl?: string,
  *   durationMs?: number,
  * }} track
+ * @returns {Promise<VibeverseResolveResult>}
  */
 export async function playVibeverseTrack(track) {
     const base = apiBase();
-    if (!base || !track?.id) return null;
+    if (!base || !track?.id) return { ok: false, reason: 'not-found' };
 
-    const playRes = await axios.post(
-        `${base}/play`,
-        {
-            trackId: track.id,
-            title: track.title,
-            artistName: track.artistName,
-            artworkUrl: track.artworkUrl,
-            durationMs: track.durationMs,
-            source: 'QUEUE',
-            // Prefer mp3 when VibeVerse can provide it; m4a is re-encoded via Icecast.
-            format: 'mp3',
-            container: 'mp3',
-            preferMp3: true,
-        },
-        {
-            timeout: 45_000,
-            validateStatus: () => true,
-            headers: { 'Content-Type': 'application/json' },
-        },
-    );
+    const titleHint = String(track.title || '').trim();
+
+    /** Prefer an already-cached R2 file before / after /play. */
+    const tryStatusDurable = async (trackId) => {
+        const st = await fetchVibeverseStatus(trackId);
+        if (st?.failed) {
+            return { failed: true, error: st.error };
+        }
+        const url = String(st?.streamUrl || '').trim();
+        if (isVibeverseDurableStreamUrl(url)) {
+            return { streamUrl: url, status: String(st.status || 'READY').toUpperCase(), data: st };
+        }
+        return null;
+    };
+
+    let playRes;
+    try {
+        playRes = await axios.post(
+            `${base}/play`,
+            {
+                trackId: track.id,
+                title: track.title,
+                artistName: track.artistName,
+                artworkUrl: track.artworkUrl,
+                durationMs: track.durationMs,
+                source: 'QUEUE',
+                // Prefer mp3 when VibeVerse can provide it; m4a is re-encoded via Icecast.
+                format: 'mp3',
+                container: 'mp3',
+                preferMp3: true,
+            },
+            {
+                timeout: 45_000,
+                validateStatus: () => true,
+                headers: { 'Content-Type': 'application/json' },
+            },
+        );
+    } catch (e) {
+        console.warn(`[vibeverse] play network error:`, e?.message || e);
+        const cached = await tryStatusDurable(track.id);
+        if (cached?.streamUrl) {
+            return finishPlayable(track, track, cached.streamUrl);
+        }
+        return { ok: false, reason: 'network', detail: e?.message || 'play failed', title: titleHint };
+    }
 
     if (playRes.status >= 400 || !playRes.data) {
         console.warn(`[vibeverse] play HTTP ${playRes.status}:`, playRes.data?.error || playRes.data || '');
-        return null;
+        // Song may already be cached even when /play errors (e.g. extractor busy).
+        const cached = await tryStatusDurable(track.id);
+        if (cached?.streamUrl) {
+            console.log(`[vibeverse] /play failed but durable cache hit for ${track.id}`);
+            return finishPlayable(track, track, cached.streamUrl);
+        }
+        return {
+            ok: false,
+            reason: 'play-failed',
+            detail: `play HTTP ${playRes.status}`,
+            title: titleHint,
+        };
     }
 
     let streamUrl = String(playRes.data.streamUrl || '').trim();
@@ -126,6 +215,27 @@ export async function playVibeverseTrack(track) {
     const trackId = String(resolvedTrack.id || track.id);
     const cached = playRes.data.cached === true;
     const message = String(playRes.data.message || '');
+
+    // Already have a usable file URL — skip the wait.
+    if (isVibeverseDurableStreamUrl(streamUrl) && status !== 'PREPARING' && status !== 'DOWNLOADING') {
+        return finishPlayable(resolvedTrack, track, streamUrl);
+    }
+
+    // Cache may already be READY on /status while /play still returns a progressive URL.
+    const pre = await tryStatusDurable(trackId);
+    if (pre?.failed) {
+        console.warn(`[vibeverse] download failed for ${trackId}`);
+        return {
+            ok: false,
+            reason: 'download-failed',
+            detail: String(pre.error || 'download failed'),
+            title: String(resolvedTrack.title || titleHint || ''),
+        };
+    }
+    if (pre?.streamUrl) {
+        console.log(`[vibeverse] durable cache already ready for ${trackId}`);
+        return finishPlayable(resolvedTrack, track, pre.streamUrl);
+    }
 
     const needsDurableWait =
         !isVibeverseDurableStreamUrl(streamUrl) ||
@@ -143,7 +253,12 @@ export async function playVibeverseTrack(track) {
         const ready = await waitForVibeverseReady(trackId, readyWaitMs(), { preferDurable: true });
         if (ready?.failed) {
             console.warn(`[vibeverse] download failed for ${trackId}`);
-            return null;
+            return {
+                ok: false,
+                reason: 'download-failed',
+                detail: String(ready.error || 'download failed'),
+                title: String(resolvedTrack.title || titleHint || ''),
+            };
         }
         if (ready?.streamUrl && isVibeverseDurableStreamUrl(ready.streamUrl)) {
             streamUrl = String(ready.streamUrl).trim();
@@ -152,30 +267,52 @@ export async function playVibeverseTrack(track) {
             console.warn(
                 `[vibeverse] timed out waiting for durable stream for ${trackId} (last status=${status})`,
             );
-            return null;
+            return {
+                ok: false,
+                reason: 'not-ready',
+                detail: `last status=${status || '?'}`,
+                title: String(resolvedTrack.title || titleHint || ''),
+            };
         }
     }
 
     if (!isVibeverseDurableStreamUrl(streamUrl)) {
         console.warn(`[vibeverse] no durable stream for ${trackId} (status=${status})`);
-        return null;
+        return {
+            ok: false,
+            reason: 'not-ready',
+            detail: `status=${status || '?'}`,
+            title: String(resolvedTrack.title || titleHint || ''),
+        };
     }
 
+    return finishPlayable(resolvedTrack, track, streamUrl);
+}
+
+/**
+ * @param {object} resolvedTrack
+ * @param {object} fallbackTrack
+ * @param {string} streamUrl
+ * @returns {Extract<VibeverseResolveResult, { ok: true }>}
+ */
+function finishPlayable(resolvedTrack, fallbackTrack, streamUrl) {
+    const trackId = String(resolvedTrack.id || fallbackTrack.id);
     if (/\.m4a(\?|$)/i.test(streamUrl) || /audio\/(mp4|aac|x-m4a)/i.test(streamUrl)) {
         console.warn(`[vibeverse] stream is m4a/AAC — re-encoding to Icecast MP3 for IMVU.`);
     }
-
     console.log(
-        `[music] stream URL for “${String(resolvedTrack.title || track.title || trackId)}”: ${streamUrl}`,
+        `[music] stream URL for “${String(resolvedTrack.title || fallbackTrack.title || trackId)}”: ${streamUrl}`,
     );
-
     return {
-        trackId,
-        title: String(resolvedTrack.title || track.title || 'Track'),
-        artistName: String(resolvedTrack.artistName || track.artistName || ''),
-        artworkUrl: resolvedTrack.artworkUrl || track.artworkUrl,
-        durationMs: Number(resolvedTrack.durationMs || track.durationMs || 0) || 0,
-        streamUrl,
+        ok: true,
+        track: {
+            trackId,
+            title: String(resolvedTrack.title || fallbackTrack.title || 'Track'),
+            artistName: String(resolvedTrack.artistName || fallbackTrack.artistName || ''),
+            artworkUrl: resolvedTrack.artworkUrl || fallbackTrack.artworkUrl,
+            durationMs: Number(resolvedTrack.durationMs || fallbackTrack.durationMs || 0) || 0,
+            streamUrl,
+        },
     };
 }
 
@@ -185,13 +322,34 @@ export async function playVibeverseTrack(track) {
  * @param {{ title?: string, artistName?: string, artworkUrl?: string, durationMs?: number }} [hint]
  */
 export async function refreshVibeverseStream(trackId, hint = {}) {
-    return playVibeverseTrack({
+    const result = await playVibeverseTrack({
         id: trackId,
         title: hint.title,
         artistName: hint.artistName,
         artworkUrl: hint.artworkUrl,
         durationMs: hint.durationMs,
     });
+    return result.ok ? result.track : null;
+}
+
+async function fetchVibeverseStatus(trackId) {
+    const base = apiBase();
+    if (!base || !trackId) return null;
+    try {
+        const res = await axios.get(`${base}/tracks/${encodeURIComponent(trackId)}/status`, {
+            timeout: 10_000,
+            validateStatus: () => true,
+        });
+        if (res.status >= 400 || !res.data) return null;
+        const status = String(res.data.status || '').toUpperCase();
+        if (status === 'FAILED') {
+            return { failed: true, status: 'FAILED', error: res.data.error, streamUrl: '' };
+        }
+        return res.data;
+    } catch (e) {
+        console.warn('[vibeverse] status:', e?.message || e);
+        return null;
+    }
 }
 
 /**
@@ -200,24 +358,24 @@ export async function refreshVibeverseStream(trackId, hint = {}) {
  * @param {{ preferDurable?: boolean }} [opts]
  */
 async function waitForVibeverseReady(trackId, timeoutMs = 90_000, opts = {}) {
-    const base = apiBase();
     const preferDurable = opts.preferDurable !== false;
     const started = Date.now();
     let lastLog = 0;
+    let first = true;
     while (Date.now() - started < timeoutMs) {
-        await new Promise((r) => setTimeout(r, 1000));
+        if (!first) {
+            await new Promise((r) => setTimeout(r, 1000));
+        }
+        first = false;
         try {
-            const res = await axios.get(`${base}/tracks/${encodeURIComponent(trackId)}/status`, {
-                timeout: 10_000,
-                validateStatus: () => true,
-            });
-            if (res.status >= 400 || !res.data) continue;
-            const status = String(res.data.status || '').toUpperCase();
-            if (status === 'FAILED') {
-                console.warn(`[vibeverse] download failed: ${res.data.error || 'unknown'}`);
-                return { failed: true, status: 'FAILED', error: res.data.error };
+            const data = await fetchVibeverseStatus(trackId);
+            if (!data) continue;
+            if (data.failed) {
+                console.warn(`[vibeverse] download failed: ${data.error || 'unknown'}`);
+                return { failed: true, status: 'FAILED', error: data.error };
             }
-            const url = String(res.data.streamUrl || '').trim();
+            const status = String(data.status || '').toUpperCase();
+            const url = String(data.streamUrl || '').trim();
             const now = Date.now();
             if (now - lastLog > 10_000) {
                 lastLog = now;
@@ -229,7 +387,7 @@ async function waitForVibeverseReady(trackId, timeoutMs = 90_000, opts = {}) {
             if (!isPlayableAudioUrl(url)) continue;
             if (preferDurable && !isVibeverseDurableStreamUrl(url)) continue;
             if (status === 'READY' || isVibeverseDurableStreamUrl(url)) {
-                return res.data;
+                return data;
             }
         } catch (e) {
             console.warn('[vibeverse] status poll:', e?.message || e);

@@ -173,7 +173,7 @@ export function createVibeverseRoomPlayer(opts) {
                 durationMs: track.durationMs,
             });
             if (gen !== generation) return { ok: false, reason: 'stale' };
-            if (fresh) Object.assign(track, fresh);
+            if (fresh?.ok && fresh.track) Object.assign(track, fresh.track);
         }
 
         if (!track.streamUrl) {
