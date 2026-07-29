@@ -43,8 +43,8 @@ async function replyRoomMediaFailure(reply, result, track = null) {
     if (reason === 'mount-not-live' || reason === 'ffmpeg-spawn') {
         await reply(
             label
-                ? `Found “${label}”, but the live stream did not start. Check Icecast / tunnel and try again.`
-                : 'The live stream did not start. Check Icecast / tunnel and try again.',
+                ? `Found “${label}”, but the live stream did not start. Try again in a moment.`
+                : 'The live stream did not start. Try again in a moment.',
         );
         return;
     }
