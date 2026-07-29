@@ -80,6 +80,10 @@ export async function playVibeverseTrack(track) {
             artworkUrl: track.artworkUrl,
             durationMs: track.durationMs,
             source: 'QUEUE',
+            // IMVU room radio plays MP3/mpeg reliably; m4a/AAC often sets URL but stays silent.
+            format: 'mp3',
+            container: 'mp3',
+            preferMp3: true,
         },
         {
             timeout: 45_000,
@@ -110,6 +114,12 @@ export async function playVibeverseTrack(track) {
     if (!isPlayableAudioUrl(streamUrl)) {
         console.warn(`[vibeverse] no playable stream for ${trackId} (status=${status})`);
         return null;
+    }
+
+    if (/\.m4a(\?|$)/i.test(streamUrl) || /audio\/(mp4|aac|x-m4a)/i.test(streamUrl)) {
+        console.warn(
+            `[vibeverse] stream is m4a/AAC — IMVU radio often cannot play this. Prefer mp3 from VibeVerse.`,
+        );
     }
 
     console.log(

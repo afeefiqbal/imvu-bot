@@ -75,6 +75,25 @@ export async function processSyncActions(data, ctx) {
         }
     }
 
+    if (Array.isArray(data.pending_join_rooms) && typeof ctx.startRoom === 'function') {
+        for (const raw of data.pending_join_rooms) {
+            const roomId = trackerRoomKey(raw);
+            if (!roomId) continue;
+            if (ctx.roomClients?.has(roomId)) {
+                logger.log(`${logPrefix} join skipped — already in room ${roomId}`);
+                continue;
+            }
+            logger.log(`${logPrefix} joining room ${roomId} (pending_join_rooms)`);
+            try {
+                await ctx.startRoom(roomId);
+            } catch (error) {
+                logger.warn(
+                    `${logPrefix} pending join failed room=${roomId}: ${error?.message || error}`
+                );
+            }
+        }
+    }
+
     if (Array.isArray(data.pending_kicks)) {
         for (const kick of data.pending_kicks) {
             if (!kick || typeof kick !== 'object') continue;

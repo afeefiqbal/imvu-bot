@@ -1491,11 +1491,13 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         if (!raw) return raw;
         try {
             const parsed = new URL(raw);
-            parsed.search = '';
             parsed.hash = '';
+            // Only strip Icecast cache-bust params. Keep signed CDN/R2/S3 query strings
+            // (X-Amz-*, Signature, …) — clearing search entirely breaks VibeVerse playback.
+            parsed.searchParams.delete('_play');
             return parsed.toString();
         } catch {
-            return raw.split('?')[0].split('#')[0];
+            return raw.split('#')[0];
         }
     }
 

@@ -42,7 +42,7 @@ async function replyRoomMediaFailure(reply, result, track = null) {
     );
 }
 
-const HELP_VIBEVERSE = `Music: !play/!p · !add/!a · !queue/!q · !skip/!next · !stop · !pause · !resume · !music`;
+const HELP_VIBEVERSE = `Music: !play/!p · !add/!a · !queue/!q · !skip/!next · !stop · !pause · !resume · !music · radio https://vibeverse-web.vvpz.workers.dev/radio`;
 const HELP_ICECAST = `Music: !play/!p · !add/!a · !queue/!q · !skip · !stop · !pause · !resume · !music · idle playlist is server .env only (not set by chat)`;
 
 function parseCmdLine(text) {
