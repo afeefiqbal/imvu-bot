@@ -389,7 +389,9 @@ function createVibeverseCommandHandler({
             await reply(`Looking up “${rest}”…`);
             const one = await resolveVibeversePlayable(rest);
             if (!one) {
-                await reply('Could not find that track.');
+                await reply(
+                    'VibeVerse has not finished preparing that track yet. Try !play again in a moment.',
+                );
                 return true;
             }
 
@@ -418,7 +420,9 @@ function createVibeverseCommandHandler({
             await reply(`Looking up “${rest}”…`);
             const one = await resolveVibeversePlayable(rest);
             if (!one) {
-                await reply('Could not find that track.');
+                await reply(
+                    'VibeVerse has not finished preparing that track yet. Try !add again in a moment.',
+                );
                 return true;
             }
 

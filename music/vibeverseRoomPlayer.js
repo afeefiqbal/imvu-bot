@@ -1,9 +1,8 @@
 import { createTrackQueue } from './queue.js';
 import { applyRoomMediaStreamUrl, waitForRoomMediaPlayback } from './imvuRoomMediaDom.js';
 import { notifyImvuMusicState } from './notifyImvuMusicApi.js';
-import { playVibeverseTrack, refreshVibeverseStream, isVibeverseDurableStreamUrl } from './vibeverseClient.js';
-import { createFfmpegHttpToIcecast, createFfmpegIcecastPipe } from './ffmpegIcecast.js';
-import { spawnYtDlpAudioStdout } from './ytDlpAudioStdout.js';
+import { playVibeverseTrack, refreshVibeverseStream } from './vibeverseClient.js';
+import { createFfmpegHttpToIcecast } from './ffmpegIcecast.js';
 import { loadStreamConfig, withPerPlayStreamMount } from './loadStreamConfig.js';
 import { withIcecastMountEncodeLock } from './icecastMountLock.js';
 import {
@@ -32,8 +31,6 @@ export function createVibeverseRoomPlayer(opts) {
     let paused = false;
     /** @type {import('child_process').ChildProcess | null} */
     let ffProc = null;
-    /** @type {import('child_process').ChildProcess | null} */
-    let ytdlpProc = null;
     /** @type {ReturnType<typeof setTimeout> | null} */
     let endTimer = null;
     /** @type {Promise<void>} */
@@ -50,12 +47,6 @@ export function createVibeverseRoomPlayer(opts) {
     };
 
     const killFf = () => {
-        if (ytdlpProc) {
-            try {
-                ytdlpProc.kill('SIGKILL');
-            } catch {}
-            ytdlpProc = null;
-        }
         if (!ffProc) return;
         try {
             ffProc.kill('SIGKILL');
@@ -184,12 +175,7 @@ export function createVibeverseRoomPlayer(opts) {
             if (fresh) Object.assign(track, fresh);
         }
 
-        const ytId = String(track.youtubeVideoId || '').trim();
-        const useYtdlp =
-            track.sourceMode === 'ytdlp' ||
-            (!isVibeverseDurableStreamUrl(track.streamUrl) && Boolean(ytId));
-
-        if (!track.streamUrl && !useYtdlp) {
+        if (!track.streamUrl) {
             console.warn('[music] skip unplayable track:', track.title);
             if (gen !== generation) return { ok: false, reason: 'stale' };
             queue.setCurrent(null);
@@ -242,9 +228,7 @@ export function createVibeverseRoomPlayer(opts) {
         const isStale = () => gen !== generation;
 
         console.log(
-            useYtdlp
-                ? `[music] live encode: yt-dlp → Icecast ${mountPath} → ${pub.slice(0, 120)}`
-                : `[music] live encode: source → Icecast ${mountPath} → ${pub.slice(0, 120)}`,
+            `[music] live encode: VibeVerse → Icecast ${mountPath} → ${pub.slice(0, 120)}`,
         );
 
         /** @type {{ ok: boolean, reason?: string, detail?: string }} */
@@ -257,35 +241,19 @@ export function createVibeverseRoomPlayer(opts) {
 
             let proc;
             try {
-                if (useYtdlp) {
-                    const watchUrl = `https://www.youtube.com/watch?v=${ytId}`;
-                    console.log(`[music] VibeVerse file URL missing/unusable — yt-dlp ${watchUrl}`);
-                    const { proc: yp, stdout } = spawnYtDlpAudioStdout(watchUrl);
-                    ytdlpProc = yp;
-                    const pipe = createFfmpegIcecastPipe({ icecastDestUrl: iceDest });
-                    proc = pipe.proc;
-                    stdout.on('error', () => {});
-                    pipe.stdin.on('error', (e) => {
-                        console.warn('[music] FFmpeg stdin:', e?.message || e);
-                    });
-                    stdout.pipe(pipe.stdin);
-                } else {
-                    ({ proc } = createFfmpegHttpToIcecast({
-                        sourceUrl: track.streamUrl,
-                        icecastDestUrl: iceDest,
-                    }));
-                }
+                ({ proc } = createFfmpegHttpToIcecast({
+                    sourceUrl: track.streamUrl,
+                    icecastDestUrl: iceDest,
+                }));
             } catch (e) {
-                console.error('[music] ffmpeg encode failed:', e?.message || e);
+                console.error('[music] ffmpeg http→icecast failed:', e?.message || e);
                 applied = { ok: false, reason: 'ffmpeg-spawn', detail: e?.message || 'ffmpeg failed' };
-                killFf();
                 return;
             }
             if (isStale()) {
                 try {
                     proc.kill('SIGKILL');
                 } catch {}
-                killFf();
                 return;
             }
             ffProc = proc;

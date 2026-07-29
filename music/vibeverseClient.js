@@ -1,8 +1,9 @@
 import axios from 'axios';
 
 /**
- * VibeVerse API client for IMVU room music (Option A).
- * Search → POST /play → signed/progressive stream URL → set as IMVU room media URL.
+ * VibeVerse API client for IMVU room music.
+ * Search → POST /play → wait for durable file URL → ffmpeg → Icecast.
+ * Progressive trycloudflare /stream/ proxies are not used (often 0 bytes from the bot host).
  */
 
 function apiBase() {
@@ -20,7 +21,7 @@ function isPlayableAudioUrl(url) {
     return /^https?:\/\//i.test(String(url));
 }
 
-/** VibeVerse “live stream — caching in background” proxy — often 0 bytes / TLS fail from OCI. */
+/** VibeVerse “live stream — caching in background” proxy — often unusable from OCI. */
 export function isVibeverseProgressiveStreamUrl(url) {
     const u = String(url || '');
     return /\/stream\//i.test(u) && /\.trycloudflare\.com\b/i.test(u);
@@ -32,18 +33,14 @@ export function isVibeverseDurableStreamUrl(url) {
     if (!isPlayableAudioUrl(u) || isVibeverseProgressiveStreamUrl(u)) return false;
     if (/cloudflarestorage\.com|\.r2\.cloudflarestorage\.|\/vibeverse-audio\//i.test(u)) return true;
     if (/\.(mp3|m4a|aac|ogg|opus|wav)(\?|$)/i.test(u)) return true;
-    // Non-proxy https that isn't the progressive tunnel host.
     return /^https:\/\//i.test(u) && !/\.trycloudflare\.com\b/i.test(u);
 }
 
-function youtubeIdFromPlayPayload(playRes, track) {
-    const fromPlay = String(playRes?.youtubeVideoId || '').trim();
-    if (fromPlay) return fromPlay;
-    const id = String(playRes?.track?.id || track?.id || '').trim();
-    const m = /^yt[_-](.+)$/i.exec(id);
-    if (m) return m[1];
-    if (/^[\w-]{6,}$/i.test(id) && !id.includes('://')) return id;
-    return '';
+function readyWaitMs() {
+    return Math.max(
+        15_000,
+        parseInt(String(process.env.VIBEVERSE_READY_WAIT_MS || '90000'), 10) || 90_000,
+    );
 }
 
 /**
@@ -106,7 +103,7 @@ export async function playVibeverseTrack(track) {
             artworkUrl: track.artworkUrl,
             durationMs: track.durationMs,
             source: 'QUEUE',
-            // IMVU room radio plays MP3/mpeg reliably; m4a/AAC often sets URL but stays silent.
+            // Prefer mp3 when VibeVerse can provide it; m4a is re-encoded via Icecast.
             format: 'mp3',
             container: 'mp3',
             preferMp3: true,
@@ -127,77 +124,45 @@ export async function playVibeverseTrack(track) {
     let status = String(playRes.data.status || '').toUpperCase();
     const resolvedTrack = playRes.data.track || track;
     const trackId = String(resolvedTrack.id || track.id);
-    const youtubeVideoId = youtubeIdFromPlayPayload(playRes.data, resolvedTrack);
     const cached = playRes.data.cached === true;
     const message = String(playRes.data.message || '');
 
-    // Progressive trycloudflare /stream/ is often unusable from the bot host (0 bytes / TLS I/O).
-    // Skip a long R2 wait when we can fall back to yt-dlp immediately.
-    const progressiveUncached =
+    const needsDurableWait =
+        !isVibeverseDurableStreamUrl(streamUrl) ||
+        status === 'PREPARING' ||
+        status === 'DOWNLOADING' ||
         (!cached && isVibeverseProgressiveStreamUrl(streamUrl)) ||
         /caching in background/i.test(message);
 
-    if (
-        !isPlayableAudioUrl(streamUrl) ||
-        status === 'PREPARING' ||
-        status === 'DOWNLOADING'
-    ) {
-        const ready = await waitForVibeverseReady(trackId, 45_000, { preferDurable: true });
-        if (ready?.streamUrl) {
-            streamUrl = String(ready.streamUrl).trim();
-            status = String(ready.status || 'READY').toUpperCase();
-        } else if (ready?.failed) {
-            status = 'FAILED';
-        }
-    } else if (progressiveUncached && !isVibeverseDurableStreamUrl(streamUrl)) {
-        // Brief poll in case R2 finishes instantly; otherwise yt-dlp.
+    if (needsDurableWait) {
         console.log(
-            `[vibeverse] progressive/uncached for ${trackId}` +
+            `[vibeverse] waiting for durable file URL for ${trackId}` +
                 (message ? ` (${message})` : '') +
-                (youtubeVideoId ? ' — prefer yt-dlp if no R2 file' : ' — waiting briefly for file URL'),
+                `… up to ${Math.round(readyWaitMs() / 1000)}s`,
         );
-        const ready = await waitForVibeverseReady(
-            trackId,
-            youtubeVideoId ? 4_000 : 25_000,
-            { preferDurable: true },
-        );
+        const ready = await waitForVibeverseReady(trackId, readyWaitMs(), { preferDurable: true });
+        if (ready?.failed) {
+            console.warn(`[vibeverse] download failed for ${trackId}`);
+            return null;
+        }
         if (ready?.streamUrl && isVibeverseDurableStreamUrl(ready.streamUrl)) {
             streamUrl = String(ready.streamUrl).trim();
             status = String(ready.status || 'READY').toUpperCase();
-        } else if (ready?.failed) {
-            status = 'FAILED';
+        } else {
+            console.warn(
+                `[vibeverse] timed out waiting for durable stream for ${trackId} (last status=${status})`,
+            );
+            return null;
         }
     }
 
-    const durable = isVibeverseDurableStreamUrl(streamUrl);
-    const progressive = isVibeverseProgressiveStreamUrl(streamUrl);
-
-    // Progressive trycloudflare /stream/ often returns 0 bytes from the bot host (TLS I/O error).
-    // Prefer yt-dlp via youtubeVideoId when we only have that proxy URL.
-    if (!durable && (progressive || status === 'FAILED' || !isPlayableAudioUrl(streamUrl))) {
-        if (youtubeVideoId) {
-            console.warn(
-                `[vibeverse] no durable stream for ${trackId} (status=${status}) — will use yt-dlp for ${youtubeVideoId}`,
-            );
-            return {
-                trackId,
-                title: String(resolvedTrack.title || track.title || 'Track'),
-                artistName: String(resolvedTrack.artistName || track.artistName || ''),
-                artworkUrl: resolvedTrack.artworkUrl || track.artworkUrl,
-                durationMs: Number(resolvedTrack.durationMs || track.durationMs || 0) || 0,
-                streamUrl: '',
-                youtubeVideoId,
-                sourceMode: 'ytdlp',
-            };
-        }
-        console.warn(`[vibeverse] no playable stream for ${trackId} (status=${status})`);
+    if (!isVibeverseDurableStreamUrl(streamUrl)) {
+        console.warn(`[vibeverse] no durable stream for ${trackId} (status=${status})`);
         return null;
     }
 
     if (/\.m4a(\?|$)/i.test(streamUrl) || /audio\/(mp4|aac|x-m4a)/i.test(streamUrl)) {
-        console.warn(
-            `[vibeverse] stream is m4a/AAC — re-encoding to Icecast MP3 for IMVU.`,
-        );
+        console.warn(`[vibeverse] stream is m4a/AAC — re-encoding to Icecast MP3 for IMVU.`);
     }
 
     console.log(
@@ -211,8 +176,6 @@ export async function playVibeverseTrack(track) {
         artworkUrl: resolvedTrack.artworkUrl || track.artworkUrl,
         durationMs: Number(resolvedTrack.durationMs || track.durationMs || 0) || 0,
         streamUrl,
-        youtubeVideoId: youtubeVideoId || undefined,
-        sourceMode: 'http',
     };
 }
 
@@ -236,12 +199,13 @@ export async function refreshVibeverseStream(trackId, hint = {}) {
  * @param {number} [timeoutMs]
  * @param {{ preferDurable?: boolean }} [opts]
  */
-async function waitForVibeverseReady(trackId, timeoutMs = 45_000, opts = {}) {
+async function waitForVibeverseReady(trackId, timeoutMs = 90_000, opts = {}) {
     const base = apiBase();
-    const preferDurable = opts.preferDurable === true;
+    const preferDurable = opts.preferDurable !== false;
     const started = Date.now();
+    let lastLog = 0;
     while (Date.now() - started < timeoutMs) {
-        await new Promise((r) => setTimeout(r, 800));
+        await new Promise((r) => setTimeout(r, 1000));
         try {
             const res = await axios.get(`${base}/tracks/${encodeURIComponent(trackId)}/status`, {
                 timeout: 10_000,
@@ -254,6 +218,14 @@ async function waitForVibeverseReady(trackId, timeoutMs = 45_000, opts = {}) {
                 return { failed: true, status: 'FAILED', error: res.data.error };
             }
             const url = String(res.data.streamUrl || '').trim();
+            const now = Date.now();
+            if (now - lastLog > 10_000) {
+                lastLog = now;
+                console.log(
+                    `[vibeverse] still preparing ${trackId}: status=${status || '?'} ` +
+                        `(${Math.round((now - started) / 1000)}s)`,
+                );
+            }
             if (!isPlayableAudioUrl(url)) continue;
             if (preferDurable && !isVibeverseDurableStreamUrl(url)) continue;
             if (status === 'READY' || isVibeverseDurableStreamUrl(url)) {
