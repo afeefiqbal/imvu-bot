@@ -27,6 +27,27 @@ function formatTrackLabel(track) {
 
 async function replyRoomMediaFailure(reply, result, track = null) {
     const label = track ? formatTrackLabel(track) : '';
+    const reason = String(result?.reason || '');
+    if (reason === 'icecast-disabled') {
+        await reply(
+            'Live radio needs Icecast enabled on the bot host (MUSIC_ENABLED + ICECAST_*). Ask an admin to check the server config.',
+        );
+        return;
+    }
+    if (reason === 'no-public-url') {
+        await reply(
+            'Live radio needs a public HTTPS stream URL. Set MUSIC_PUBLIC_STREAM_URL_TEMPLATE or CLOUDFLARE_TUNNEL_AUTO=1, then restart.',
+        );
+        return;
+    }
+    if (reason === 'mount-not-live' || reason === 'ffmpeg-spawn') {
+        await reply(
+            label
+                ? `Found “${label}”, but the live stream did not start. Check Icecast / tunnel and try again.`
+                : 'The live stream did not start. Check Icecast / tunnel and try again.',
+        );
+        return;
+    }
     if (roomMediaNotModerator(result)) {
         await reply(
             label
@@ -230,7 +251,7 @@ export async function createMusicRoomChatCommandHandler(opts) {
 
     if (useVibeverse) {
         console.log(
-            `[music] stream API mode — ${String(process.env.VIBEVERSE_API_URL).replace(/\/$/, '')}`,
+            `[music] stream API + Icecast live — ${String(process.env.VIBEVERSE_API_URL).replace(/\/$/, '')}`,
         );
         return createVibeverseCommandHandler({
             page,
@@ -242,7 +263,7 @@ export async function createMusicRoomChatCommandHandler(opts) {
         });
     }
 
-    console.log('[music] Icecast mode (set VIBEVERSE_API_URL for stream API mode)');
+    console.log('[music] Icecast/yt-dlp mode (set VIBEVERSE_API_URL for search + live Icecast)');
     return createIcecastCommandHandler(opts);
 }
 
@@ -335,7 +356,7 @@ function createVibeverseCommandHandler({
                 return true;
             }
             player.pause();
-            await reply('Paused. Say !resume to continue (track restarts from the beginning).');
+            await reply('Paused. Say !resume to continue.');
             return true;
         }
 
@@ -513,7 +534,7 @@ function createIcecastCommandHandler(opts) {
                 return true;
             }
             player.pause();
-            await reply('Paused. Say !resume to continue (track restarts from the beginning).');
+            await reply('Paused. Say !resume to continue.');
             return true;
         }
 

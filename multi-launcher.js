@@ -594,11 +594,11 @@ async function run() {
 
     if (String(process.env.VIBEVERSE_API_URL || '').trim()) {
         console.log(
-            `[MULTI-LAUNCHER] Stream API music mode — skipping Icecast/tunnel ingress (${String(process.env.VIBEVERSE_API_URL).replace(/\/$/, '')})`,
+            `[MULTI-LAUNCHER] Stream API search + Icecast live radio (${String(process.env.VIBEVERSE_API_URL).replace(/\/$/, '')})`,
         );
-    } else {
-        await maybeStartMusicIngressTunnel();
     }
+    // Hybrid music still needs a public Icecast HTTPS URL for shared live radio.
+    await maybeStartMusicIngressTunnel();
 
     console.log(`\n[MULTI-LAUNCHER] 🔥 Preparing to launch ${bots.length} active bots!`);
     console.log(`[MULTI-LAUNCHER] 📝 Bots found: ${bots.map((b) => b.name).join(', ')}`);
