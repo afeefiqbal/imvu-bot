@@ -153,11 +153,13 @@ export async function waitForPublicHttpsStream(pubUrl, timeoutMs, opts = {}) {
  * (unless opts.localOnly — preferred for quick !play when the tunnel already points at this Icecast).
  * @param {{ enabled?: boolean, icecastHost?: string, icecastPort?: number, icecastMount?: string, publicStreamUrl?: string }} cfg
  * @param {number} timeoutMs
- * @param {{ isStale?: () => boolean, localOnly?: boolean, pollMs?: number, publicWaitMs?: number }} [opts]
+ * @param {{ isStale?: () => boolean, localOnly?: boolean, pollMs?: number, publicWaitMs?: number, isEncodeAlive?: () => boolean }} [opts]
  */
 export async function waitForIcecastMountLive(cfg, timeoutMs, opts = {}) {
     if (!cfg?.enabled) return false;
     const isStale = typeof opts.isStale === 'function' ? opts.isStale : () => false;
+    const isEncodeAlive =
+        typeof opts.isEncodeAlive === 'function' ? opts.isEncodeAlive : () => true;
     const localOnly = opts.localOnly === true;
     const pollMs = Math.max(100, Number(opts.pollMs) || 200);
     const loopHost = cfg.icecastHost === '0.0.0.0' ? '127.0.0.1' : String(cfg.icecastHost || '127.0.0.1');
@@ -169,10 +171,21 @@ export async function waitForIcecastMountLive(cfg, timeoutMs, opts = {}) {
         !/^(0|false|no|off)$/i.test(String(process.env.MUSIC_REQUIRE_ICECAST_SOURCE_JSON ?? '1').trim());
     while (Date.now() < deadline) {
         if (isStale()) return false;
+        if (!isEncodeAlive()) {
+            console.warn(
+                `[music] ffmpeg exited before Icecast SOURCE on http://${loopHost}:${port}${mount} (last GET ${lastGet}).`,
+            );
+            return false;
+        }
+        // Prefer status-json (SOURCE present); GET alone can 404 briefly even after connect.
         const fromJson = await icecastStatusJsonShowsSource(loopHost, port, mount);
         if (isStale()) return false;
-        lastGet = await httpGetStatus(loopHost, port, mount);
-        if (isStale()) return false;
+        if (!fromJson) {
+            lastGet = await httpGetStatus(loopHost, port, mount);
+            if (isStale()) return false;
+        } else {
+            lastGet = 200;
+        }
         const mountOk = requireJson ? fromJson : fromJson || lastGet === 200;
         if (mountOk) {
             if (localOnly) return true;

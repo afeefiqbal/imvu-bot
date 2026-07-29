@@ -258,29 +258,34 @@ export function createVibeverseRoomPlayer(opts) {
             }
             ffProc = proc;
 
+            // Remote VibeVerse/trycloudflare sources often need >8s before ffmpeg opens Icecast.
+            // Keep localOnly (no HTTPS probe) for speed; allow enough time for the source connect.
+            const waitMs = Math.max(
+                8000,
+                parseInt(String(process.env.MUSIC_CHAT_WAIT_MOUNT_MS || '20000'), 10) || 20000,
+            );
+            const diagAt = Math.min(8000, Math.max(3000, Math.floor(waitMs / 2)));
             setTimeout(async () => {
                 if (isStale()) return;
                 const up = await icecastStatusJsonShowsSource(loopHost, icePort, mountPath);
                 if (isStale()) return;
                 if (!up) {
+                    const ffGone = !ffProc || ffProc.exitCode != null || ffProc.signalCode != null;
                     console.warn(
-                        `[music] Icecast has no SOURCE on ${mountPath} at ${loopHost}:${icePort} ~8s after start.`,
+                        `[music] Icecast has no SOURCE on ${mountPath} at ${loopHost}:${icePort} ~${Math.round(diagAt / 1000)}s after start` +
+                            (ffGone ? ' (ffmpeg already exited).' : '.'),
                     );
                 } else {
                     console.log(`[music] Icecast confirms source on ${mountPath} (${loopHost}:${icePort}).`);
                 }
-            }, 8000);
+            }, diagAt);
 
-            // Fast path: wait for local Icecast only (tunnel already fronts this host).
-            // Skipping the multi-second public HTTPS probe cuts most of the !play latency.
-            const waitMs = Math.max(
-                2500,
-                parseInt(String(process.env.MUSIC_CHAT_WAIT_MOUNT_MS || '8000'), 10) || 8000,
-            );
             const live = await waitForIcecastMountLive(activeStreamCfg, waitMs, {
                 isStale,
                 localOnly: true,
-                pollMs: 200,
+                pollMs: 250,
+                isEncodeAlive: () =>
+                    Boolean(ffProc) && ffProc.exitCode == null && ffProc.signalCode == null,
             });
             if (isStale()) return;
             if (!live || !ffProc) {
