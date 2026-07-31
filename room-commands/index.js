@@ -20,9 +20,9 @@ const SCALE_CHECK_INTERVAL_MS = Math.max(
     parseInt(String(process.env.IMVU_SCALE_CHECK_INTERVAL_MS || '30000'), 10) || 30000
 );
 
-/** Rooms where anyone may !seat (not only owner/mods). null = all rooms. */
-function seatOpenRoomSet() {
-    const raw = process.env.IMVU_SEAT_OPEN_ROOMS;
+/** Rooms that skip the “owner or mods only” chat reply (still enforce the check). */
+function silentModDenyRoomSet() {
+    const raw = process.env.IMVU_SILENT_MOD_DENY_ROOMS;
     if (raw === undefined) return new Set(['242955291-1130']);
     const t = String(raw).trim();
     if (!t) return new Set();
@@ -69,9 +69,9 @@ export function createRoomChatCommandHandler(opts) {
         getRoomModerators,
     } = opts;
 
-    const openSeatRooms = seatOpenRoomSet();
-    const seatOpenToAnyone =
-        openSeatRooms === null || openSeatRooms.has(String(roomId));
+    const silentDenyRooms = silentModDenyRoomSet();
+    const silentModDeny =
+        silentDenyRooms === null || silentDenyRooms.has(String(roomId));
 
     const persist = async (patch) => {
         patchRoomSettingsLocal(roomId, patch);
@@ -98,7 +98,9 @@ export function createRoomChatCommandHandler(opts) {
             }
             return true;
         }
-        await reply('That command is for room owner or mods only.');
+        if (!silentModDeny) {
+            await reply('That command is for room owner or mods only.');
+        }
         return false;
     };
 
@@ -256,8 +258,6 @@ export function createRoomChatCommandHandler(opts) {
             return true;
         }
 
-        // !move is open to anyone. !seat is mod-only unless room is in IMVU_SEAT_OPEN_ROOMS
-        // (default includes 242955291-1130). Use =all for every room, or empty to require mods.
         const modOnly = new Set([
             'newgreeting',
             'autogreet',
@@ -271,10 +271,8 @@ export function createRoomChatCommandHandler(opts) {
             'intro',
             'maxkbs',
             'outfit',
+            'seat',
         ]);
-        if (!seatOpenToAnyone) {
-            modOnly.add('seat');
-        }
         if (modOnly.has(cmd) && !(await requireMod(senderId, senderLabel))) return true;
 
         if (cmd === 'help') {
