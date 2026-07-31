@@ -1430,6 +1430,20 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
     const radioOpQuietUntil = new Map();
     /** @type {Map<string, { url: string, stationName: string, at: number }>} */
     const lastAppliedRoomRadio = new Map();
+    /** Fresh If-Match etags from the last radio POST — skip player GET on same-URL pulse. */
+    /** @type {Map<string, { etag: string, stationUrl: string, at: number }>} */
+    const radioPlayerEtagCache = new Map();
+
+    function rememberRadioEtag(roomId, etag, stationUrl) {
+        const key = String(roomId || '').trim();
+        const tag = String(etag || '').trim();
+        if (!key || !tag) return;
+        radioPlayerEtagCache.set(key, {
+            etag: tag,
+            stationUrl: canonicalRadioStationUrl(stationUrl),
+            at: Date.now(),
+        });
+    }
 
     function markRadioOpQuiet(roomId, extraMs = null) {
         const key = String(roomId || '').trim();
@@ -1548,13 +1562,20 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
 
     async function waitForRoomRadioStatus(roomId, wantStatus, timeoutMs = 3500) {
         const want = String(wantStatus || '').trim().toLowerCase();
-        const deadline = Date.now() + Math.max(500, timeoutMs);
+        const budget = Math.max(0, Number(timeoutMs) || 0);
+        if (budget <= 0) return false;
+        const deadline = Date.now() + budget;
         while (Date.now() < deadline) {
             const st = await fetchRoomMediaPlaybackState(roomId);
             if (st.ok && String(st.status || '').trim().toLowerCase() === want) return true;
             await new Promise((r) => setTimeout(r, 180));
         }
         return false;
+    }
+
+    /** Warm the media-player URL cache so !play radio cutover skips 3–4 IMVU GETs. */
+    async function warmRoomRadioPlayer(roomId) {
+        return fetchRoomRadioMediaInfo(roomId);
     }
 
     async function fetchRoomMediaPlaybackState(roomId) {
@@ -1663,12 +1684,21 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         });
     }
 
+    /** IMVU rejects media_title / station_name over 100 chars (INBOUND VALIDATION-001). */
+    function truncateStationName(name, max = 100) {
+        const s = String(name || '').trim().replace(/\s+/g, ' ');
+        if (s.length <= max) return s;
+        if (max <= 1) return s.slice(0, max);
+        return `${s.slice(0, Math.max(1, max - 1)).trimEnd()}…`;
+    }
+
     async function setRoomRadioStreamUrl(roomId, publicUrl, options = {}) {
         const url = String(publicUrl || '').trim();
         if (!/^https:\/\//i.test(url)) return { ok: false, reason: 'invalid-url' };
 
         const stationUrl = canonicalRadioStationUrl(url);
-        const stationName = String(options?.stationName || '').trim();
+        const stationName = truncateStationName(options?.stationName || '');
+        const tRadio = Date.now();
 
         return enqueueRoomRadioOp(roomId, async () => {
             markRadioOpQuiet(roomId);
@@ -1677,12 +1707,37 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
             if (!playerUrl) return { ok: false, reason: 'radio-player-not-found' };
             /** Room mods POST here; experience-nested URL returns AUTHORIZATION-002 even for mods. */
             const postPlayerUrl = playerUrl;
+            const forceRestart = Boolean(options?.forceRestart);
+            // Bot is already in-room during !play; skip participant POST (~0.5–1.5s).
+            const skipEnsure =
+                forceRestart ||
+                options?.skipEnsureParticipant === true ||
+                /^(1|true|yes|on)$/i.test(
+                    String(process.env.IMVU_RADIO_SKIP_ENSURE_PARTICIPANT || '1').trim(),
+                );
 
             try {
-                const identity = await resolveImqIdentity();
-                if (identity.userId) {
-                    await ensureChatParticipant(roomId, identity.userId);
+                if (!skipEnsure) {
+                    const identity = await resolveImqIdentity();
+                    if (identity.userId) {
+                        await ensureChatParticipant(roomId, identity.userId);
+                    }
                 }
+
+                // Cache-bust so IMVU treats each cutover as a new station_url even when
+                // the stable /live m3u8 path is unchanged (stop→start alone does not reload HLS).
+                const playSeed = Date.now();
+                const stationUrlForImvu = (() => {
+                    if (
+                        /^(0|false|no|off)$/i.test(
+                            String(process.env.MUSIC_STREAM_URL_CACHE_BUST ?? '1').trim(),
+                        )
+                    ) {
+                        return stationUrl;
+                    }
+                    const sep = stationUrl.includes('?') ? '&' : '?';
+                    return `${stationUrl}${sep}_play=${playSeed}`;
+                })();
 
                 const getRes = await client.get(playerUrl, {
                     headers: { Accept: 'application/json; charset=utf-8' },
@@ -1700,7 +1755,8 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                 let etag =
                     getRes.headers?.etag || getRes.data?.http?.[playerUrl]?.headers?.etag || '';
 
-                // Stable /live: skip stop→clear→update→start when already on this URL.
+                // Stable /live: skip stop→clear→update→start when already on this URL
+                // — unless caller forces a restart (extractor HLS reuses the same m3u8 per room).
                 const cur =
                     getRes.data?.denormalized?.[playerUrl]?.data?.current_state ||
                     getRes.data?.denormalized?.[playerUrl]?.data ||
@@ -1708,14 +1764,85 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                 const curUrl = canonicalRadioStationUrl(String(cur?.station_url || ''));
                 const curStatus = String(cur?.status || '').toLowerCase();
                 if (
+                    !forceRestart &&
                     curUrl &&
                     curUrl === stationUrl &&
                     (curStatus === 'playing' || curStatus === 'paused')
                 ) {
+                    rememberRadioEtag(roomId, etag, stationUrl);
                     logger.log(
                         `[IMVU-SESSION] Room ${roomId} already on radio URL — skip rewrite: ${stationUrl}`,
                     );
                     return { ok: true, reason: 'url-unchanged' };
+                }
+
+                // Same-URL HLS cutover: stop → update(with _play bust) → start.
+                // Do NOT stop→start only — IMVU keeps the old HLS session and rooms go silent.
+                const sameUrlCutover =
+                    forceRestart &&
+                    curUrl &&
+                    curUrl === stationUrl &&
+                    !/^(0|false|no|off)$/i.test(
+                        String(process.env.IMVU_RADIO_FAST_SAME_URL_PULSE ?? '1').trim(),
+                    );
+
+                if (sameUrlCutover) {
+                    // Default: update(?_play=) → start (skip stop — saves ~1–2s).
+                    // Set IMVU_RADIO_CUTOVER_STOP=1 if rooms stick on the previous track.
+                    const doStop = !/^(0|false|no|off)$/i.test(
+                        String(process.env.IMVU_RADIO_CUTOVER_STOP ?? '1').trim(),
+                    );
+                    if (doStop) {
+                        const stopRes = await postMediaPlayerAction(
+                            roomId,
+                            postPlayerUrl,
+                            { action: 'stop_radio' },
+                            etag,
+                        );
+                        if (stopRes.etag) etag = stopRes.etag;
+                    }
+                    const updateRes = await postMediaPlayerAction(
+                        roomId,
+                        postPlayerUrl,
+                        {
+                            action: 'update_radio',
+                            station_name: stationName,
+                            station_url: stationUrlForImvu,
+                        },
+                        etag,
+                    );
+                    if (updateRes.etag) etag = updateRes.etag;
+                    if (!updateRes.ok) {
+                        const detail = summarizeResponseData(updateRes.data);
+                        logger.warn(
+                            `[IMVU-SESSION] Fast cutover update failed for ${roomId}: POST ${updateRes.status}${detail}`,
+                        );
+                        return { ok: false, reason: `post-${updateRes.status}`, detail };
+                    }
+                    const startRes = await postMediaPlayerAction(
+                        roomId,
+                        postPlayerUrl,
+                        { action: 'start_radio' },
+                        etag,
+                    );
+                    if (!startRes.ok) {
+                        const detail = summarizeResponseData(startRes.data);
+                        logger.warn(
+                            `[IMVU-SESSION] Fast cutover start failed for ${roomId}: POST ${startRes.status}${detail}`,
+                        );
+                        return { ok: false, reason: `post-${startRes.status}`, detail };
+                    }
+                    rememberRadioEtag(roomId, startRes.etag || etag, stationUrl);
+                    lastAppliedRoomRadio.set(String(roomId || '').trim(), {
+                        url: stationUrl,
+                        stationName,
+                        at: Date.now(),
+                    });
+                    markRadioOpQuiet(roomId);
+                    logger.log(
+                        `[IMVU-SESSION] Fast same-URL radio cutover for ${roomId} in ${Date.now() - tRadio}ms: ${stationUrlForImvu}`,
+                    );
+                    return { ok: true, reason: 'api-fast-same-url-cutover' };
                 }
 
                 const stopRes = await postMediaPlayerAction(
@@ -1725,9 +1852,10 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                     etag,
                 );
                 if (stopRes.etag) etag = stopRes.etag;
+                // Default 0: waiting for "stopped" re-GETs the player and often costs >1s.
                 const waitStoppedMs = Math.max(
                     0,
-                    parseInt(String(process.env.IMVU_RADIO_WAIT_STOPPED_MS || '400'), 10) || 400,
+                    parseInt(String(process.env.IMVU_RADIO_WAIT_STOPPED_MS || '0'), 10) || 0,
                 );
                 if (waitStoppedMs > 0) {
                     const stopped = await waitForRoomRadioStatus(roomId, 'stopped', waitStoppedMs);
@@ -1738,9 +1866,13 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                     }
                 }
 
-                const flashClear = !/^(0|false|no|off)$/i.test(
-                    String(process.env.IMVU_RADIO_URL_FLASH_CLEAR ?? '1').trim(),
-                );
+                // Flash-clear is slow (~2–4s). Default off when URL already has ?_play=
+                // cache-bust (forceRestart path). Set IMVU_RADIO_URL_FLASH_CLEAR=1 to force.
+                const flashClear =
+                    !forceRestart &&
+                    !/^(0|false|no|off)$/i.test(
+                        String(process.env.IMVU_RADIO_URL_FLASH_CLEAR ?? '0').trim(),
+                    );
                 if (flashClear) {
                     const clearRes = await postMediaPlayerAction(
                         roomId,
@@ -1757,9 +1889,9 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                         setTimeout(
                             r,
                             Math.max(
-                                0,
-                                parseInt(String(process.env.IMVU_RADIO_URL_FLASH_MS || '100'), 10) ||
-                                    100,
+                                50,
+                                parseInt(String(process.env.IMVU_RADIO_URL_FLASH_MS || '150'), 10) ||
+                                    150,
                             ),
                         ),
                     );
@@ -1771,7 +1903,7 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                     {
                         action: 'update_radio',
                         station_name: stationName,
-                        station_url: stationUrl,
+                        station_url: stationUrlForImvu,
                     },
                     etag,
                 );
@@ -1779,7 +1911,7 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                 if (!updateRes.ok) {
                     const detail = summarizeResponseData(updateRes.data);
                     logger.warn(
-                        `[IMVU-SESSION] Could not update room ${roomId} radio URL: POST ${updateRes.status}${detail} · url=${stationUrl}`,
+                        `[IMVU-SESSION] Could not update room ${roomId} radio URL: POST ${updateRes.status}${detail} · url=${stationUrlForImvu}`,
                     );
                     const errCode = String(updateRes.data?.error || '');
                     const modDenied =
@@ -1835,9 +1967,10 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                     stationName,
                     at: Date.now(),
                 });
+                rememberRadioEtag(roomId, startRes.etag || etag, stationUrl);
                 markRadioOpQuiet(roomId);
                 logger.log(
-                    `[IMVU-SESSION] Updated room ${roomId} radio URL via API (stop${flashClear ? ' → clear' : ''} → update → start, status ${startRes.status}): ${stationUrl}`,
+                    `[IMVU-SESSION] Updated room ${roomId} radio URL via API (stop${flashClear ? ' → clear' : ''} → update → start, ${Date.now() - tRadio}ms, status ${startRes.status}): ${stationUrlForImvu}`,
                 );
                 return { ok: true, reason: 'api-restart-radio' };
             } catch (error) {
@@ -2896,6 +3029,7 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         removeChatParticipant,
         fetchRoomMediaPlaybackState,
         fetchRoomMediaPlayerUpdateQueue,
+        warmRoomRadioPlayer,
         setRoomRadioStreamUrl,
         stopRoomRadioStream,
         markRadioOpQuiet,

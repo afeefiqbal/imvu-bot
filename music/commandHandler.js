@@ -7,6 +7,7 @@ import { cacheBustHttpsStreamUrl } from './loadStreamConfig.js';
 import { probePublicStreamForImvu, urlLooksLikeNgrokFree, isImvuBlockingStreamProbe } from './verifyImvuStreamUrl.js';
 import {
     resolveVibeversePlayable,
+    parseMusicSearchQuery,
     vibeverseEnabled,
 } from './vibeverseClient.js';
 import { createVibeverseRoomPlayer } from './vibeverseRoomPlayer.js';
@@ -24,7 +25,9 @@ function roomMediaNotModerator(result) {
 
 function formatTrackLabel(track) {
     const title = String(track?.title || '').trim() || 'Unknown track';
-    const artist = String(track?.artistName || '').trim();
+    // Strip album suffix if an older search path stuffed it into artistName.
+    let artist = String(track?.artistName || '').trim();
+    artist = artist.replace(/\s*[·•]\s*.+$/, '').trim();
     return artist ? `${title} — ${artist}` : title;
 }
 
@@ -66,7 +69,7 @@ async function replyRoomMediaFailure(reply, result, track = null) {
     );
 }
 
-const HELP_VIBEVERSE = `Music: !play/!p · !add/!a · !queue/!q · !skip/!next · !stop · !pause · !resume · !music · after !play, random songs keep playing until !stop · radio https://vibeverse-web.vvpz.workers.dev/radio`;
+const HELP_VIBEVERSE = `Music: !play/!p · !add/!a · !queue/!q · !skip/!next · !stop · !pause · !resume · !music · !play .typo for smart search · after !play, random songs keep playing until !stop · radio https://vibeverse-web.vvpz.workers.dev/radio`;
 const HELP_ICECAST = `Music: !play/!p · !add/!a · !queue/!q · !skip · !stop · !pause · !resume · !music · idle playlist is server .env only (not set by chat)`;
 
 function parseCmdLine(text) {
@@ -383,6 +386,13 @@ function createVibeverseCommandHandler({
 
         if (cmd === '*play' || cmd === '*p' || cmd === '*playmp3' || cmd === '*mp3') {
             if (!rest) {
+                await reply('Usage: !play <song or YouTube URL> · !play .typo for smart search');
+                return true;
+            }
+
+            const parsed = parseMusicSearchQuery(rest);
+            if (parsed.kind === 'silent') return true; // e.g. !play ...
+            if (parsed.kind === 'empty') {
                 await reply('Usage: !play <song or YouTube URL>');
                 return true;
             }
@@ -391,8 +401,31 @@ function createVibeverseCommandHandler({
             player.cutForReplace();
             player.armAutoplay?.('!play');
 
-            await reply(`Looking up “${rest}”…`);
-            const one = await resolveVibeversePlayable(rest, { roomId });
+            const label = parsed.display;
+            await reply(
+                parsed.kind === 'smart'
+                    ? `Looking up “${label}” (smart)…`
+                    : `Looking up “${label}”…`,
+            );
+            // Overlap IMVU media-player discovery with search+HLS (hides ~2–8s on cold cache).
+            void sessionClient?.warmRoomRadioPlayer?.(roomId)?.catch?.(() => null);
+            let announcedTitle = false;
+            const one = await resolveVibeversePlayable(parsed.query, {
+                roomId,
+                smart: parsed.kind === 'smart',
+                // Announce as soon as search picks a track — don't wait ~15–25s for HLS.
+                onPicked: async (track) => {
+                    announcedTitle = true;
+                    await reply(`Now playing: ${formatTrackLabel(track)}`);
+                },
+            });
+            if (one?.failed) {
+                void player.ensurePlaying?.();
+                await reply(
+                    `Couldn’t play that track${one.detail ? ` (${String(one.detail).slice(0, 120)})` : ''} — trying another song.`,
+                );
+                return true;
+            }
             if (one?.pending) {
                 // Found, but still caching — keep music going via idle autoplay.
                 void player.ensurePlaying?.();
@@ -412,6 +445,9 @@ function createVibeverseCommandHandler({
             }
 
             await queueMediaSync(async () => {
+                if (!announcedTitle) {
+                    await reply(`Now playing: ${formatTrackLabel(one)}`);
+                }
                 const result = await player.playNow(one);
                 if (!result?.ok) {
                     if (result?.reason === 'stale') {
@@ -419,10 +455,7 @@ function createVibeverseCommandHandler({
                         return;
                     }
                     await replyRoomMediaFailure(reply, result, one);
-                    return;
                 }
-                const playing = result.track || one;
-                await reply(`Now playing: ${formatTrackLabel(playing)}`);
             });
             return true;
         }
@@ -433,8 +466,28 @@ function createVibeverseCommandHandler({
                 return true;
             }
 
-            await reply(`Looking up “${rest}”…`);
-            const one = await resolveVibeversePlayable(rest, { roomId });
+            const parsed = parseMusicSearchQuery(rest);
+            if (parsed.kind === 'silent') return true;
+            if (parsed.kind === 'empty') {
+                await reply('Usage: !add <song or YouTube URL>');
+                return true;
+            }
+
+            await reply(
+                parsed.kind === 'smart'
+                    ? `Looking up “${parsed.display}” (smart)…`
+                    : `Looking up “${parsed.display}”…`,
+            );
+            const one = await resolveVibeversePlayable(parsed.query, {
+                roomId,
+                smart: parsed.kind === 'smart',
+            });
+            if (one?.failed) {
+                await reply(
+                    `Couldn’t add that track${one.detail ? ` (${String(one.detail).slice(0, 120)})` : ''}.`,
+                );
+                return true;
+            }
             if (one?.pending) {
                 player.armAutoplay?.('!add');
                 void player.ensurePlaying?.();

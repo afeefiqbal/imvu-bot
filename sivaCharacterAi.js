@@ -1,7 +1,8 @@
 /**
  * Sugar AI triggers (case-insensitive):
  * - Message contains "sugar" (e.g. sugar, !sugar, SugarNix), OR
- * - Message starts with "." (silent ask, e.g. ".how do I play music")
+ * - Message starts with "." then a letter (e.g. ".hi", "...how are you")
+ *   Dots-only ("...", "..", "....") → no reply
  *
  * No open follow-up session — only those messages get an AI reply.
  */
@@ -10,8 +11,8 @@ const HAS_SUGAR_COMMAND = /\!sugar\b/i;
 const HAS_NEW_SUGAR_COMMAND = /\!newsugar\b/i;
 /** Any word that contains "sugar" anywhere inside it */
 const HAS_SUGAR_SUBSTRING = /sugar/i;
-/** Silent ask: first non-space char is "." */
-const STARTS_WITH_DOT = /^\s*\./;
+/** Letter after leading dots (Latin or Malayalam) */
+const LETTER_AFTER_DOTS = /^\.+\s*[a-zA-Z\u0D00-\u0D7F]/;
 const ENDS_SESSION_COMMAND = /\!endsugar\b|\!endsiva\b/i;
 const NEW_THREAD_COMMAND = /\!newsugar\b|\!newsiva\b/i;
 
@@ -31,8 +32,10 @@ export function messageInvokesSivaCharacterAi(text) {
     if (typeof text !== 'string' || !text.trim()) {
         return false;
     }
-    if (STARTS_WITH_DOT.test(text)) {
-        return true;
+    const t = text.trim();
+    // ".hi" / "...hello" → yes; "..." / ".." / "...." → no
+    if (t.startsWith('.')) {
+        return LETTER_AFTER_DOTS.test(t);
     }
     return HAS_SUGAR_SUBSTRING.test(text);
 }
@@ -110,9 +113,9 @@ export function stripSivaCharacterAiTriggers(message) {
         return '';
     }
     let q = message.trim();
-    // Silent ask: ".how do I …" → "how do I …"
+    // Silent ask: ".how do I …" / "...hello" → "how do I …" / "hello"
     if (q.startsWith('.')) {
-        q = q.slice(1).trim();
+        q = q.replace(/^\.+/, '').trim();
     }
     q = q.replace(/\!endsugar\b/gi, ' ');
     q = q.replace(/\!endsiva\b/gi, ' ');

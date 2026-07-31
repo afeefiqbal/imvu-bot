@@ -14,6 +14,7 @@ export async function applyRoomMediaStreamUrl(page, publicUrl, opts = null) {
     if ((!page || page.isClosed()) && sessionClient?.setRoomRadioStreamUrl && roomId) {
         const result = await sessionClient.setRoomRadioStreamUrl(roomId, url, {
             stationName: String(opts?.stationName || '').trim(),
+            forceRestart: Boolean(opts?.forceRestart),
         });
         if (result?.ok) {
             console.log(`[music/api] room ${roomId} media URL set: ${url}`);

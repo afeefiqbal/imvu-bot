@@ -184,7 +184,10 @@ export function createVibeverseRoomPlayer(opts) {
         console.log(`[music] autoplay filling empty queue (${roomId})…`);
         let pick = null;
         try {
-            pick = await fetchRandomVibeversePlayable({ excludeIds: recentAutoplayIds });
+            pick = await fetchRandomVibeversePlayable({
+                excludeIds: recentAutoplayIds,
+                roomId,
+            });
         } catch (e) {
             console.warn(`[music] autoplay fetch failed (${roomId}):`, e?.message || e);
             autoplayFailStreak += 1;
@@ -361,6 +364,7 @@ export function createVibeverseRoomPlayer(opts) {
             sessionClient,
             roomId,
             stationName: String(track?.title || '').trim(),
+            forceRestart: opts.forceRestart === true,
         });
         if (!applied.ok) return applied;
         lastRoomRadioUrl = url;
@@ -404,7 +408,12 @@ export function createVibeverseRoomPlayer(opts) {
         console.log(`[music] extractor live HLS — set room radio only: ${url}`);
         discardOutgoing();
         killCurrentEncodeOnly();
-        const applied = await applyPublicUrlToRoom(url, track);
+        // Same m3u8 path per room; content changes under it — always stop→update→start
+        // so IMVU reloads instead of staying on the previous track (or silence).
+        const applied = await applyPublicUrlToRoom(url, track, {
+            skipIfSame: false,
+            forceRestart: true,
+        });
         if (gen !== generation) return { ok: false, reason: 'stale' };
         if (!applied.ok) return applied;
         playing = true;

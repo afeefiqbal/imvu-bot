@@ -23,6 +23,72 @@ function isPlayableAudioUrl(url) {
     return /^https?:\/\//i.test(String(url));
 }
 
+function normalizeSearchText(s) {
+    return String(s || '')
+        .toLowerCase()
+        .normalize('NFKD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function editDistance(a, b) {
+    if (a === b) return 0;
+    if (!a.length) return b.length;
+    if (!b.length) return a.length;
+    const prev = new Array(b.length + 1);
+    const cur = new Array(b.length + 1);
+    for (let j = 0; j <= b.length; j++) prev[j] = j;
+    for (let i = 1; i <= a.length; i++) {
+        cur[0] = i;
+        for (let j = 1; j <= b.length; j++) {
+            const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+            cur[j] = Math.min(cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
+        }
+        for (let j = 0; j <= b.length; j++) prev[j] = cur[j];
+    }
+    return prev[b.length];
+}
+
+function fuzzyContains(hay, needle) {
+    if (!needle || !hay) return false;
+    if (hay.includes(needle)) return true;
+    const n = needle.length;
+    if (n < 5) return false;
+    const maxDist = n >= 10 ? 2 : 1;
+    for (let len = n - maxDist; len <= n + maxDist; len++) {
+        if (len < 5) continue;
+        for (let i = 0; i <= hay.length - len; i++) {
+            if (editDistance(hay.slice(i, i + len), needle) <= maxDist) return true;
+        }
+    }
+    return false;
+}
+
+/** Prefer titles that match the user query (demote unrelated OST fillers). */
+function queryMatchScore(query, title, artistName = '', albumTitle = '') {
+    const q = normalizeSearchText(query);
+    const hay = normalizeSearchText(
+        `${title || ''} ${artistName || ''} ${albumTitle || ''}`,
+    );
+    if (!q || !hay) return 0;
+    if (hay.includes(q) || q.includes(hay)) return 1;
+    const qC = q.replace(/\s/g, '');
+    const hC = hay.replace(/\s/g, '');
+    if (qC.length >= 5 && fuzzyContains(hC, qC)) return 0.92;
+    const qt = q.split(' ').filter((t) => t.length >= 2);
+    const ht = hay.split(' ').filter((t) => t.length >= 2);
+    if (!qt.length) return 0;
+    let hit = 0;
+    for (const t of qt) {
+        if (ht.some((h) => h === t || h.includes(t) || t.includes(h) || fuzzyContains(h, t))) {
+            hit += 1;
+        }
+    }
+    return hit / qt.length;
+}
+
 /** Extractor progressive pipes are for the web player — not durable for Icecast. */
 function isProgressiveExtractorUrl(url) {
     const s = String(url || '');
@@ -43,36 +109,116 @@ function isProgressiveExtractorUrl(url) {
  */
 
 /**
+ * Parse !play / !add query:
+ * - `...` / dots only → silent (no reply)
+ * - `.song name` (dot then a letter) → smart AI search
+ * - otherwise → direct YouTube Music
+ * @param {string} raw
+ * @returns {{ kind: 'silent' } | { kind: 'empty' } | { kind: 'direct'|'smart', query: string, display: string }}
+ */
+export function parseMusicSearchQuery(raw) {
+    const s = String(raw || '').trim();
+    if (!s) return { kind: 'empty' };
+    // Only dots / punctuation — e.g. "..." — ignore completely.
+    if (!/[a-zA-Z0-9\u0D00-\u0D7F]/.test(s)) return { kind: 'silent' };
+    // Leading dot(s): AI/smart search only if a letter follows.
+    const dotted = /^\.+\s*(.*)$/s.exec(s);
+    if (dotted) {
+        const rest = String(dotted[1] || '').trim();
+        if (!rest || !/^[a-zA-Z\u0D00-\u0D7F]/.test(rest)) return { kind: 'silent' };
+        return { kind: 'smart', query: rest, display: rest };
+    }
+    return { kind: 'direct', query: s, display: s };
+}
+
+/**
  * @param {string} query
- * @param {{ roomId?: string }} [opts]
- * @returns {Promise<VibeversePlayable | VibeversePending | null>}
- *   playable track | `{ pending: true }` (found, still caching) | null (not found)
+ * @param {{ roomId?: string, onPicked?: (track: object) => void | Promise<void>, smart?: boolean }} [opts]
+ * @returns {Promise<VibeversePlayable | VibeversePending | { failed: true, trackId?: string, title?: string, detail?: string } | null>}
  */
 export async function resolveVibeversePlayable(query, opts = {}) {
     const base = apiBase();
     if (!base) return null;
     const q = String(query || '').trim();
     if (!q) return null;
+    const t0 = Date.now();
 
     const search = await axios.get(`${base}/search`, {
-        params: { q, source: 'youtube' },
-        timeout: 20_000,
+        params: {
+            q,
+            source: 'youtube',
+            limit: 8,
+            ...(opts.smart ? { smart: '1' } : {}),
+        },
+        timeout: opts.smart ? 18_000 : 12_000,
         validateStatus: () => true,
     });
+    const searchMs = Date.now() - t0;
     if (search.status >= 400 || !search.data) {
         console.warn(`[vibeverse] search HTTP ${search.status}`);
         return null;
     }
 
     const tracks = Array.isArray(search.data.tracks) ? search.data.tracks : [];
-    const track =
-        search.data.top ||
-        tracks.find((t) => t?.provider === 'YOUTUBE') ||
-        tracks[0] ||
-        null;
-    if (!track?.id) return null;
+    const ranked = [];
+    // Trust API order (direct YTM, or smart-ranked when smart=1).
+    if (search.data.top?.id) ranked.push(search.data.top);
+    for (const t of tracks) {
+        if (t?.id && !ranked.some((x) => x.id === t.id)) ranked.push(t);
+    }
+    if (!ranked.length) return null;
 
-    return playVibeverseTrack(track, { roomId: opts.roomId });
+    /** @type {{ failed: true, trackId?: string, title?: string, detail?: string } | null} */
+    let lastFail = null;
+    // Keep YouTube Music order. READY (R2) top hits naturally land under ~10s.
+    const playOrder = ranked.slice(0, 5);
+    if (playOrder[0]?.ready) {
+        console.log(`[vibeverse] top hit READY (cached) — fast path: ${playOrder[0].title || '?'}`);
+    }
+    let announced = false;
+    for (const track of playOrder) {
+        const tPlay = Date.now();
+        const playable = await playVibeverseTrack(track, { roomId: opts.roomId });
+        console.log(
+            `[vibeverse] timing search=${searchMs}ms play=${Date.now() - tPlay}ms total=${Date.now() - t0}ms smart=${!!opts.smart} title=${track.title || '?'}`,
+        );
+        if (playable?.streamUrl) {
+            // Announce only after we actually have a stream — avoids false "Now playing".
+            if (!announced && typeof opts.onPicked === 'function') {
+                announced = true;
+                try {
+                    await opts.onPicked(track);
+                } catch {
+                    /* ignore */
+                }
+            }
+            return playable;
+        }
+        if (playable?.pending) return playable;
+        if (playable?.failed) {
+            lastFail = {
+                ...playable,
+                detail: cleanPlayFailDetail(playable.detail),
+            };
+            console.warn(
+                `[vibeverse] search hit failed (${track.id}): ${lastFail.detail || 'FAILED'} — trying next`,
+            );
+            continue;
+        }
+    }
+    return lastFail;
+}
+
+function cleanPlayFailDetail(raw) {
+    const s = String(raw || '').trim();
+    if (!s) return '';
+    if (/unavailable|not available/i.test(s)) return 'YouTube video unavailable';
+    if (/bot.?check|sign in to confirm/i.test(s)) return 'YouTube bot-check (cookies)';
+    if (/error code:\s*502/i.test(s)) return 'extractor briefly unavailable';
+    // Strip yt-dlp binary prefix noise
+    const m = s.match(/ERROR:\s*\[youtube\]\s*[\w-]+:\s*(.+)/i);
+    if (m) return m[1].slice(0, 160);
+    return s.slice(0, 160);
 }
 
 function vibeverseLiveEnabled() {
@@ -154,6 +300,18 @@ export async function playVibeverseTrack(track, opts = {}) {
     }
 
     if (!isPlayableAudioUrl(streamUrl)) {
+        if (status === 'FAILED') {
+            const detail = String(playRes.data.message || playRes.data.error || '').trim();
+            console.warn(
+                `[vibeverse] play FAILED for ${trackId}${detail ? `: ${detail.slice(0, 200)}` : ''}`,
+            );
+            return {
+                failed: true,
+                trackId,
+                title,
+                detail: detail || 'Could not resolve a playable stream',
+            };
+        }
         if (waitMs > 0) {
             console.warn(`[vibeverse] no stream for ${trackId} (status=${status})`);
         }
@@ -221,7 +379,7 @@ function shuffleInPlace(arr) {
  * Prefers VibeVerse READY catalog downloads (already cached), then trending.
  * Never waits on PREPARING — skip cold tracks so the room doesn't go silent for minutes.
  *
- * @param {{ excludeIds?: Iterable<string> }} [opts]
+ * @param {{ excludeIds?: Iterable<string>, roomId?: string }} [opts]
  * @returns {Promise<VibeversePlayable | null>}
  */
 export async function fetchRandomVibeversePlayable(opts = {}) {
@@ -245,7 +403,11 @@ export async function fetchRandomVibeversePlayable(opts = {}) {
             if (!id || exclude.has(id)) continue;
             tries += 1;
             // Instant only — never block autoplay on a 90s PREPARING poll.
-            const playable = await playVibeverseTrack(raw, { waitMs: 0 });
+            // Pass roomId so live HLS delivery is used (same as !play).
+            const playable = await playVibeverseTrack(raw, {
+                waitMs: 0,
+                roomId: opts.roomId,
+            });
             if (playable?.streamUrl) {
                 console.log(`[music] autoplay pick via ${source}: “${playable.title}”`);
                 return playable;
