@@ -242,6 +242,8 @@ export function createRoomChatCommandHandler(opts) {
             return true;
         }
 
+        // !seat / !move are open to anyone (guests often ask the bot to sit).
+        // Settings toggles stay mod/owner-only.
         const modOnly = new Set([
             'newgreeting',
             'autogreet',
@@ -255,7 +257,6 @@ export function createRoomChatCommandHandler(opts) {
             'intro',
             'maxkbs',
             'outfit',
-            'seat',
         ]);
         if (modOnly.has(cmd) && !(await requireMod(senderId, senderLabel))) return true;
 

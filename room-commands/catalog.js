@@ -88,7 +88,7 @@ export const COMMAND_CATALOG = {
     },
     maxkbs: { category: 'admin', summary: 'Max outfit size in KB (warning threshold).', usage: '!maxkbs 500' },
     outfit: { category: 'admin', summary: 'Check outfit size for a user (best effort).', usage: '!outfit username' },
-    seat: { category: 'admin', summary: 'Move bot to a seat number.', usage: '!seat 2' },
+    seat: { category: 'admin', summary: 'Move bot to a seat number (anyone).', usage: '!seat 2' },
 };
 
 /** @type {Record<string, string>} */
