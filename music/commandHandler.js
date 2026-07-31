@@ -387,7 +387,7 @@ function createVibeverseCommandHandler({
                 return true;
             }
 
-            // Cut current song immediately — !play always replaces, never queues behind.
+            // Soft-preempt: keep current audio until new HLS is ready (cutForReplace must not stop radio early).
             player.cutForReplace();
             player.armAutoplay?.('!play');
 

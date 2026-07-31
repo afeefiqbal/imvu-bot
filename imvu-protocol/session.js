@@ -1700,6 +1700,24 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                 let etag =
                     getRes.headers?.etag || getRes.data?.http?.[playerUrl]?.headers?.etag || '';
 
+                // Stable /live: skip stop→clear→update→start when already on this URL.
+                const cur =
+                    getRes.data?.denormalized?.[playerUrl]?.data?.current_state ||
+                    getRes.data?.denormalized?.[playerUrl]?.data ||
+                    null;
+                const curUrl = canonicalRadioStationUrl(String(cur?.station_url || ''));
+                const curStatus = String(cur?.status || '').toLowerCase();
+                if (
+                    curUrl &&
+                    curUrl === stationUrl &&
+                    (curStatus === 'playing' || curStatus === 'paused')
+                ) {
+                    logger.log(
+                        `[IMVU-SESSION] Room ${roomId} already on radio URL — skip rewrite: ${stationUrl}`,
+                    );
+                    return { ok: true, reason: 'url-unchanged' };
+                }
+
                 const stopRes = await postMediaPlayerAction(
                     roomId,
                     postPlayerUrl,
