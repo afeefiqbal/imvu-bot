@@ -44,10 +44,11 @@ function isProgressiveExtractorUrl(url) {
 
 /**
  * @param {string} query
+ * @param {{ roomId?: string }} [opts]
  * @returns {Promise<VibeversePlayable | VibeversePending | null>}
  *   playable track | `{ pending: true }` (found, still caching) | null (not found)
  */
-export async function resolveVibeversePlayable(query) {
+export async function resolveVibeversePlayable(query, opts = {}) {
     const base = apiBase();
     if (!base) return null;
     const q = String(query || '').trim();
@@ -71,7 +72,11 @@ export async function resolveVibeversePlayable(query) {
         null;
     if (!track?.id) return null;
 
-    return playVibeverseTrack(track);
+    return playVibeverseTrack(track, { roomId: opts.roomId });
+}
+
+function vibeverseLiveEnabled() {
+    return /^(1|true|yes|on)$/i.test(String(process.env.MUSIC_VIBEVERSE_LIVE || '').trim());
 }
 
 /**
@@ -82,7 +87,7 @@ export async function resolveVibeversePlayable(query) {
  *   artworkUrl?: string,
  *   durationMs?: number,
  * }} track
- * @param {{ waitMs?: number }} [opts]
+ * @param {{ waitMs?: number, forceDurable?: boolean, roomId?: string }} [opts]
  *   `waitMs: 0` = never poll for PREPARING (autoplay). Default waits up to 90s.
  * @returns {Promise<VibeversePlayable | VibeversePending | null>}
  */
@@ -93,26 +98,32 @@ export async function playVibeverseTrack(track, opts = {}) {
         opts.waitMs != null
             ? Math.max(0, Number(opts.waitMs) || 0)
             : 90_000;
+    const live = vibeverseLiveEnabled();
+    const roomId = String(opts.roomId || process.env.MUSIC_ROOM_ID || '').trim();
 
-    const playRes = await axios.post(
-        `${base}/play`,
-        {
-            trackId: track.id,
-            title: track.title,
-            artistName: track.artistName,
-            artworkUrl: track.artworkUrl,
-            durationMs: track.durationMs,
-            source: 'QUEUE',
-            // Durable R2 (+ mp3 when available). Never progressive extractor pipes.
-            preferMp3: true,
-            requireCached: true,
-        },
-        {
-            timeout: 45_000,
-            validateStatus: () => true,
-            headers: { 'Content-Type': 'application/json' },
-        },
-    );
+    const body = {
+        trackId: track.id,
+        title: track.title,
+        artistName: track.artistName,
+        artworkUrl: track.artworkUrl,
+        durationMs: track.durationMs,
+        source: 'QUEUE',
+        preferMp3: true,
+        requireCached: live ? false : true,
+        allowProgressive: live ? true : undefined,
+        delivery: live ? 'hls' : undefined,
+        roomId: live && roomId ? roomId : undefined,
+    };
+    if (opts.forceDurable && !live) {
+        body.requireCached = true;
+        body.preferMp3 = true;
+    }
+
+    const playRes = await axios.post(`${base}/play`, body, {
+        timeout: live ? 90_000 : 45_000,
+        validateStatus: () => true,
+        headers: { 'Content-Type': 'application/json' },
+    });
 
     if (playRes.status >= 400 || !playRes.data) {
         console.warn(`[vibeverse] play HTTP ${playRes.status}:`, playRes.data?.error || playRes.data || '');
@@ -121,16 +132,18 @@ export async function playVibeverseTrack(track, opts = {}) {
 
     let streamUrl = String(playRes.data.streamUrl || '').trim();
     let status = String(playRes.data.status || '').toUpperCase();
+    const delivery = String(playRes.data.delivery || (live ? 'hls' : 'source'));
     const resolvedTrack = playRes.data.track || track;
     const trackId = String(resolvedTrack.id || track.id);
     const title = String(resolvedTrack.title || track.title || 'Track');
 
     const needsWait =
-        !isPlayableAudioUrl(streamUrl) ||
-        isProgressiveExtractorUrl(streamUrl) ||
-        status === 'PREPARING' ||
-        status === 'DOWNLOADING' ||
-        status === 'PENDING';
+        !live &&
+        (!isPlayableAudioUrl(streamUrl) ||
+            isProgressiveExtractorUrl(streamUrl) ||
+            status === 'PREPARING' ||
+            status === 'DOWNLOADING' ||
+            status === 'PENDING');
 
     if (needsWait && waitMs > 0) {
         const ready = await waitForVibeverseReady(trackId, waitMs);
@@ -140,8 +153,16 @@ export async function playVibeverseTrack(track, opts = {}) {
         }
     }
 
-    if (!isPlayableAudioUrl(streamUrl) || isProgressiveExtractorUrl(streamUrl)) {
-        // Track exists; durable cache just isn't ready yet — not a "not found".
+    if (!isPlayableAudioUrl(streamUrl)) {
+        if (waitMs > 0) {
+            console.warn(`[vibeverse] no stream for ${trackId} (status=${status})`);
+        }
+        return { pending: true, trackId, title };
+    }
+
+    // Live HLS from extractor is the playable URL (m3u8). Progressive pipes still blocked
+    // for local Icecast path.
+    if (!live && isProgressiveExtractorUrl(streamUrl)) {
         if (waitMs > 0) {
             console.warn(`[vibeverse] no durable stream for ${trackId} (status=${status})`);
         }
@@ -157,6 +178,9 @@ export async function playVibeverseTrack(track, opts = {}) {
         artworkUrl: resolvedTrack.artworkUrl || track.artworkUrl,
         durationMs: Number(resolvedTrack.durationMs || track.durationMs || 0) || 0,
         streamUrl,
+        cached: playRes.data.cached === true,
+        progressiveReady: playRes.data.progressiveReady === true,
+        delivery,
     };
 }
 

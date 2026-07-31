@@ -392,7 +392,7 @@ function createVibeverseCommandHandler({
             player.armAutoplay?.('!play');
 
             await reply(`Looking up “${rest}”…`);
-            const one = await resolveVibeversePlayable(rest);
+            const one = await resolveVibeversePlayable(rest, { roomId });
             if (one?.pending) {
                 // Found, but still caching — keep music going via idle autoplay.
                 void player.ensurePlaying?.();
@@ -434,7 +434,7 @@ function createVibeverseCommandHandler({
             }
 
             await reply(`Looking up “${rest}”…`);
-            const one = await resolveVibeversePlayable(rest);
+            const one = await resolveVibeversePlayable(rest, { roomId });
             if (one?.pending) {
                 player.armAutoplay?.('!add');
                 void player.ensurePlaying?.();

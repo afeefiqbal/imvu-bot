@@ -139,10 +139,26 @@ export async function loadStreamConfig(opts) {
 }
 
 async function loadStreamConfigInner({ apiBaseUrl, roomId }) {
-    const base = String(apiBaseUrl || '').replace(/\/+$/, '');
-    if (!base) return streamConfigFromProcessEnv(roomId);
     const rid = String(roomId || '').trim();
     if (!rid) return null;
+
+    // Music-critical path: never call Laravel stream-audio-config (bot-only hosts
+    // often see 502/503). Prefer MUSIC_PUBLIC_* / ICECAST_* templates from env.
+    if (
+        truthyEnvFlag('MUSIC_SKIP_LARAVEL_STREAM_CONFIG') ||
+        truthyEnvFlag('MUSIC_PREFER_BOT_ENV')
+    ) {
+        const fromEnv = streamConfigFromProcessEnv(rid);
+        if (fromEnv) {
+            console.log(
+                `[music] loadStreamConfig: using bot env (skip Laravel) for ${rid}`,
+            );
+            return fromEnv;
+        }
+    }
+
+    const base = String(apiBaseUrl || '').replace(/\/+$/, '');
+    if (!base) return streamConfigFromProcessEnv(roomId);
     try {
         const res = await axios.get(`${base}/api/stream-audio-config`, {
             params: { room_id: rid },
