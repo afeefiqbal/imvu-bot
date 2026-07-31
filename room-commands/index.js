@@ -20,6 +20,16 @@ const SCALE_CHECK_INTERVAL_MS = Math.max(
     parseInt(String(process.env.IMVU_SCALE_CHECK_INTERVAL_MS || '30000'), 10) || 30000
 );
 
+/** Rooms where anyone may !seat (not only owner/mods). null = all rooms. */
+function seatOpenRoomSet() {
+    const raw = process.env.IMVU_SEAT_OPEN_ROOMS;
+    if (raw === undefined) return new Set(['242955291-1130']);
+    const t = String(raw).trim();
+    if (!t) return new Set();
+    if (/^(1|true|all|\*)$/i.test(t)) return null;
+    return new Set(t.split(/[,\s]+/).map((s) => s.trim()).filter(Boolean));
+}
+
 /**
  * @param {object} opts
  * @param {string} opts.roomId
@@ -58,6 +68,10 @@ export function createRoomChatCommandHandler(opts) {
         scalerWarnedAt: scalerWarnedAtOpt,
         getRoomModerators,
     } = opts;
+
+    const openSeatRooms = seatOpenRoomSet();
+    const seatOpenToAnyone =
+        openSeatRooms === null || openSeatRooms.has(String(roomId));
 
     const persist = async (patch) => {
         patchRoomSettingsLocal(roomId, patch);
@@ -242,8 +256,8 @@ export function createRoomChatCommandHandler(opts) {
             return true;
         }
 
-        // !seat / !move are open to anyone (guests often ask the bot to sit).
-        // Settings toggles stay mod/owner-only.
+        // !move is open to anyone. !seat is mod-only unless room is in IMVU_SEAT_OPEN_ROOMS
+        // (default includes 242955291-1130). Use =all for every room, or empty to require mods.
         const modOnly = new Set([
             'newgreeting',
             'autogreet',
@@ -258,6 +272,9 @@ export function createRoomChatCommandHandler(opts) {
             'maxkbs',
             'outfit',
         ]);
+        if (!seatOpenToAnyone) {
+            modOnly.add('seat');
+        }
         if (modOnly.has(cmd) && !(await requireMod(senderId, senderLabel))) return true;
 
         if (cmd === 'help') {
