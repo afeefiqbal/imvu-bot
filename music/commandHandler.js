@@ -297,7 +297,7 @@ function createVibeverseCommandHandler({
         return next;
     };
 
-    return async ({ text, senderLabel, senderId, isSelf }) => {
+    const handler = async ({ text, senderLabel, senderId, isSelf }) => {
         if (isSelf) return false;
         const parsed = parseCmdLine(text);
         if (!parsed) return false;
@@ -546,6 +546,9 @@ function createVibeverseCommandHandler({
 
         return false;
     };
+
+    handler.player = player;
+    return handler;
 }
 
 function createIcecastCommandHandler(opts) {
@@ -584,7 +587,7 @@ function createIcecastCommandHandler(opts) {
     /**
      * @returns {Promise<boolean>} true if this message was a music command (consumed)
      */
-    return async ({ text, senderLabel, senderId, isSelf }) => {
+    const handler = async ({ text, senderLabel, senderId, isSelf }) => {
         if (isSelf) return false;
         const parsed = parseCmdLine(text);
         if (!parsed) return false;
@@ -803,4 +806,7 @@ function createIcecastCommandHandler(opts) {
 
         return false;
     };
+
+    handler.player = player;
+    return handler;
 }

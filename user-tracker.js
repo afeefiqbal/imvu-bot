@@ -1263,5 +1263,24 @@ export async function startUserTracking(page, roomId, options = {}) {
             return { ok: Boolean(removed), reason: removed ? undefined : 'kick-failed' };
         },
         getVisitors: () => getVisitorListForSync(lastUserMap),
+        /** Dashboard / sync: turn idle autoplay on or off for this room. */
+        setAutoplay: (enabled) => {
+            const player = musicCommandHandler?.player;
+            if (!player) return { ok: false, reason: 'no-player' };
+            if (enabled) {
+                player.armAutoplay?.('dashboard');
+                player.kickAutoplayDrain?.();
+                void player.ensurePlaying?.();
+                return { ok: true, action: 'on' };
+            }
+            if (typeof player.autoplayOff === 'function') {
+                player.autoplayOff();
+            } else {
+                player.disarmAutoplay?.();
+                player.stop?.();
+            }
+            return { ok: true, action: 'off' };
+        },
+        isAutoplayArmed: () => Boolean(musicCommandHandler?.player?.isAutoplayArmed?.()),
     });
 }

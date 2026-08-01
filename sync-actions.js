@@ -132,6 +132,33 @@ export async function processSyncActions(data, ctx) {
         }
     }
 
+    if (Array.isArray(data.pending_autoplay)) {
+        for (const item of data.pending_autoplay) {
+            if (!item || typeof item !== 'object') continue;
+            const roomId = trackerRoomKey(item.room_id);
+            const action = String(item.action || '').trim().toLowerCase();
+            if (!roomId || (action !== 'on' && action !== 'off')) continue;
+
+            const runtime = getRoomRuntime(roomId);
+            if (!runtime?.setAutoplay) {
+                logger.warn(`${logPrefix} autoplay skipped — bot not in room ${roomId}`);
+                continue;
+            }
+            const result = runtime.setAutoplay(action === 'on');
+            if (result?.ok) {
+                logger.log(`${logPrefix} autoplay ${action} in ${roomId}`);
+                await reportMusicState(roomId, {
+                    state: action === 'on' ? 'autoplay-on' : 'autoplay-off',
+                    track: null,
+                });
+            } else {
+                logger.warn(
+                    `${logPrefix} autoplay ${action} failed room=${roomId}: ${result?.reason || 'unknown'}`,
+                );
+            }
+        }
+    }
+
     if (Array.isArray(data.pending_music)) {
         for (const item of data.pending_music) {
             if (!item || typeof item !== 'object') continue;
