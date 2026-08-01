@@ -207,56 +207,15 @@ export function createVibeverseRoomPlayer(opts) {
         disarmAutoplay();
     };
 
-    /** @returns {Promise<boolean>} false when bot cannot set radio — skip autoplay */
+    /**
+     * Only block after IMVU rejected a radio set with not-moderator.
+     * Proactive mod-list checks are flaky (empty roster) and were silencing autoplay
+     * even in rooms where the bot can set radio.
+     * @returns {Promise<boolean>}
+     */
     const botCanSetRoomRadio = async () => {
         if (radioControl.forbidden) return false;
-        const ttl = Math.max(
-            15_000,
-            parseInt(String(process.env.MUSIC_AUTOPLAY_MOD_CHECK_MS || '60000'), 10) || 60_000,
-        );
-        if (radioControl.ok != null && Date.now() - radioControl.at < ttl) {
-            return radioControl.ok;
-        }
-        if (
-            typeof sessionClient?.resolveBotUserId !== 'function' ||
-            typeof sessionClient?.fetchRoomOwnerId !== 'function'
-        ) {
-            // No session helpers — allow until IMVU returns not-moderator.
-            return true;
-        }
-        try {
-            const botId = String((await sessionClient.resolveBotUserId()) || '').trim();
-            if (!botId) return false;
-
-            const roomOwnerPrefix = String(roomId || '')
-                .trim()
-                .replace(/^room-/i, '')
-                .split('-')[0];
-            if (roomOwnerPrefix && roomOwnerPrefix === botId) {
-                radioControl = { at: Date.now(), ok: true, forbidden: false };
-                return true;
-            }
-
-            const ownerId = String((await sessionClient.fetchRoomOwnerId(roomId)) || '').trim();
-            if (ownerId && ownerId === botId) {
-                radioControl = { at: Date.now(), ok: true, forbidden: false };
-                return true;
-            }
-
-            const modIds =
-                typeof sessionClient.fetchRoomModeratorIds === 'function'
-                    ? await sessionClient.fetchRoomModeratorIds(roomId)
-                    : [];
-            const ok = (Array.isArray(modIds) ? modIds : []).some((id) => String(id) === botId);
-            radioControl = { at: Date.now(), ok, forbidden: false };
-            if (!ok) {
-                console.log(`[music] autoplay skip (${roomId}): bot ${botId} is not host/mod`);
-            }
-            return ok;
-        } catch (e) {
-            console.warn(`[music] host/mod check failed (${roomId}):`, e?.message || e);
-            return false;
-        }
+        return true;
     };
 
     /** After music goes idle/off — wait 3s (cancellable via !autoplay-off), then fill. */
