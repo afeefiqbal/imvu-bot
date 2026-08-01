@@ -179,6 +179,10 @@ export function createVibeverseRoomPlayer(opts) {
 
     const armAutoplay = (reason = 'user') => {
         autoplayOptedOut = false;
+        // Only explicit !play/!add may retry after a hard radio-control forbid.
+        if (radioControl.forbidden && /^(!play|!add|manual)/i.test(String(reason || ''))) {
+            radioControl = { at: 0, ok: null, forbidden: false };
+        }
         if (!autoplayArmed) {
             console.log(`[music] autoplay armed (${roomId}): ${reason}`);
         }
@@ -207,15 +211,82 @@ export function createVibeverseRoomPlayer(opts) {
         disarmAutoplay();
     };
 
+    const isRadioControlDeniedReason = (reason, detail = '') => {
+        const r = String(reason || '');
+        const d = String(detail || '');
+        return (
+            r === 'not-moderator' ||
+            r === 'not-authorized' ||
+            r === 'radio-player-not-found' ||
+            /MEDIA_PLAYER_NODE-004|host or moderator|must be host/i.test(`${r} ${d}`)
+        );
+    };
+
     /**
-     * Only block after IMVU rejected a radio set with not-moderator.
-     * Proactive mod-list checks are flaky (empty roster) and were silencing autoplay
-     * even in rooms where the bot can set radio.
+     * Prefer a real host/mod roster check. Empty mod lists are treated as unknown
+     * (allow one apply attempt); IMVU denials still mark forbidden.
      * @returns {Promise<boolean>}
      */
     const botCanSetRoomRadio = async () => {
         if (radioControl.forbidden) return false;
-        return true;
+        const ttl = Math.max(
+            15_000,
+            parseInt(String(process.env.MUSIC_AUTOPLAY_MOD_CHECK_MS || '60000'), 10) || 60_000,
+        );
+        if (radioControl.ok === true && Date.now() - radioControl.at < ttl) {
+            return true;
+        }
+        if (radioControl.ok === false && Date.now() - radioControl.at < ttl) {
+            return false;
+        }
+        if (
+            typeof sessionClient?.resolveBotUserId !== 'function' ||
+            typeof sessionClient?.fetchRoomOwnerId !== 'function'
+        ) {
+            return true;
+        }
+        try {
+            const botId = String((await sessionClient.resolveBotUserId()) || '').trim();
+            if (!botId) return false;
+
+            const roomOwnerPrefix = String(roomId || '')
+                .trim()
+                .replace(/^room-/i, '')
+                .split('-')[0];
+            if (roomOwnerPrefix && roomOwnerPrefix === botId) {
+                radioControl = { at: Date.now(), ok: true, forbidden: false };
+                return true;
+            }
+
+            const ownerId = String((await sessionClient.fetchRoomOwnerId(roomId)) || '').trim();
+            if (ownerId && ownerId === botId) {
+                radioControl = { at: Date.now(), ok: true, forbidden: false };
+                return true;
+            }
+
+            const modIds =
+                typeof sessionClient.fetchRoomModeratorIds === 'function'
+                    ? await sessionClient.fetchRoomModeratorIds(roomId)
+                    : [];
+            const mods = Array.isArray(modIds) ? modIds.map(String) : [];
+            if (mods.length > 0) {
+                const ok = mods.includes(botId);
+                radioControl = { at: Date.now(), ok, forbidden: !ok };
+                if (!ok) {
+                    console.log(
+                        `[music] autoplay skip (${roomId}): bot ${botId} is not host/mod (roster)`,
+                    );
+                    disarmAutoplay();
+                }
+                return ok;
+            }
+
+            // Empty roster — unknown. Allow a quiet apply attempt (no chat until success).
+            return true;
+        } catch (e) {
+            console.warn(`[music] host/mod check failed (${roomId}):`, e?.message || e);
+            return !radioControl.forbidden;
+        }
     };
 
     /** After music goes idle/off — wait 3s (cancellable via !autoplay-off), then fill. */
@@ -352,8 +423,9 @@ export function createVibeverseRoomPlayer(opts) {
             progressiveReady: pick.progressiveReady,
             delivery: pick.delivery,
             autoplay: true,
+            // Announce only after room radio URL is actually set.
+            announceOnRadioOk: true,
         });
-        announce(`▶ Autoplay: ${pick.title}`);
         return true;
     };
 
@@ -505,17 +577,17 @@ export function createVibeverseRoomPlayer(opts) {
         if (!applied.ok) {
             const reason = String(applied.reason || '');
             const detail = String(applied.detail || '');
-            if (
-                reason === 'not-moderator' ||
-                reason === 'not-authorized' ||
-                /MEDIA_PLAYER_NODE-004|host or moderator|must be host/i.test(`${reason} ${detail}`)
-            ) {
+            if (isRadioControlDeniedReason(reason, detail)) {
                 markRadioControlForbidden(reason || 'not-moderator');
             }
             return applied;
         }
         markRadioControlOk();
         lastRoomRadioUrl = url;
+        if (track?.announceOnRadioOk || track?.autoplay) {
+            track.announceOnRadioOk = false;
+            announce(`▶ Autoplay: ${track?.title || 'track'}`);
+        }
         // Don't block chat on IMVU playback confirmation — announce as soon as the URL is set.
         void waitForRoomMediaPlayback(page, {
             roomId,
@@ -563,7 +635,19 @@ export function createVibeverseRoomPlayer(opts) {
             forceRestart: true,
         });
         if (gen !== generation) return { ok: false, reason: 'stale' };
-        if (!applied.ok) return applied;
+        if (!applied.ok) {
+            if (track?.autoplay) {
+                playing = false;
+                queue.setCurrent(null);
+                notify(null, 'idle');
+                // Do not keep retrying autoplay when we cannot control room radio.
+                if (isRadioControlDeniedReason(applied.reason, applied.detail)) {
+                    clearAutoplayRetry();
+                    clearIdleKick();
+                }
+            }
+            return applied;
+        }
         playing = true;
         // No local ffmpeg — advance on duration timer.
         clearEndTimer();
