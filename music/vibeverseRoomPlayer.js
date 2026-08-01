@@ -75,6 +75,10 @@ export function createVibeverseRoomPlayer(opts) {
     let endTimer = null;
     /** @type {ReturnType<typeof setTimeout> | null} */
     let autoplayRetryTimer = null;
+    /** @type {ReturnType<typeof setTimeout> | null} */
+    let idleKickTimer = null;
+    /** @type {ReturnType<typeof setInterval> | null} */
+    let idleWatchInterval = null;
     /** @type {Promise<void>} */
     let drainTail = Promise.resolve();
     let generation = 0;
@@ -82,11 +86,19 @@ export function createVibeverseRoomPlayer(opts) {
     let activeStreamCfg = null;
     /** Last IMVU radio URL we successfully applied (stable /live skips rewrite). */
     let lastRoomRadioUrl = '';
-    /** Idle autoplay only after user music activity (!play / !add). */
-    let autoplayArmed = false;
+    /**
+     * Idle autoplay fills the queue when armed. Armed by default (and after !play/!add);
+     * only !autoplay-off opts out until the next !play/!add.
+     */
+    let autoplayArmed = envFlagTrue('MUSIC_AUTOPLAY', true) && roomAllowedForAutoplay(roomId);
+    /** Chat `!autoplay-off` — do not auto-start until !play/!add. */
+    let autoplayOptedOut = false;
     /** @type {string[]} */
     const recentAutoplayIds = [];
     let autoplayFailStreak = 0;
+
+    const idleDelayMs = () =>
+        Math.max(0, parseInt(String(process.env.MUSIC_AUTOPLAY_IDLE_MS || '3000'), 10) || 3000);
 
     const clearEndTimer = () => {
         if (endTimer) {
@@ -102,18 +114,50 @@ export function createVibeverseRoomPlayer(opts) {
         }
     };
 
+    const clearIdleKick = () => {
+        if (idleKickTimer) {
+            clearTimeout(idleKickTimer);
+            idleKickTimer = null;
+        }
+    };
+
+    const botBusyLocally = () =>
+        Boolean(
+            paused ||
+                playing ||
+                ffProc ||
+                outgoingProc ||
+                endTimer ||
+                queue.getCurrent() ||
+                queue.peek(),
+        );
+
+    /** @returns {Promise<boolean|null>} true=playing, false=off, null=unknown */
+    const roomRadioPlaying = async () => {
+        if (typeof sessionClient?.fetchRoomMediaPlaybackState !== 'function') return null;
+        try {
+            const st = await sessionClient.fetchRoomMediaPlaybackState(roomId);
+            if (!st?.ok) return null;
+            const status = String(st.status || '').toLowerCase();
+            const url = String(st.stationUrl || '').trim();
+            return status === 'playing' && Boolean(url);
+        } catch {
+            return null;
+        }
+    };
+
     const scheduleAutoplayRetry = () => {
         clearAutoplayRetry();
-        if (!autoplayArmed || paused) return;
+        if (autoplayOptedOut || !autoplayArmed || paused) return;
         const ms = Math.max(
             5000,
             parseInt(String(process.env.MUSIC_AUTOPLAY_RETRY_MS || '15000'), 10) || 15000,
         );
         autoplayRetryTimer = setTimeout(() => {
             autoplayRetryTimer = null;
-            if (!autoplayArmed || paused) return;
+            if (autoplayOptedOut || !autoplayArmed || paused) return;
             // Soft cutover parks prior encode in outgoingProc — still busy.
-            if (playing || ffProc || outgoingProc || queue.getCurrent() || queue.peek()) return;
+            if (botBusyLocally()) return;
             console.log(`[music] autoplay retry (${roomId})`);
             void enqueueDrain();
         }, ms);
@@ -128,6 +172,7 @@ export function createVibeverseRoomPlayer(opts) {
     };
 
     const armAutoplay = (reason = 'user') => {
+        autoplayOptedOut = false;
         if (!autoplayArmed) {
             console.log(`[music] autoplay armed (${roomId}): ${reason}`);
         }
@@ -141,6 +186,53 @@ export function createVibeverseRoomPlayer(opts) {
         autoplayArmed = false;
         autoplayFailStreak = 0;
         clearAutoplayRetry();
+        clearIdleKick();
+    };
+
+    /** After music goes idle/off — wait 3s (cancellable via !autoplay-off), then fill. */
+    const scheduleIdleAutoplay = (reason = 'idle') => {
+        clearIdleKick();
+        if (autoplayOptedOut || paused) return;
+        if (!envFlagTrue('MUSIC_AUTOPLAY', true) || !roomAllowedForAutoplay(roomId)) return;
+        if (botBusyLocally()) return;
+        const ms = idleDelayMs();
+        console.log(`[music] idle autoplay scheduled in ${ms}ms (${roomId}): ${reason}`);
+        idleKickTimer = setTimeout(() => {
+            idleKickTimer = null;
+            void kickIdleAutoplay(reason);
+        }, ms);
+    };
+
+    const kickIdleAutoplay = async (reason = 'idle') => {
+        if (autoplayOptedOut || paused) return;
+        if (!envFlagTrue('MUSIC_AUTOPLAY', true) || !roomAllowedForAutoplay(roomId)) return;
+        if (botBusyLocally()) return;
+        const radioOn = await roomRadioPlaying();
+        if (radioOn === true) {
+            console.log(`[music] idle autoplay skip (${roomId}): room radio already playing`);
+            return;
+        }
+        armAutoplay(reason);
+        console.log(`[music] idle autoplay kick (${roomId}): ${reason}`);
+        void enqueueDrain();
+    };
+
+    const startIdleWatcher = () => {
+        if (idleWatchInterval) return;
+        const pollMs = Math.max(
+            5000,
+            parseInt(String(process.env.MUSIC_AUTOPLAY_IDLE_POLL_MS || '15000'), 10) || 15000,
+        );
+        idleWatchInterval = setInterval(() => {
+            if (autoplayOptedOut || paused || botBusyLocally() || idleKickTimer) return;
+            void (async () => {
+                const radioOn = await roomRadioPlaying();
+                if (radioOn === true) return;
+                // Room radio off/unknown and bot idle → start after delay.
+                scheduleIdleAutoplay(radioOn === false ? 'room-radio-off' : 'idle-poll');
+            })();
+        }, pollMs);
+        if (typeof idleWatchInterval.unref === 'function') idleWatchInterval.unref();
     };
 
     const rememberAutoplayId = (trackId) => {
@@ -163,8 +255,12 @@ export function createVibeverseRoomPlayer(opts) {
             );
             return false;
         }
+        if (autoplayOptedOut) {
+            console.log(`[music] autoplay skip (${roomId}): !autoplay-off`);
+            return false;
+        }
         if (!autoplayArmed) {
-            console.log(`[music] autoplay skip (${roomId}): not armed (need !play/!add first)`);
+            console.log(`[music] autoplay skip (${roomId}): not armed`);
             return false;
         }
         if (!roomAllowedForAutoplay(roomId)) {
@@ -906,21 +1002,35 @@ export function createVibeverseRoomPlayer(opts) {
         return next;
     };
 
+    // Start watching room radio; kick first song after idle delay if nothing is on.
+    startIdleWatcher();
+    if (autoplayArmed && !autoplayOptedOut) {
+        scheduleIdleAutoplay('on-mount');
+    }
+
     return {
         getQueue: () => queue,
-        isPlaying: () => playing && !paused && (ffProc != null || outgoingProc != null),
+        // Extractor-live HLS has no local ffmpeg — `playing` + current track is enough.
+        isPlaying: () =>
+            playing &&
+            !paused &&
+            (ffProc != null || outgoingProc != null || endTimer != null || queue.getCurrent() != null),
         isPaused: () => paused,
         hasActive: () =>
             playing ||
             paused ||
             ffProc != null ||
             outgoingProc != null ||
+            endTimer != null ||
             queue.getCurrent() != null ||
             queue.peek() != null,
-        isAutoplayArmed: () => autoplayArmed,
+        isAutoplayArmed: () => autoplayArmed && !autoplayOptedOut,
+        isAutoplayOptedOut: () => autoplayOptedOut,
         armAutoplay: (reason) => armAutoplay(reason || 'manual'),
         disarmAutoplay,
         ensurePlaying: () => enqueueDrain(),
+        /** Soft kick used by command handler (same as idle schedule). */
+        kickAutoplayDrain: () => scheduleIdleAutoplay('kick'),
 
         /**
          * Soft-preempt for !play: bump generation / clear pending queue, but keep
@@ -930,6 +1040,7 @@ export function createVibeverseRoomPlayer(opts) {
 
         /** Replace whatever is playing/queued with this track and start it now. */
         async playNow(track) {
+            clearIdleKick();
             armAutoplay('!play');
             clearEndTimer();
             generation += 1;
@@ -944,6 +1055,7 @@ export function createVibeverseRoomPlayer(opts) {
         },
 
         async enqueue(track) {
+            clearIdleKick();
             armAutoplay('!add');
             const wasIdle =
                 !queue.getCurrent() && !playing && !paused && !ffProc && !queue.peek();
@@ -964,10 +1076,14 @@ export function createVibeverseRoomPlayer(opts) {
             return playCurrentOrNext();
         },
 
+        /**
+         * Stop current song + clear queue. Autoplay stays armed and resumes after
+         * the idle delay unless the room used !autoplay-off.
+         */
         stop() {
-            disarmAutoplay();
             clearEndTimer();
             clearAutoplayRetry();
+            clearIdleKick();
             generation += 1;
             killFf();
             queue.clearAll();
@@ -976,13 +1092,36 @@ export function createVibeverseRoomPlayer(opts) {
             lastRoomRadioUrl = '';
             notify(null, 'idle');
             stopRoomRadioQuiet();
+            if (!autoplayOptedOut && envFlagTrue('MUSIC_AUTOPLAY', true)) {
+                if (!autoplayArmed) armAutoplay('after-stop');
+                scheduleIdleAutoplay('after-stop');
+            }
+        },
+
+        /** Permanent opt-out until !play/!add — stops music and cancels idle kick. */
+        autoplayOff() {
+            autoplayOptedOut = true;
+            disarmAutoplay();
+            clearEndTimer();
+            clearAutoplayRetry();
+            clearIdleKick();
+            generation += 1;
+            killFf();
+            queue.clearAll();
+            playing = false;
+            paused = false;
+            lastRoomRadioUrl = '';
+            notify(null, 'idle');
+            stopRoomRadioQuiet();
+            console.log(`[music] autoplay opted out (${roomId}): !autoplay-off`);
         },
 
         pause() {
-            if (!queue.getCurrent() && !playing && !ffProc) return false;
+            if (!queue.getCurrent() && !playing && !ffProc && !endTimer) return false;
             paused = true;
             playing = false;
             clearEndTimer();
+            clearIdleKick();
             killFf();
             notify(queue.getCurrent(), 'paused');
             return true;

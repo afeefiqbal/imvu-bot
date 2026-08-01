@@ -69,7 +69,7 @@ async function replyRoomMediaFailure(reply, result, track = null) {
     );
 }
 
-const HELP_VIBEVERSE = `Music: !play/!p · !add/!a · !queue/!q · !skip/!next · !stop · !pause · !resume · !music · !play .typo for smart search · after !play, random songs keep playing until !stop · radio https://vibeverse-web.vvpz.workers.dev/radio`;
+const HELP_VIBEVERSE = `Music: !play/!p · !add/!a · !queue/!q · !skip/!next · !stop · !pause · !resume · !autoplay-off · !music · when radio is off, autoplay starts in ~3s · !autoplay-off keeps music off · radio https://vibeverse-web.vvpz.workers.dev/radio`;
 const HELP_ICECAST = `Music: !play/!p · !add/!a · !queue/!q · !skip · !stop · !pause · !resume · !music · idle playlist is server .env only (not set by chat)`;
 
 function parseCmdLine(text) {
@@ -319,6 +319,16 @@ function createVibeverseCommandHandler({
             return true;
         }
 
+        if (cmd === '*autoplay-off' || cmd === '*autoplayoff') {
+            if (player.isAutoplayOptedOut?.()) {
+                await reply('Autoplay is already off. Say !play <song> to start music again.');
+                return true;
+            }
+            player.autoplayOff?.();
+            await reply('Autoplay off. Music will stay stopped until someone uses !play.');
+            return true;
+        }
+
         if (cmd === '*s' && rest) return false;
 
         if (cmd === '*skip' || cmd === '*s' || cmd === '*next') {
@@ -343,12 +353,16 @@ function createVibeverseCommandHandler({
         }
 
         if (cmd === '*stop') {
-            if (!hasActivePlayback(player) && !player.isAutoplayArmed?.()) {
+            if (!hasActivePlayback(player) && !player.isAutoplayArmed?.() && !player.isAutoplayOptedOut?.()) {
                 await reply('Nothing playing.');
                 return true;
             }
+            if (player.isAutoplayOptedOut?.() && !hasActivePlayback(player)) {
+                await reply('Nothing playing. Autoplay is off — say !play to start.');
+                return true;
+            }
             player.stop();
-            await reply('Stopped. Queue cleared — autoplay off until the next !play.');
+            await reply('Stopped. Autoplay resumes in ~3s — say !autoplay-off to keep music off.');
             return true;
         }
 
