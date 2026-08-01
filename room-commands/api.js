@@ -94,3 +94,35 @@ export async function postBotRoomJoin(apiBaseUrl, botName, roomId, sender = {}) 
         };
     }
 }
+
+/**
+ * Bot cannot enter IMVU room — delete from dashboard / bot lists / Discord.
+ * @param {string} apiBaseUrl
+ * @param {string} botName
+ * @param {string} roomId
+ * @param {string} [reason]
+ */
+export async function postBotRoomAbandon(apiBaseUrl, botName, roomId, reason = '') {
+    const base = String(apiBaseUrl || '').replace(/\/$/, '');
+    if (!base || !botName || !roomId) return { ok: false, message: 'missing params' };
+
+    try {
+        const response = await axios.post(
+            `${base}/api/bot-room/abandon`,
+            {
+                room_id: roomId,
+                bot_name: botName,
+                reason: reason ? String(reason).slice(0, 255) : undefined,
+            },
+            { timeout: 15000 }
+        );
+        return response.data || { ok: false, message: 'empty response' };
+    } catch (error) {
+        const data = error.response?.data;
+        return {
+            ok: false,
+            message: data?.error || data?.message || error.message || 'abandon failed',
+            send_dm: false,
+        };
+    }
+}

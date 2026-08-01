@@ -31,6 +31,7 @@ import {
     handleSocialWsDmHint,
 } from './sync-actions.js';
 import { resolveBotImvuProfile } from './imvu-profile-sync.js';
+import { postBotRoomAbandon } from './room-commands/api.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -422,6 +423,79 @@ async function main() {
         );
     };
 
+    /** @type {Map<string, { fails: number, lastReason: string, abandoning: boolean }>} */
+    const joinAccessFails = new Map();
+    const joinFailLimit = Math.max(
+        1,
+        parseInt(String(process.env.IMVU_ROOM_ABANDON_AFTER_FAILS || '2'), 10) || 2,
+    );
+
+    const abandonUnreachableRoom = async (roomId, reason = 'forbidden') => {
+        const id = trackerRoomId(roomId);
+        if (!id) return;
+        const state = joinAccessFails.get(id) || { fails: 0, lastReason: '', abandoning: false };
+        if (state.abandoning) return;
+        state.abandoning = true;
+        joinAccessFails.set(id, state);
+        console.warn(
+            `[${BOT_NAME}] Abandoning unreachable room ${id} (${reason}) — removing from dashboard/bots`,
+        );
+        try {
+            await stopRoom(id).catch(() => null);
+        } catch {
+            /* ignore */
+        }
+        locallyPausedRooms.add(id);
+        const result = await postBotRoomAbandon(BACKEND_URL, BOT_NAME, id, reason);
+        if (result?.ok) {
+            console.log(`[${BOT_NAME}] Abandoned room ${id}: ${result.message || 'ok'}`);
+            configuredRoomIds = configuredRoomIds.filter((r) => r !== id);
+            joinAccessFails.delete(id);
+        } else {
+            state.abandoning = false;
+            joinAccessFails.set(id, state);
+            console.warn(
+                `[${BOT_NAME}] Abandon API failed for ${id}: ${result?.message || 'unknown'}`,
+            );
+        }
+    };
+
+    const noteJoinAccessProbe = async (roomId) => {
+        const id = trackerRoomId(roomId);
+        if (!id || typeof session.probeRoomJoinAccess !== 'function') return true;
+        if (locallyPausedRooms.has(id)) return false;
+        let probe;
+        try {
+            probe = await session.probeRoomJoinAccess(id);
+        } catch (error) {
+            console.warn(`[${BOT_NAME}] join probe failed for ${id}: ${error?.message || error}`);
+            return true;
+        }
+        if (probe?.ok) {
+            joinAccessFails.delete(id);
+            return true;
+        }
+        const hard =
+            probe?.reason === 'forbidden' ||
+            probe?.reason === 'not-found' ||
+            probe?.reason === 'bad-room-id';
+        if (!hard) return true;
+
+        const prev = joinAccessFails.get(id) || { fails: 0, lastReason: '', abandoning: false };
+        prev.fails += 1;
+        prev.lastReason = String(probe.reason || 'forbidden');
+        joinAccessFails.set(id, prev);
+        console.warn(
+            `[${BOT_NAME}] Room ${id} join denied (${prev.lastReason}` +
+                `${probe.status ? ` HTTP ${probe.status}` : ''}) — fail ${prev.fails}/${joinFailLimit}`,
+        );
+        if (prev.fails >= joinFailLimit) {
+            await abandonUnreachableRoom(id, prev.lastReason);
+            return false;
+        }
+        return false;
+    };
+
     const startRoom = async (roomId, { force = false } = {}) => {
         const id = trackerRoomId(roomId);
         if (!id || roomClients.has(id)) return roomClients.get(id) || null;
@@ -436,6 +510,9 @@ async function main() {
             console.warn(`[${BOT_NAME}] Max room count ${MAX_ROOMS} reached; skipping ${id}.`);
             return null;
         }
+
+        const canJoin = await noteJoinAccessProbe(id);
+        if (!canJoin) return null;
 
         const details = await session.fetchRoomDetails(id);
         if (typeof session.watchRoomDmContacts === 'function' && isDmJoinEnabled()) {
@@ -773,6 +850,22 @@ async function main() {
                 await startRoom(target).catch((error) => {
                     console.error(`[${BOT_NAME}] Failed to start room ${target}: ${error.message}`);
                 });
+            }
+
+            // Rooms that connected but never got a chat queue (403) — probe and drop.
+            for (const id of [...roomClients.keys()]) {
+                if (locallyPausedRooms.has(id)) continue;
+                const client = roomClients.get(id)?.client;
+                if (!client) continue;
+                const hasChat =
+                    Boolean(client.chatQueue) ||
+                    client.legacyChatSubscribed === true ||
+                    client.liveRoom === true;
+                if (hasChat) {
+                    joinAccessFails.delete(id);
+                    continue;
+                }
+                await noteJoinAccessProbe(id);
             }
         })();
     }, syncIntervalMs);

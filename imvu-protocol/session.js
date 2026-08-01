@@ -827,6 +827,57 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         }
     }
 
+    /**
+     * Hard join probe: 403/401 on chat (and no live audience fallback) means the bot
+     * cannot enter — dashboard should drop the room instead of retrying forever.
+     * @returns {Promise<{ ok: boolean, reason: string, status?: number }>}
+     */
+    async function probeRoomJoinAccess(roomId) {
+        const normalizedRoomId = String(roomId || '').trim().replace(/^room-/i, '');
+        if (!/^\d+-\d+$/.test(normalizedRoomId)) {
+            return { ok: false, reason: 'bad-room-id' };
+        }
+
+        let chatStatus = 0;
+        try {
+            const response = await client.get(
+                new URL(`chat/chat-${normalizedRoomId}`, `${DEFAULT_API_ORIGIN}/`).href,
+                {
+                    headers: { Accept: 'application/json' },
+                    validateStatus: () => true,
+                    timeout: Number(process.env.IMVU_ROOM_PROBE_TIMEOUT_MS || 15000),
+                },
+            );
+            chatStatus = Number(response.status) || 0;
+            if (chatStatus >= 200 && chatStatus < 300 && findLegacyChatQueue(response.data)) {
+                return { ok: true, reason: 'legacy-chat', status: chatStatus };
+            }
+        } catch (error) {
+            const msg = String(error?.message || error || '');
+            if (/403|401|forbidden|unauthorized/i.test(msg)) {
+                return { ok: false, reason: 'forbidden', status: 403 };
+            }
+            if (/404|not found/i.test(msg)) {
+                return { ok: false, reason: 'not-found', status: 404 };
+            }
+        }
+
+        const live = await fetchLiveRoomContext(normalizedRoomId);
+        if (live?.isLive && (live.audienceQueue || live.hangoutQueue)) {
+            return { ok: true, reason: 'live-audience' };
+        }
+
+        if (chatStatus === 403 || chatStatus === 401) {
+            return { ok: false, reason: 'forbidden', status: chatStatus };
+        }
+        if (chatStatus === 404) {
+            return { ok: false, reason: 'not-found', status: chatStatus };
+        }
+
+        // Soft unknown — do not auto-delete (transient IMVU/network blips).
+        return { ok: true, reason: 'unknown-allow', status: chatStatus || undefined };
+    }
+
     async function fetchChatParticipant(roomId, userId, sauce = '') {
         const normalizedRoomId = String(roomId || '').trim().replace(/^room-/i, '');
         const normalizedUserId = String(userId || '').trim();
@@ -2956,6 +3007,7 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         apiGetWearableScan,
         fetchUserName,
         fetchLegacyChatQueue,
+        probeRoomJoinAccess,
         fetchLiveRoomContext,
         ensureAudienceJoin,
         leaveAudienceJoin,
