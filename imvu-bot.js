@@ -457,6 +457,14 @@ async function main() {
             console.warn(
                 `[${BOT_NAME}] Abandon API failed for ${id}: ${result?.message || 'unknown'}`,
             );
+            // Render may still be deploying the abandon route — retry shortly.
+            const retryMs = Math.max(
+                15000,
+                parseInt(String(process.env.IMVU_ROOM_ABANDON_API_RETRY_MS || '45000'), 10) || 45000,
+            );
+            setTimeout(() => {
+                void abandonUnreachableRoom(id, reason);
+            }, retryMs);
         }
     };
 
