@@ -1776,75 +1776,9 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                     return { ok: true, reason: 'url-unchanged' };
                 }
 
-                // Same-URL HLS cutover: stop → update(with _play bust) → start.
-                // Do NOT stop→start only — IMVU keeps the old HLS session and rooms go silent.
-                const sameUrlCutover =
-                    forceRestart &&
-                    curUrl &&
-                    curUrl === stationUrl &&
-                    !/^(0|false|no|off)$/i.test(
-                        String(process.env.IMVU_RADIO_FAST_SAME_URL_PULSE ?? '1').trim(),
-                    );
-
-                if (sameUrlCutover) {
-                    // Default: update(?_play=) → start (skip stop — saves ~1–2s).
-                    // Set IMVU_RADIO_CUTOVER_STOP=1 if rooms stick on the previous track.
-                    const doStop = !/^(0|false|no|off)$/i.test(
-                        String(process.env.IMVU_RADIO_CUTOVER_STOP ?? '1').trim(),
-                    );
-                    if (doStop) {
-                        const stopRes = await postMediaPlayerAction(
-                            roomId,
-                            postPlayerUrl,
-                            { action: 'stop_radio' },
-                            etag,
-                        );
-                        if (stopRes.etag) etag = stopRes.etag;
-                    }
-                    const updateRes = await postMediaPlayerAction(
-                        roomId,
-                        postPlayerUrl,
-                        {
-                            action: 'update_radio',
-                            station_name: stationName,
-                            station_url: stationUrlForImvu,
-                        },
-                        etag,
-                    );
-                    if (updateRes.etag) etag = updateRes.etag;
-                    if (!updateRes.ok) {
-                        const detail = summarizeResponseData(updateRes.data);
-                        logger.warn(
-                            `[IMVU-SESSION] Fast cutover update failed for ${roomId}: POST ${updateRes.status}${detail}`,
-                        );
-                        return { ok: false, reason: `post-${updateRes.status}`, detail };
-                    }
-                    const startRes = await postMediaPlayerAction(
-                        roomId,
-                        postPlayerUrl,
-                        { action: 'start_radio' },
-                        etag,
-                    );
-                    if (!startRes.ok) {
-                        const detail = summarizeResponseData(startRes.data);
-                        logger.warn(
-                            `[IMVU-SESSION] Fast cutover start failed for ${roomId}: POST ${startRes.status}${detail}`,
-                        );
-                        return { ok: false, reason: `post-${startRes.status}`, detail };
-                    }
-                    rememberRadioEtag(roomId, startRes.etag || etag, stationUrl);
-                    lastAppliedRoomRadio.set(String(roomId || '').trim(), {
-                        url: stationUrl,
-                        stationName,
-                        at: Date.now(),
-                    });
-                    markRadioOpQuiet(roomId);
-                    logger.log(
-                        `[IMVU-SESSION] Fast same-URL radio cutover for ${roomId} in ${Date.now() - tRadio}ms: ${stationUrlForImvu}`,
-                    );
-                    return { ok: true, reason: 'api-fast-same-url-cutover' };
-                }
-
+                // Same-path / forceRestart cutover must flash-clear: IMVU strips ?_play=
+                // from persisted station_url, so stop→update(same path) leaves clients on
+                // the old HLS session until they rejoin. Empty URL forces a reload.
                 const stopRes = await postMediaPlayerAction(
                     roomId,
                     postPlayerUrl,
@@ -1852,10 +1786,14 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                     etag,
                 );
                 if (stopRes.etag) etag = stopRes.etag;
-                // Default 0: waiting for "stopped" re-GETs the player and often costs >1s.
+                // forceRestart defaults to a short stopped wait so clients drop the stream.
+                const waitStoppedDefault = forceRestart ? '500' : '0';
                 const waitStoppedMs = Math.max(
                     0,
-                    parseInt(String(process.env.IMVU_RADIO_WAIT_STOPPED_MS || '0'), 10) || 0,
+                    parseInt(
+                        String(process.env.IMVU_RADIO_WAIT_STOPPED_MS || waitStoppedDefault),
+                        10,
+                    ) || 0,
                 );
                 if (waitStoppedMs > 0) {
                     const stopped = await waitForRoomRadioStatus(roomId, 'stopped', waitStoppedMs);
@@ -1866,13 +1804,12 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                     }
                 }
 
-                // Flash-clear is slow (~2–4s). Default off when URL already has ?_play=
-                // cache-bust (forceRestart path). Set IMVU_RADIO_URL_FLASH_CLEAR=1 to force.
-                const flashClear =
-                    !forceRestart &&
-                    !/^(0|false|no|off)$/i.test(
-                        String(process.env.IMVU_RADIO_URL_FLASH_CLEAR ?? '0').trim(),
-                    );
+                // Default ON for forceRestart (track change on stable/live HLS).
+                // Set IMVU_RADIO_URL_FLASH_CLEAR=0 to skip.
+                const flashClearDefault = forceRestart ? '1' : '0';
+                const flashClear = !/^(0|false|no|off)$/i.test(
+                    String(process.env.IMVU_RADIO_URL_FLASH_CLEAR ?? flashClearDefault).trim(),
+                );
                 if (flashClear) {
                     const clearRes = await postMediaPlayerAction(
                         roomId,
@@ -1885,16 +1822,13 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
                         etag,
                     );
                     if (clearRes.etag) etag = clearRes.etag;
-                    await new Promise((r) =>
-                        setTimeout(
-                            r,
-                            Math.max(
-                                50,
-                                parseInt(String(process.env.IMVU_RADIO_URL_FLASH_MS || '150'), 10) ||
-                                    150,
-                            ),
-                        ),
+                    // forceRestart needs a longer empty gap so IMVU clients drop HLS
+                    // (100ms is often too short — users still had to rejoin).
+                    const flashMs = Math.max(
+                        forceRestart ? 350 : 50,
+                        parseInt(String(process.env.IMVU_RADIO_URL_FLASH_MS || '150'), 10) || 150,
                     );
+                    await new Promise((r) => setTimeout(r, flashMs));
                 }
 
                 const updateRes = await postMediaPlayerAction(

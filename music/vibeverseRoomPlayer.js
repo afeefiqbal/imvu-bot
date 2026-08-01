@@ -615,6 +615,41 @@ export function createVibeverseRoomPlayer(opts) {
     const vibeverseLiveMode = () =>
         /^(1|true|yes|on)$/i.test(String(process.env.MUSIC_VIBEVERSE_LIVE || '').trim());
 
+    /**
+     * Hit the live playlist once before radio apply so extractor can cold-restart
+     * from 0 (encode otherwise runs ahead during search/cutover → mid-song).
+     */
+    const primeExtractorLiveHls = async (url) => {
+        const u = String(url || '').trim();
+        if (!/^https:\/\//i.test(u)) return;
+        const started = Date.now();
+        const timeoutMs = Math.max(
+            8_000,
+            parseInt(String(process.env.MUSIC_HLS_PRIME_TIMEOUT_MS || '20000'), 10) || 20_000,
+        );
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), timeoutMs);
+        try {
+            const res = await fetch(u, {
+                method: 'GET',
+                headers: {
+                    Accept: 'application/vnd.apple.mpegurl,application/x-mpegURL,*/*',
+                    'Cache-Control': 'no-cache',
+                },
+                signal: ac.signal,
+            });
+            const text = res.ok ? await res.text() : '';
+            const segs = (text.match(/\.ts\b/g) || []).length;
+            console.log(
+                `[music] primed live HLS (${Date.now() - started}ms, http=${res.status}, segs=${segs}): ${u}`,
+            );
+        } catch (e) {
+            console.warn(`[music] live HLS prime failed:`, e?.message || e);
+        } finally {
+            clearTimeout(timer);
+        }
+    };
+
     /** Extractor owns ffmpeg; bot only sets IMVU room radio to the live m3u8. */
     const playViaExtractorLive = async (track, gen) => {
         const url = String(track?.streamUrl || '').trim();
@@ -628,8 +663,10 @@ export function createVibeverseRoomPlayer(opts) {
         console.log(`[music] extractor live HLS — set room radio only: ${url}`);
         discardOutgoing();
         killCurrentEncodeOnly();
-        // Same m3u8 path per room; content changes under it — always stop→update→start
-        // so IMVU reloads instead of staying on the previous track (or silence).
+        // Restart encode near t=0, then force IMVU cutover (flash-clear) so
+        // in-room clients reload without leaving/rejoining.
+        await primeExtractorLiveHls(url);
+        if (gen !== generation) return { ok: false, reason: 'stale' };
         const applied = await applyPublicUrlToRoom(url, track, {
             skipIfSame: false,
             forceRestart: true,
