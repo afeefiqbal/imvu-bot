@@ -481,7 +481,12 @@ async function main() {
             probe?.reason === 'bad-room-id';
         if (!hard) return true;
 
-        const prev = joinAccessFails.get(id) || { fails: 0, lastReason: '', abandoning: false };
+        const prev = joinAccessFails.get(id) || {
+            fails: 0,
+            lastReason: '',
+            abandoning: false,
+            retryTimer: null,
+        };
         prev.fails += 1;
         prev.lastReason = String(probe.reason || 'forbidden');
         joinAccessFails.set(id, prev);
@@ -490,8 +495,25 @@ async function main() {
                 `${probe.status ? ` HTTP ${probe.status}` : ''}) — fail ${prev.fails}/${joinFailLimit}`,
         );
         if (prev.fails >= joinFailLimit) {
+            if (prev.retryTimer) {
+                clearTimeout(prev.retryTimer);
+                prev.retryTimer = null;
+            }
             await abandonUnreachableRoom(id, prev.lastReason);
             return false;
+        }
+        // Don't wait on dashboard sync (often 503 during Render deploys) for the next fail.
+        if (!prev.retryTimer) {
+            const retryMs = Math.max(
+                5000,
+                parseInt(String(process.env.IMVU_ROOM_ABANDON_RETRY_MS || '12000'), 10) || 12000,
+            );
+            prev.retryTimer = setTimeout(() => {
+                const state = joinAccessFails.get(id);
+                if (state) state.retryTimer = null;
+                void noteJoinAccessProbe(id);
+            }, retryMs);
+            joinAccessFails.set(id, prev);
         }
         return false;
     };
