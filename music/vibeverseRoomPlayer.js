@@ -16,6 +16,7 @@ import {
     waitForIcecastMountLive,
 } from './icecastLive.js';
 import { isHlsColdEnabled, isHlsOnlyEnabled, startHlsColdSession } from './hlsSession.js';
+import { probePublicStreamForImvu } from './verifyImvuStreamUrl.js';
 
 function envFlagTrue(name, defaultOn = false) {
     const raw = process.env[name];
@@ -86,6 +87,8 @@ export function createVibeverseRoomPlayer(opts) {
     let activeStreamCfg = null;
     /** Last IMVU radio URL we successfully applied (stable /live skips rewrite). */
     let lastRoomRadioUrl = '';
+    /** Cache station_url liveness so idle polls don't hammer dead links. */
+    let radioUrlProbe = { url: '', at: 0, alive: /** @type {boolean|null} */ (null) };
     /**
      * Idle autoplay fills the queue when armed. Armed by default (and after !play/!add);
      * only !autoplay-off opts out until the next !play/!add.
@@ -146,7 +149,36 @@ export function createVibeverseRoomPlayer(opts) {
             if (!st?.ok) return null;
             const status = String(st.status || '').toLowerCase();
             const url = String(st.stationUrl || '').trim();
-            return status === 'playing' && Boolean(url);
+            if (status !== 'playing' || !url) return false;
+
+            // We are actively encoding / draining — treat as playing.
+            if (botBusyLocally()) return true;
+
+            // IMVU often leaves status=playing with a stale station_url (dead tunnel / empty
+            // mount) while the room is silent. Probe before blocking idle autoplay.
+            const now = Date.now();
+            const probeTtlMs = Math.max(
+                5000,
+                parseInt(String(process.env.MUSIC_RADIO_PROBE_CACHE_MS || '20000'), 10) || 20000,
+            );
+            if (
+                radioUrlProbe.url === url &&
+                radioUrlProbe.alive != null &&
+                now - radioUrlProbe.at < probeTtlMs
+            ) {
+                return radioUrlProbe.alive;
+            }
+
+            const probe = await probePublicStreamForImvu(url, 4500);
+            const alive = probe?.ok === true;
+            radioUrlProbe = { url, at: now, alive };
+            if (!alive) {
+                console.log(
+                    `[music] room radio link silent/stale (${roomId}): ${probe?.reason || 'unreachable'}` +
+                        ` — allowing autoplay`,
+                );
+            }
+            return alive;
         } catch {
             return null;
         }
