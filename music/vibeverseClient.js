@@ -133,7 +133,12 @@ export function parseMusicSearchQuery(raw) {
 
 /**
  * @param {string} query
- * @param {{ roomId?: string, onPicked?: (track: object) => void | Promise<void>, smart?: boolean }} [opts]
+ * @param {{
+ *   roomId?: string,
+ *   onFound?: (track: object) => void | Promise<void>,
+ *   onPicked?: (track: object) => void | Promise<void>,
+ *   smart?: boolean,
+ * }} [opts]
  * @returns {Promise<VibeversePlayable | VibeversePending | { failed: true, trackId?: string, title?: string, detail?: string } | null>}
  */
 export async function resolveVibeversePlayable(query, opts = {}) {
@@ -175,6 +180,14 @@ export async function resolveVibeversePlayable(query, opts = {}) {
     if (playOrder[0]?.ready) {
         console.log(`[vibeverse] top hit READY (cached) — fast path: ${playOrder[0].title || '?'}`);
     }
+    // Immediate feedback after search (~1–3s) — stream prep can still take 10–30s.
+    if (typeof opts.onFound === 'function' && playOrder[0]) {
+        try {
+            await opts.onFound(playOrder[0]);
+        } catch {
+            /* ignore */
+        }
+    }
     let announced = false;
     for (const track of playOrder) {
         const tPlay = Date.now();
@@ -183,11 +196,11 @@ export async function resolveVibeversePlayable(query, opts = {}) {
             `[vibeverse] timing search=${searchMs}ms play=${Date.now() - tPlay}ms total=${Date.now() - t0}ms smart=${!!opts.smart} title=${track.title || '?'}`,
         );
         if (playable?.streamUrl) {
-            // Announce only after we actually have a stream — avoids false "Now playing".
+            // Optional mid-hook once stream URL exists (radio apply may still be pending).
             if (!announced && typeof opts.onPicked === 'function') {
                 announced = true;
                 try {
-                    await opts.onPicked(track);
+                    await opts.onPicked(playable.trackId ? { ...track, ...playable } : track);
                 } catch {
                     /* ignore */
                 }

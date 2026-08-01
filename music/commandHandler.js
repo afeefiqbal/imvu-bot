@@ -423,14 +423,12 @@ function createVibeverseCommandHandler({
             );
             // Overlap IMVU media-player discovery with search+HLS (hides ~2–8s on cold cache).
             void sessionClient?.warmRoomRadioPlayer?.(roomId)?.catch?.(() => null);
-            let announcedTitle = false;
             const one = await resolveVibeversePlayable(parsed.query, {
                 roomId,
                 smart: parsed.kind === 'smart',
-                // Announce as soon as search picks a track — don't wait ~15–25s for HLS.
-                onPicked: async (track) => {
-                    announcedTitle = true;
-                    await reply(`Now playing: ${formatTrackLabel(track)}`);
+                // Right after search (~1–3s) so chat isn't silent during 15–30s stream prep.
+                onFound: async (track) => {
+                    await reply(`Added to queue: ${formatTrackLabel(track)} — starting soon…`);
                 },
             });
             if (one?.failed) {
@@ -459,9 +457,6 @@ function createVibeverseCommandHandler({
             }
 
             await queueMediaSync(async () => {
-                if (!announcedTitle) {
-                    await reply(`Now playing: ${formatTrackLabel(one)}`);
-                }
                 const result = await player.playNow(one);
                 if (!result?.ok) {
                     if (result?.reason === 'stale') {
@@ -469,7 +464,9 @@ function createVibeverseCommandHandler({
                         return;
                     }
                     await replyRoomMediaFailure(reply, result, one);
+                    return;
                 }
+                await reply(`Now playing: ${formatTrackLabel(one)}`);
             });
             return true;
         }
@@ -492,9 +489,14 @@ function createVibeverseCommandHandler({
                     ? `Looking up “${parsed.display}” (smart)…`
                     : `Looking up “${parsed.display}”…`,
             );
+            let announcedQueued = false;
             const one = await resolveVibeversePlayable(parsed.query, {
                 roomId,
                 smart: parsed.kind === 'smart',
+                onFound: async (track) => {
+                    announcedQueued = true;
+                    await reply(`Added to queue: ${formatTrackLabel(track)} — starting soon…`);
+                },
             });
             if (one?.failed) {
                 await reply(
@@ -523,7 +525,9 @@ function createVibeverseCommandHandler({
             await queueMediaSync(async () => {
                 const result = await player.enqueue(one);
                 if (result?.queued) {
-                    await reply(`Added to queue: ${formatTrackLabel(one)}`);
+                    if (!announcedQueued) {
+                        await reply(`Added to queue: ${formatTrackLabel(one)}`);
+                    }
                     return;
                 }
                 if (!result?.ok) {
