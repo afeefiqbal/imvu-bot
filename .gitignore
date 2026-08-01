@@ -3,6 +3,7 @@ node_modules/
 .DS_Store
 bots.json
 profiles/
+data/
 *.log
 *.bak
 *.png

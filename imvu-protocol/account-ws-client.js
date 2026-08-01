@@ -2,6 +2,7 @@ import { EventEmitter } from 'events';
 import WebSocket from 'ws';
 import { introMessageDelayMs, resolveIntroMessage } from '../introMessages.js';
 import { isIntroEnabledForRoom } from '../room-settings/store.js';
+import { getPreferredSeat } from '../room-settings/preferredSeats.js';
 import {
     roomQueueBelongsToRoom,
     isImvuRoomChatQueue,
@@ -1427,8 +1428,16 @@ export class ImvuAccountRoomClient extends EventEmitter {
     async #ensureChatParticipant() {
         const userId = String(this.bot.imqUserId || this.bot.user_id || this.bot.userId || '').trim();
         if (!/^\d+$/.test(userId) || !this.session?.ensureChatParticipant) return false;
+        const preferredSeat = getPreferredSeat(this.roomId);
+        const participant = preferredSeat
+            ? {
+                  ...(this.participant && typeof this.participant === 'object' ? this.participant : {}),
+                  seat_number: preferredSeat.seatNumber,
+                  seat_furni_id: preferredSeat.seatFurniId,
+              }
+            : this.participant;
         const result = await this.session.ensureChatParticipant(this.roomId, userId, {
-            participant: this.participant,
+            participant,
         });
         if (result?.mode === 'audience' && result.live) {
             this.liveRoom = true;
@@ -1544,13 +1553,22 @@ export class ImvuAccountRoomClient extends EventEmitter {
 
         const seatAssignmentVersion =
             String(process.env.IMVU_WS_SEAT_ASSIGNMENT_VERSION || '3').trim() || '3';
+        const preferredSeat = getPreferredSeat(this.roomId);
+        if (preferredSeat) {
+            this.seatNumber = String(preferredSeat.seatNumber);
+            this.seatFurniId = preferredSeat.seatFurniId;
+            // Preferred seat wins over IMVU's last legacy seat line (often seat 1 after restart).
+            this.legacySeatMessage = '';
+        }
         const seatNumber =
             this.seatNumber ||
             String(process.env.IMVU_WS_SEAT_NUMBER || process.env.IMVU_WS_SEAT_INDEX || '1').trim() ||
             '1';
         const seatFurniId = Number.isFinite(Number(this.seatFurniId)) ? Number(this.seatFurniId) : 0;
         const legacyOutfitMessage = String(this.legacyOutfitMessage || '').trim();
-        const legacySeatMessage = String(this.legacySeatMessage || '').trim();
+        const legacySeatMessage = preferredSeat
+            ? ''
+            : String(this.legacySeatMessage || '').trim();
         const bootstrapMessages = ['*imvu:isPureUser'];
 
         if (legacyOutfitMessage) {
@@ -1567,9 +1585,15 @@ export class ImvuAccountRoomClient extends EventEmitter {
                 bootstrapMessages.push(`*putOnOutfit ${outfitProductIds}`, `*use ${outfitProductIds}`);
             }
         }
-        bootstrapMessages.push(
-            legacySeatMessage || `*msg SeatAssignment ${seatAssignmentVersion} ${userId} ${seatNumber} ${seatFurniId}`
-        );
+        const seatLine =
+            legacySeatMessage ||
+            `*msg SeatAssignment ${seatAssignmentVersion} ${userId} ${seatNumber} ${seatFurniId}`;
+        bootstrapMessages.push(seatLine);
+        if (preferredSeat) {
+            this.logger.log(
+                `[IMVU-WS][${this.roomId}] using preferred seat ${seatNumber} furni ${seatFurniId}`
+            );
+        }
 
         for (const text of bootstrapMessages) {
             const frame = this.spec.sendFrameFor(this.roomId, text, {

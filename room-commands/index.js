@@ -3,6 +3,7 @@ import {
     formatGreeting,
 } from '../room-settings/defaults.js';
 import { getRoomSettings, isLurkEnabledForRoom, isWelcomeEnabledForRoom, patchRoomSettingsLocal } from '../room-settings/store.js';
+import { setPreferredSeat } from '../room-settings/preferredSeats.js';
 import { patchRoomSettingsRemote } from './api.js';
 import { buildHelpMessages, buildInfoMessage } from './help.js';
 import { getMaxKbsForRoom, runFunCommand, setMaxKbsForRoom } from './fun.js';
@@ -233,6 +234,7 @@ export function createRoomChatCommandHandler(opts) {
                         }
                         await sendMessage(line);
                     }
+                    setPreferredSeat(roomId, capturedSeat);
                     await reply('Moving to your spot...');
                 } catch (e) {
                     console.warn('[room-cmd] move:', e?.message || e);
@@ -357,6 +359,9 @@ export function createRoomChatCommandHandler(opts) {
                 seatNumber,
                 seatFurniId: 0,
             });
+            if (moved) {
+                setPreferredSeat(roomId, { seatNumber, seatFurniId: 0 });
+            }
             await reply(moved ? `Moved to seat ${seatNumber}.` : `Could not move to seat ${seatNumber}.`);
             return true;
         }
