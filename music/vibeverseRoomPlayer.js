@@ -154,6 +154,20 @@ export function createVibeverseRoomPlayer(opts) {
             // We are actively encoding / draining — treat as playing.
             if (botBusyLocally()) return true;
 
+            // Our per-room live HLS can keep serving an old playlist after encode stops.
+            // If we aren't playing locally, don't let that block idle autoplay.
+            const roomKey = String(roomId || '')
+                .trim()
+                .replace(/^room-/i, '');
+            // e.g. .../hls/334151838-93/live/index.m3u8
+            if (roomKey && url.includes(`/hls/${roomKey}/`)) {
+                console.log(
+                    `[music] room radio is our idle live HLS (${roomId}) — allowing autoplay`,
+                );
+                radioUrlProbe = { url, at: Date.now(), alive: false };
+                return false;
+            }
+
             // IMVU often leaves status=playing with a stale station_url (dead tunnel / empty
             // mount) while the room is silent. Probe before blocking idle autoplay.
             const now = Date.now();
@@ -176,6 +190,11 @@ export function createVibeverseRoomPlayer(opts) {
                 console.log(
                     `[music] room radio link silent/stale (${roomId}): ${probe?.reason || 'unreachable'}` +
                         ` — allowing autoplay`,
+                );
+            } else {
+                console.log(
+                    `[music] idle autoplay skip (${roomId}): room radio stream alive` +
+                        ` (${probe?.reason || 'ok'}) ${url.slice(0, 96)}`,
                 );
             }
             return alive;
@@ -345,7 +364,7 @@ export function createVibeverseRoomPlayer(opts) {
         }
         const radioOn = await roomRadioPlaying();
         if (radioOn === true) {
-            console.log(`[music] idle autoplay skip (${roomId}): room radio already playing`);
+            // roomRadioPlaying already logged why (alive stream URL).
             return;
         }
         armAutoplay(reason);

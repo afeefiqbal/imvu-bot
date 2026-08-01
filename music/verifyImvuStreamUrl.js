@@ -15,6 +15,22 @@ export function isImvuBlockingStreamProbe(probe, url) {
     return urlLooksLikeNgrokFree(u) && probe.reason === 'html-not-audio' && probe.status === 200;
 }
 
+function looksLikeHlsUrl(url, contentType = '') {
+    return (
+        /\.m3u8(\?|#|$)/i.test(String(url || '')) ||
+        /mpegurl|x-mpegURL|vnd\.apple\.mpegurl/i.test(String(contentType || ''))
+    );
+}
+
+/** True when playlist text has at least one media segment (not an empty/stale shell). */
+export function hlsPlaylistHasMedia(body) {
+    const text = String(body || '');
+    if (!/#EXTM3U/i.test(text)) return false;
+    if (/#EXTINF:/i.test(text)) return true;
+    // Master playlist — at least one variant line that isn't a comment.
+    return /^[^#\s].+\.m3u8(\?.*)?$/im.test(text);
+}
+
 /**
  * Fetch a public HTTPS stream URL the way IMVU's client would (no ngrok-skip-browser-warning).
  * @param {string} pubUrl
@@ -41,23 +57,52 @@ export async function probePublicStreamForImvu(pubUrl, timeoutMs = 6000) {
         const status = res.status;
         const ct = String(res.headers.get('content-type') || '');
         const ngrokErr = String(res.headers.get('ngrok-error-code') || '').trim();
-        try {
-            await res.body?.cancel();
-        } catch {}
+        const asHls = looksLikeHlsUrl(url, ct);
 
         if (ngrokErr) {
+            try {
+                await res.body?.cancel();
+            } catch {}
             return { ok: false, reason: 'ngrok-interstitial', contentType: ct, status, ngrokError: ngrokErr };
         }
         // Empty Icecast mount (tunnel OK) — Cloudflare often returns 400 + text/html, Icecast 404 + html.
         if (status === 404 || status === 400) {
+            try {
+                await res.body?.cancel();
+            } catch {}
             return { ok: false, reason: 'mount-empty', contentType: ct, status };
         }
-        if (/text\/html/i.test(ct)) {
+        if (/text\/html/i.test(ct) && !asHls) {
+            try {
+                await res.body?.cancel();
+            } catch {}
             if (urlLooksLikeNgrokFree(url) && status === 200) {
                 return { ok: false, reason: 'ngrok-interstitial', contentType: ct, status };
             }
             return { ok: false, reason: 'mount-empty', contentType: ct, status };
         }
+
+        // HLS: 200 + m3u8 shell is common after encode dies — require real segments.
+        if (asHls) {
+            let body = '';
+            try {
+                body = await res.text();
+            } catch {
+                body = '';
+            }
+            if (status !== 200) {
+                return { ok: false, reason: 'hls-bad-status', contentType: ct, status };
+            }
+            if (!hlsPlaylistHasMedia(body)) {
+                return { ok: false, reason: 'hls-empty', contentType: ct, status };
+            }
+            return { ok: true, reason: 'hls', contentType: ct, status };
+        }
+
+        try {
+            await res.body?.cancel();
+        } catch {}
+
         if (
             status === 200 &&
             (/audio\//i.test(ct) ||
