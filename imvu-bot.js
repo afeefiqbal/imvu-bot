@@ -433,7 +433,13 @@ async function main() {
     const abandonUnreachableRoom = async (roomId, reason = 'forbidden') => {
         const id = trackerRoomId(roomId);
         if (!id) return;
-        const state = joinAccessFails.get(id) || { fails: 0, lastReason: '', abandoning: false };
+        const state = joinAccessFails.get(id) || {
+            fails: 0,
+            lastReason: '',
+            abandoning: false,
+            apiAttempts: 0,
+            apiRetryTimer: null,
+        };
         if (state.abandoning) return;
         state.abandoning = true;
         joinAccessFails.set(id, state);
@@ -451,21 +457,33 @@ async function main() {
             console.log(`[${BOT_NAME}] Abandoned room ${id}: ${result.message || 'ok'}`);
             configuredRoomIds = configuredRoomIds.filter((r) => r !== id);
             joinAccessFails.delete(id);
-        } else {
-            state.abandoning = false;
-            joinAccessFails.set(id, state);
-            console.warn(
-                `[${BOT_NAME}] Abandon API failed for ${id}: ${result?.message || 'unknown'}`,
-            );
-            // Render may still be deploying the abandon route — retry shortly.
-            const retryMs = Math.max(
-                15000,
-                parseInt(String(process.env.IMVU_ROOM_ABANDON_API_RETRY_MS || '45000'), 10) || 45000,
-            );
-            setTimeout(() => {
-                void abandonUnreachableRoom(id, reason);
-            }, retryMs);
+            return;
         }
+
+        state.abandoning = false;
+        state.apiAttempts = (state.apiAttempts || 0) + 1;
+        joinAccessFails.set(id, state);
+        const maxApiAttempts = Math.max(
+            1,
+            parseInt(String(process.env.IMVU_ROOM_ABANDON_API_MAX_ATTEMPTS || '8'), 10) || 8,
+        );
+        console.warn(
+            `[${BOT_NAME}] Abandon API failed for ${id} (attempt ${state.apiAttempts}/${maxApiAttempts}): ${result?.message || 'unknown'}`,
+        );
+        if (state.apiAttempts >= maxApiAttempts || state.apiRetryTimer) return;
+
+        // Render may still be deploying the abandon route — backoff, don't spam.
+        const baseMs = Math.max(
+            30000,
+            parseInt(String(process.env.IMVU_ROOM_ABANDON_API_RETRY_MS || '60000'), 10) || 60000,
+        );
+        const retryMs = Math.min(10 * 60 * 1000, baseMs * state.apiAttempts);
+        state.apiRetryTimer = setTimeout(() => {
+            const cur = joinAccessFails.get(id);
+            if (cur) cur.apiRetryTimer = null;
+            void abandonUnreachableRoom(id, reason);
+        }, retryMs);
+        joinAccessFails.set(id, state);
     };
 
     const noteJoinAccessProbe = async (roomId) => {
