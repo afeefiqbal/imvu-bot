@@ -106,18 +106,35 @@ export async function postBotRoomAbandon(apiBaseUrl, botName, roomId, reason = '
     const base = String(apiBaseUrl || '').replace(/\/$/, '');
     if (!base || !botName || !roomId) return { ok: false, message: 'missing params' };
 
-    try {
-        const response = await axios.post(
-            `${base}/api/bot-room/abandon`,
-            {
-                room_id: roomId,
-                bot_name: botName,
-                reason: reason ? String(reason).slice(0, 255) : undefined,
-            },
-            { timeout: 15000 }
-        );
+    const body = {
+        room_id: roomId,
+        bot_name: botName,
+        reason: reason ? String(reason).slice(0, 255) : undefined,
+        abandon: true,
+    };
+
+    const tryPost = async (path) => {
+        const response = await axios.post(`${base}${path}`, body, { timeout: 15000 });
         return response.data || { ok: false, message: 'empty response' };
+    };
+
+    try {
+        return await tryPost('/api/bot-room/abandon');
     } catch (error) {
+        const status = error.response?.status;
+        // Stale Render route cache: /abandon 404s but /leave still works.
+        if (status === 404) {
+            try {
+                return await tryPost('/api/bot-room/leave');
+            } catch (leaveError) {
+                const data = leaveError.response?.data;
+                return {
+                    ok: false,
+                    message: data?.error || data?.message || leaveError.message || 'abandon failed',
+                    send_dm: false,
+                };
+            }
+        }
         const data = error.response?.data;
         return {
             ok: false,
