@@ -413,7 +413,6 @@ function createVibeverseCommandHandler({
 
             // Soft-preempt: keep current audio until new HLS is ready (cutForReplace must not stop radio early).
             player.cutForReplace();
-            player.armAutoplay?.('!play');
 
             const label = parsed.display;
             await reply(
@@ -432,17 +431,14 @@ function createVibeverseCommandHandler({
                 },
             });
             if (one?.failed) {
-                void player.ensurePlaying?.();
                 await reply(
-                    `Couldn’t play that track${one.detail ? ` (${String(one.detail).slice(0, 120)})` : ''} — trying another song.`,
+                    `Couldn’t play that track${one.detail ? ` (${String(one.detail).slice(0, 120)})` : ''}.`,
                 );
                 return true;
             }
             if (one?.pending) {
-                // Found, but still caching — keep music going via idle autoplay.
-                void player.ensurePlaying?.();
                 await reply(
-                    'That track is still preparing in the library — keeping music going with another song.',
+                    'That track is still preparing in the library — try again in a moment.',
                 );
                 return true;
             }
@@ -452,7 +448,7 @@ function createVibeverseCommandHandler({
                 } else {
                     await reply('Could not find that track.');
                 }
-                void player.ensurePlaying?.();
+                // Never kick idle autoplay on a miss — leave whatever is already playing alone.
                 return true;
             }
 

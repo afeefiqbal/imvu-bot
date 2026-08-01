@@ -3012,6 +3012,7 @@ export function createImvuSessionClient({ bot = {}, agents = {}, logger = consol
         fetchRoomOwnerId,
         fetchRoomModeratorIds,
         fetchRoomModerators,
+        resolveBotUserId,
         fetchChatParticipant,
         updateChatParticipantSeat,
         fetchUserProfile,

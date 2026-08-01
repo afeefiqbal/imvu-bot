@@ -96,6 +96,12 @@ export function createVibeverseRoomPlayer(opts) {
     /** @type {string[]} */
     const recentAutoplayIds = [];
     let autoplayFailStreak = 0;
+    /**
+     * Cache whether this bot can set room radio (host/mod).
+     * null = unknown, true/false = last check. Forbidden sticks until a successful radio set.
+     * @type {{ at: number, ok: boolean|null, forbidden: boolean }}
+     */
+    let radioControl = { at: 0, ok: null, forbidden: false };
 
     const idleDelayMs = () =>
         Math.max(0, parseInt(String(process.env.MUSIC_AUTOPLAY_IDLE_MS || '3000'), 10) || 3000);
@@ -148,14 +154,14 @@ export function createVibeverseRoomPlayer(opts) {
 
     const scheduleAutoplayRetry = () => {
         clearAutoplayRetry();
-        if (autoplayOptedOut || !autoplayArmed || paused) return;
+        if (autoplayOptedOut || !autoplayArmed || paused || radioControl.forbidden) return;
         const ms = Math.max(
             5000,
             parseInt(String(process.env.MUSIC_AUTOPLAY_RETRY_MS || '15000'), 10) || 15000,
         );
         autoplayRetryTimer = setTimeout(() => {
             autoplayRetryTimer = null;
-            if (autoplayOptedOut || !autoplayArmed || paused) return;
+            if (autoplayOptedOut || !autoplayArmed || paused || radioControl.forbidden) return;
             // Soft cutover parks prior encode in outgoingProc — still busy.
             if (botBusyLocally()) return;
             console.log(`[music] autoplay retry (${roomId})`);
@@ -189,10 +195,74 @@ export function createVibeverseRoomPlayer(opts) {
         clearIdleKick();
     };
 
+    const markRadioControlOk = () => {
+        radioControl = { at: Date.now(), ok: true, forbidden: false };
+    };
+
+    const markRadioControlForbidden = (reason = 'not-moderator') => {
+        if (!radioControl.forbidden) {
+            console.log(`[music] autoplay disabled (${roomId}): bot is not host/mod (${reason})`);
+        }
+        radioControl = { at: Date.now(), ok: false, forbidden: true };
+        disarmAutoplay();
+    };
+
+    /** @returns {Promise<boolean>} false when bot cannot set radio — skip autoplay */
+    const botCanSetRoomRadio = async () => {
+        if (radioControl.forbidden) return false;
+        const ttl = Math.max(
+            15_000,
+            parseInt(String(process.env.MUSIC_AUTOPLAY_MOD_CHECK_MS || '60000'), 10) || 60_000,
+        );
+        if (radioControl.ok != null && Date.now() - radioControl.at < ttl) {
+            return radioControl.ok;
+        }
+        if (
+            typeof sessionClient?.resolveBotUserId !== 'function' ||
+            typeof sessionClient?.fetchRoomOwnerId !== 'function'
+        ) {
+            // No session helpers — allow until IMVU returns not-moderator.
+            return true;
+        }
+        try {
+            const botId = String((await sessionClient.resolveBotUserId()) || '').trim();
+            if (!botId) return false;
+
+            const roomOwnerPrefix = String(roomId || '')
+                .trim()
+                .replace(/^room-/i, '')
+                .split('-')[0];
+            if (roomOwnerPrefix && roomOwnerPrefix === botId) {
+                radioControl = { at: Date.now(), ok: true, forbidden: false };
+                return true;
+            }
+
+            const ownerId = String((await sessionClient.fetchRoomOwnerId(roomId)) || '').trim();
+            if (ownerId && ownerId === botId) {
+                radioControl = { at: Date.now(), ok: true, forbidden: false };
+                return true;
+            }
+
+            const modIds =
+                typeof sessionClient.fetchRoomModeratorIds === 'function'
+                    ? await sessionClient.fetchRoomModeratorIds(roomId)
+                    : [];
+            const ok = (Array.isArray(modIds) ? modIds : []).some((id) => String(id) === botId);
+            radioControl = { at: Date.now(), ok, forbidden: false };
+            if (!ok) {
+                console.log(`[music] autoplay skip (${roomId}): bot ${botId} is not host/mod`);
+            }
+            return ok;
+        } catch (e) {
+            console.warn(`[music] host/mod check failed (${roomId}):`, e?.message || e);
+            return false;
+        }
+    };
+
     /** After music goes idle/off — wait 3s (cancellable via !autoplay-off), then fill. */
     const scheduleIdleAutoplay = (reason = 'idle') => {
         clearIdleKick();
-        if (autoplayOptedOut || paused) return;
+        if (autoplayOptedOut || paused || radioControl.forbidden) return;
         if (!envFlagTrue('MUSIC_AUTOPLAY', true) || !roomAllowedForAutoplay(roomId)) return;
         if (botBusyLocally()) return;
         const ms = idleDelayMs();
@@ -207,6 +277,10 @@ export function createVibeverseRoomPlayer(opts) {
         if (autoplayOptedOut || paused) return;
         if (!envFlagTrue('MUSIC_AUTOPLAY', true) || !roomAllowedForAutoplay(roomId)) return;
         if (botBusyLocally()) return;
+        if (!(await botCanSetRoomRadio())) {
+            console.log(`[music] idle autoplay skip (${roomId}): not host/mod`);
+            return;
+        }
         const radioOn = await roomRadioPlaying();
         if (radioOn === true) {
             console.log(`[music] idle autoplay skip (${roomId}): room radio already playing`);
@@ -224,8 +298,11 @@ export function createVibeverseRoomPlayer(opts) {
             parseInt(String(process.env.MUSIC_AUTOPLAY_IDLE_POLL_MS || '15000'), 10) || 15000,
         );
         idleWatchInterval = setInterval(() => {
-            if (autoplayOptedOut || paused || botBusyLocally() || idleKickTimer) return;
+            if (autoplayOptedOut || paused || radioControl.forbidden || botBusyLocally() || idleKickTimer) {
+                return;
+            }
             void (async () => {
+                if (!(await botCanSetRoomRadio())) return;
                 const radioOn = await roomRadioPlaying();
                 if (radioOn === true) return;
                 // Room radio off/unknown and bot idle → start after delay.
@@ -267,6 +344,10 @@ export function createVibeverseRoomPlayer(opts) {
             console.warn(
                 `[music] autoplay skip (${roomId}): room not in MUSIC_AUTOPLAY_ROOMS`,
             );
+            return false;
+        }
+        if (!(await botCanSetRoomRadio())) {
+            console.log(`[music] autoplay skip (${roomId}): not host/mod`);
             return false;
         }
         if (autoplayFailStreak >= 5) {
@@ -462,7 +543,19 @@ export function createVibeverseRoomPlayer(opts) {
             stationName: String(track?.title || '').trim(),
             forceRestart: opts.forceRestart === true,
         });
-        if (!applied.ok) return applied;
+        if (!applied.ok) {
+            const reason = String(applied.reason || '');
+            const detail = String(applied.detail || '');
+            if (
+                reason === 'not-moderator' ||
+                reason === 'not-authorized' ||
+                /MEDIA_PLAYER_NODE-004|host or moderator|must be host/i.test(`${reason} ${detail}`)
+            ) {
+                markRadioControlForbidden(reason || 'not-moderator');
+            }
+            return applied;
+        }
+        markRadioControlOk();
         lastRoomRadioUrl = url;
         // Don't block chat on IMVU playback confirmation — announce as soon as the URL is set.
         void waitForRoomMediaPlayback(page, {
