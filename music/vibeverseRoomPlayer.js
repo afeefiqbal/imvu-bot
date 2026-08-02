@@ -669,17 +669,19 @@ export function createVibeverseRoomPlayer(opts) {
     /**
      * Hit the live playlist with ?prime=1 before radio apply so extractor
      * cold-restarts from 0 (encode otherwise runs ahead during search/cutover → mid-song).
+     * Retries until at least one .ts is listed — never apply an empty/404 m3u8 (silence).
+     * @returns {Promise<{ ok: boolean, segs?: number, status?: number, detail?: string }>}
      */
     const primeExtractorLiveHls = async (url) => {
         const u = String(url || '').trim();
-        if (!/^https:\/\//i.test(u)) return;
+        if (!/^https:\/\//i.test(u)) {
+            return { ok: false, detail: 'bad-url' };
+        }
         const started = Date.now();
         const timeoutMs = Math.max(
             8_000,
-            parseInt(String(process.env.MUSIC_HLS_PRIME_TIMEOUT_MS || '20000'), 10) || 20_000,
+            parseInt(String(process.env.MUSIC_HLS_PRIME_TIMEOUT_MS || '25000'), 10) || 25_000,
         );
-        const ac = new AbortController();
-        const timer = setTimeout(() => ac.abort(), timeoutMs);
         let primeUrl = u;
         try {
             const parsed = new URL(u);
@@ -688,25 +690,46 @@ export function createVibeverseRoomPlayer(opts) {
         } catch {
             primeUrl = u.includes('?') ? `${u}&prime=1` : `${u}?prime=1`;
         }
-        try {
-            const res = await fetch(primeUrl, {
-                method: 'GET',
-                headers: {
-                    Accept: 'application/vnd.apple.mpegurl,application/x-mpegURL,*/*',
-                    'Cache-Control': 'no-cache',
-                },
-                signal: ac.signal,
-            });
-            const text = res.ok ? await res.text() : '';
-            const segs = (text.match(/\.ts\b/g) || []).length;
-            console.log(
-                `[music] primed live HLS (${Date.now() - started}ms, http=${res.status}, segs=${segs}): ${primeUrl}`,
-            );
-        } catch (e) {
-            console.warn(`[music] live HLS prime failed:`, e?.message || e);
-        } finally {
-            clearTimeout(timer);
+
+        let lastStatus = 0;
+        let lastSegs = 0;
+        while (Date.now() - started < timeoutMs) {
+            const ac = new AbortController();
+            const timer = setTimeout(() => ac.abort(), Math.min(12_000, timeoutMs));
+            try {
+                const res = await fetch(primeUrl, {
+                    method: 'GET',
+                    headers: {
+                        Accept: 'application/vnd.apple.mpegurl,application/x-mpegURL,*/*',
+                        'Cache-Control': 'no-cache',
+                    },
+                    signal: ac.signal,
+                });
+                lastStatus = res.status;
+                const text = res.ok ? await res.text() : '';
+                lastSegs = (text.match(/\.ts\b/g) || []).length;
+                if (res.ok && lastSegs > 0) {
+                    console.log(
+                        `[music] primed live HLS (${Date.now() - started}ms, http=${res.status}, segs=${lastSegs}): ${primeUrl}`,
+                    );
+                    return { ok: true, segs: lastSegs, status: res.status };
+                }
+            } catch (e) {
+                console.warn(`[music] live HLS prime retry:`, e?.message || e);
+            } finally {
+                clearTimeout(timer);
+            }
+            await new Promise((r) => setTimeout(r, 750));
         }
+        console.warn(
+            `[music] live HLS prime gave up (${Date.now() - started}ms, http=${lastStatus}, segs=${lastSegs}): ${primeUrl}`,
+        );
+        return {
+            ok: false,
+            segs: lastSegs,
+            status: lastStatus,
+            detail: 'playlist-not-ready',
+        };
     };
 
     /** Extractor owns ffmpeg; bot only sets IMVU room radio to the live m3u8. */
@@ -724,8 +747,18 @@ export function createVibeverseRoomPlayer(opts) {
         killCurrentEncodeOnly();
         // Restart encode near t=0, then force IMVU cutover (flash-clear) so
         // in-room clients reload without leaving/rejoining.
-        await primeExtractorLiveHls(url);
+        const primed = await primeExtractorLiveHls(url);
         if (gen !== generation) return { ok: false, reason: 'stale' };
+        if (!primed.ok) {
+            console.warn(
+                `[music] skip radio apply — live HLS not ready (${primed.detail || 'unknown'}, http=${primed.status || '?'}, segs=${primed.segs || 0})`,
+            );
+            return {
+                ok: false,
+                reason: 'hls-not-ready',
+                detail: primed.detail || 'playlist-not-ready',
+            };
+        }
         const applied = await applyPublicUrlToRoom(url, track, {
             skipIfSame: false,
             forceRestart: true,
