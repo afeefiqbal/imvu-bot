@@ -667,8 +667,8 @@ export function createVibeverseRoomPlayer(opts) {
         /^(1|true|yes|on)$/i.test(String(process.env.MUSIC_VIBEVERSE_LIVE || '').trim());
 
     /**
-     * Hit the live playlist once before radio apply so extractor can cold-restart
-     * from 0 (encode otherwise runs ahead during search/cutover → mid-song).
+     * Hit the live playlist with ?prime=1 before radio apply so extractor
+     * cold-restarts from 0 (encode otherwise runs ahead during search/cutover → mid-song).
      */
     const primeExtractorLiveHls = async (url) => {
         const u = String(url || '').trim();
@@ -680,8 +680,16 @@ export function createVibeverseRoomPlayer(opts) {
         );
         const ac = new AbortController();
         const timer = setTimeout(() => ac.abort(), timeoutMs);
+        let primeUrl = u;
         try {
-            const res = await fetch(u, {
+            const parsed = new URL(u);
+            parsed.searchParams.set('prime', '1');
+            primeUrl = parsed.toString();
+        } catch {
+            primeUrl = u.includes('?') ? `${u}&prime=1` : `${u}?prime=1`;
+        }
+        try {
+            const res = await fetch(primeUrl, {
                 method: 'GET',
                 headers: {
                     Accept: 'application/vnd.apple.mpegurl,application/x-mpegURL,*/*',
@@ -692,7 +700,7 @@ export function createVibeverseRoomPlayer(opts) {
             const text = res.ok ? await res.text() : '';
             const segs = (text.match(/\.ts\b/g) || []).length;
             console.log(
-                `[music] primed live HLS (${Date.now() - started}ms, http=${res.status}, segs=${segs}): ${u}`,
+                `[music] primed live HLS (${Date.now() - started}ms, http=${res.status}, segs=${segs}): ${primeUrl}`,
             );
         } catch (e) {
             console.warn(`[music] live HLS prime failed:`, e?.message || e);
