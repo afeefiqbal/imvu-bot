@@ -474,8 +474,8 @@ export function createVibeverseRoomPlayer(opts) {
             progressiveReady: pick.progressiveReady,
             delivery: pick.delivery,
             autoplay: true,
-            // Announce only after room radio URL is actually set.
-            announceOnRadioOk: true,
+            // Chat announce gated by MUSIC_AUTOPLAY_ANNOUNCE (default off).
+            announceOnRadioOk: false,
         });
         return true;
     };
@@ -635,10 +635,8 @@ export function createVibeverseRoomPlayer(opts) {
         }
         markRadioControlOk();
         lastRoomRadioUrl = url;
-        if (track?.announceOnRadioOk || track?.autoplay) {
-            track.announceOnRadioOk = false;
-            announce(`▶ Autoplay: ${track?.title || 'track'}`);
-        }
+        // Idle autoplay never posts to room chat (keeps music silent in chat).
+        if (track?.announceOnRadioOk) track.announceOnRadioOk = false;
         // Don't block chat on IMVU playback confirmation — announce as soon as the URL is set.
         void waitForRoomMediaPlayback(page, {
             roomId,
