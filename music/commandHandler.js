@@ -11,6 +11,7 @@ import {
     vibeverseEnabled,
 } from './vibeverseClient.js';
 import { createVibeverseRoomPlayer } from './vibeverseRoomPlayer.js';
+import { beginPlayTrace } from './playTrace.js';
 
 function roomMediaNotModerator(result) {
     const reason = String(result?.reason || '');
@@ -415,6 +416,16 @@ function createVibeverseCommandHandler({
             player.cutForReplace();
 
             const label = parsed.display;
+            const trace = beginPlayTrace({
+                roomId,
+                requestedText: label,
+                userId: senderId != null ? String(senderId) : null,
+            });
+            trace?.mark('play_trace_start', {
+                requestedText: label,
+                smart: parsed.kind === 'smart',
+            });
+
             await reply(
                 parsed.kind === 'smart'
                     ? `Looking up “${label}” (smart)…`
@@ -425,24 +436,35 @@ function createVibeverseCommandHandler({
             const one = await resolveVibeversePlayable(parsed.query, {
                 roomId,
                 smart: parsed.kind === 'smart',
+                playTraceId: trace?.playTraceId,
                 // Right after search (~1–3s) so chat isn't silent during 15–30s stream prep.
                 onFound: async (track) => {
+                    if (trace && track?.id) {
+                        trace.set('youtubeId', String(track.id).replace(/^yt_/, ''));
+                        trace.set('trackId', track.id);
+                    }
                     await reply(`Added to queue: ${formatTrackLabel(track)} — starting soon…`);
                 },
             });
             if (one?.failed) {
+                trace?.mark('play_trace_failed', {
+                    detail: String(one.detail || '').slice(0, 120),
+                });
+                trace?.complete({ failed: true });
                 await reply(
                     `Couldn’t play that track${one.detail ? ` (${String(one.detail).slice(0, 120)})` : ''}.`,
                 );
                 return true;
             }
             if (one?.pending) {
+                trace?.complete({ pending: true });
                 await reply(
                     'That track is still preparing in the library — try again in a moment.',
                 );
                 return true;
             }
             if (!one?.streamUrl) {
+                trace?.complete({ noStream: true });
                 if (!vibeverseEnabled()) {
                     await reply('Music lookup is not configured.');
                 } else {
@@ -452,15 +474,39 @@ function createVibeverseCommandHandler({
                 return true;
             }
 
+            if (trace) {
+                one.playTraceId = trace.playTraceId;
+                if (one.trackId) {
+                    trace.set('trackId', one.trackId);
+                    trace.set('youtubeId', String(one.trackId).replace(/^yt_/, ''));
+                }
+                if (one.cached === true) trace.set('r2Hit', true);
+                if (one.apiTotalMs != null) {
+                    trace.set('apiTotalMs', one.apiTotalMs);
+                    trace.set('playCommandToApiResponseMs', Date.now() - trace.t0);
+                }
+                if (one.searchMs != null) trace.set('searchMs', one.searchMs);
+            }
+
             await queueMediaSync(async () => {
-                const result = await player.playNow(one);
+                const result = await player.playNow(one, {
+                    playTraceId: trace?.playTraceId,
+                });
                 if (!result?.ok) {
                     if (result?.reason === 'stale') {
                         // Superseded by a newer !play — that request will announce itself.
                         return;
                     }
+                    trace?.complete({ playNowFailed: result?.reason || true });
                     await replyRoomMediaFailure(reply, result, one);
                     return;
+                }
+                if (trace) {
+                    if (result.cutoverMs != null) trace.set('cutoverMs', result.cutoverMs);
+                    if (result.cutoverMode) trace.set('cutoverMode', result.cutoverMode);
+                    if (result.cutApiMs != null) trace.set('cutApiMs', result.cutApiMs);
+                    trace.set('playCommandToRadioAppliedMs', Date.now() - trace.t0);
+                    trace.complete();
                 }
                 await reply(`Now playing: ${formatTrackLabel(one)}`);
             });
@@ -486,8 +532,9 @@ function createVibeverseCommandHandler({
                     : `Looking up “${parsed.display}”…`,
             );
             let announcedQueued = false;
+            // forQueue: resolve without room HLS so !add cannot replace Song A's encode.
             const one = await resolveVibeversePlayable(parsed.query, {
-                roomId,
+                forQueue: true,
                 smart: parsed.kind === 'smart',
                 onFound: async (track) => {
                     announcedQueued = true;
@@ -508,7 +555,8 @@ function createVibeverseCommandHandler({
                 );
                 return true;
             }
-            if (!one?.streamUrl) {
+            // Live drain refreshes HLS from trackId; streamUrl optional when queued.
+            if (!one?.streamUrl && !one?.trackId) {
                 if (!vibeverseEnabled()) {
                     await reply('Music lookup is not configured.');
                 } else {

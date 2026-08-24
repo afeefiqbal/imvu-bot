@@ -7,7 +7,8 @@
     "start": "node index.js",
     "local": "node index.js",
     "stop": "node scripts/stop-local.js",
-    "bot": "node multi-launcher.js"
+    "bot": "node multi-launcher.js",
+    "test": "node --test imvu-protocol/radio-cutover-mode.test.js music/vibeverse-prefetch.test.js music/playTrace.test.js"
   },
   "keywords": [],
   "author": "",

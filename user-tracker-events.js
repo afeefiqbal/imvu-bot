@@ -1,4 +1,12 @@
 import axios from 'axios';
+import { applyBotApiAuth } from './laravel-auth.js';
+
+applyBotApiAuth();
+
+let aiInFlight = 0;
+function aiMaxInFlight() {
+    return Math.max(1, parseInt(process.env.AI_MAX_INFLIGHT || '2', 10) || 2);
+}
 import {
     EXCLUDED_HANDLES,
     chatVerbose,
@@ -16,10 +24,12 @@ import {
 } from './user-tracker-utils.js';
 import {
     clearSivaSession,
+    isAiSpamBlocked,
     markSivaSessionActive,
     messageEndsSivaSession,
     messageInvokesSivaCharacterAi,
     messageStartsNewSivaThread,
+    noteAiChatAttempt,
     stripSivaCharacterAiTriggers,
 } from './sivaCharacterAi.js';
 import {
@@ -802,6 +812,9 @@ export const createIncomingMessageHandler = (ctx) => {
                         (sivaActive || mentionHit) &&
                         (typeof ctx.isLurkEnabled !== 'function' || ctx.isLurkEnabled())
                     ) {
+                        if (isAiSpamBlocked(senderId)) {
+                            continue;
+                        }
                         // Dedupe identical back-to-back WS echoes only (no reply cooldown).
                         const dedupeKey = `${ctx.roomId}:${senderId}:${trimmed}`;
                         if (!ctx.mentionReplyDedupe.has(dedupeKey)) {
@@ -813,6 +826,10 @@ export const createIncomingMessageHandler = (ctx) => {
                                 const first = ctx.mentionReplyDedupe.values().next().value;
                                 ctx.mentionReplyDedupe.delete(first);
                             }
+                            // Count only real AI-bound attempts (after WS echo dedupe).
+                            if (!noteAiChatAttempt(senderId, trimmed, { senderLabel })) {
+                                continue;
+                            }
                             const sivaHit = sivaActive;
                             const wakeStyle = /^\s*\./.test(trimmed) ? 'dot' : 'sugar';
                             const sivaMessage =
@@ -820,6 +837,11 @@ export const createIncomingMessageHandler = (ctx) => {
                             console.log(
                                 `[AI-CHAT] ${sivaHit ? `sugar(${wakeStyle})` : 'lurk'} ← ${senderLabel}: ${String(sivaMessage).slice(0, 120)}`
                             );
+                            if (aiInFlight >= aiMaxInFlight()) {
+                                console.warn(`[AI-CHAT] dropping reply, ${aiInFlight} in flight`);
+                                continue;
+                            }
+                            aiInFlight += 1;
                             void (async () => {
                                 try {
                                     // Clear music intents via sugar/dot ("skip this", "play amsham")
@@ -897,6 +919,8 @@ export const createIncomingMessageHandler = (ctx) => {
                                     }
                                 } catch (e) {
                                     console.error(`[AI-CHAT] Error communicating with AI backend:`, e.message);
+                                } finally {
+                                    aiInFlight = Math.max(0, aiInFlight - 1);
                                 }
                             })();
                         }

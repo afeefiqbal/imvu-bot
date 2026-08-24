@@ -241,7 +241,7 @@ export async function processSyncActions(data, ctx) {
         });
     }
 
-    if (isSocialSyncEnabled()) {
+    if (isSocialSyncEnabled() && /^(1|true|yes)$/i.test(String(process.env.SOCIAL_SYNC_ON_DASHBOARD || ''))) {
         await runBotSocialSync({
             session: ctx.session,
             botName: ctx.botName,

@@ -6,6 +6,7 @@ import { EventEmitter } from 'events';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import { backendApiBaseUrl } from './env-app-url.js';
+import { applyBotApiAuth } from './laravel-auth.js';
 import { parseProxyFromProcessEnv, proxyConfigured } from './proxy-env.js';
 import { createProtocolSpec } from './imvu-protocol/spec.js';
 import { createProxyAgents } from './imvu-protocol/proxy-agent.js';
@@ -40,6 +41,7 @@ dotenv.config({ path: path.join(__dirname, '.env') });
 // Fallbacks for common local layouts: embedded Laravel parent, then sibling Laravel app.
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 dotenv.config({ path: path.join(__dirname, '..', 'imvu-bot-laravel', '.env') });
+applyBotApiAuth();
 
 if (!global.discordBridge) {
     global.discordBridge = new EventEmitter();
@@ -204,10 +206,24 @@ async function fetchBotSettings(botName) {
     };
 }
 
+function mapPool(items, limit, fn) {
+    const list = [...items];
+    const concurrency = Math.max(1, Math.min(limit, list.length || 1));
+    let index = 0;
+    return Promise.all(
+        Array.from({ length: concurrency }, async () => {
+            while (index < list.length) {
+                const current = index++;
+                await fn(list[current], current);
+            }
+        }),
+    );
+}
+
 async function syncDashboardRooms({ roomClients, session, bot, botImvuUserId = null }) {
     const rooms = [];
     const runtimes = allRoomRuntimes();
-    for (const [roomId, entry] of roomClients) {
+    await mapPool(roomClients, 4, async ([roomId, entry]) => {
         let details = entry.details;
         if (!details) {
             details = await session.fetchRoomDetails(roomId);
@@ -230,7 +246,7 @@ async function syncDashboardRooms({ roomClients, session, bot, botImvuUserId = n
             population: visitors.length || details?.occupancy || 0,
             capacity: details?.capacity ?? null,
         });
-    }
+    });
 
     const botProfile = await resolveBotImvuProfile(session, bot, botImvuUserId);
 
@@ -823,7 +839,13 @@ async function main() {
         });
     }
 
+    let dashboardSyncInFlight = false;
     setInterval(() => {
+        if (dashboardSyncInFlight) {
+            console.warn(`[${BOT_NAME}] Skipping dashboard sync; previous tick still running`);
+            return;
+        }
+        dashboardSyncInFlight = true;
         void (async () => {
             let data = {};
             try {
@@ -915,7 +937,9 @@ async function main() {
                 }
                 await noteJoinAccessProbe(id);
             }
-        })();
+        })().finally(() => {
+            dashboardSyncInFlight = false;
+        });
     }, syncIntervalMs);
 
     const spamLibrary = [

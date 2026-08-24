@@ -15,10 +15,16 @@ export async function applyRoomMediaStreamUrl(page, publicUrl, opts = null) {
         const result = await sessionClient.setRoomRadioStreamUrl(roomId, url, {
             stationName: String(opts?.stationName || '').trim(),
             forceRestart: Boolean(opts?.forceRestart),
+            playTraceId: opts?.playTraceId,
         });
         if (result?.ok) {
             console.log(`[music/api] room ${roomId} media URL set: ${url}`);
-            return { ok: true, reason: result.reason || 'api' };
+            return {
+                ok: true,
+                reason: result.reason || 'api',
+                cutoverMode: result.cutoverMode,
+                cutApiMs: result.cutApiMs,
+            };
         }
         console.warn(
             `[music/api] room media URL not updated for ${roomId}: ${result?.reason || 'unknown'}${result?.detail ? ` (${result.detail})` : ''} · url=${url}`,
@@ -27,6 +33,8 @@ export async function applyRoomMediaStreamUrl(page, publicUrl, opts = null) {
             ok: false,
             reason: result?.reason || 'api-failed',
             detail: result?.detail || '',
+            cutoverMode: result?.cutoverMode,
+            cutApiMs: result?.cutApiMs,
         };
     }
 

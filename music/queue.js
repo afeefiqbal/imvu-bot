@@ -12,7 +12,10 @@ export function createTrackQueue() {
             current = t;
         },
         enqueue: (t) => {
+            const cap = Math.max(1, parseInt(process.env.MUSIC_QUEUE_MAX || '25', 10) || 25);
+            if (pending.length >= cap) return false;
             pending.push(t);
+            return true;
         },
         dequeue: () => pending.shift() ?? null,
         peek: () => pending[0] ?? null,

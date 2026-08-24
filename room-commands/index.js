@@ -107,6 +107,7 @@ export function createRoomChatCommandHandler(opts) {
 
     let scaleTimer = null;
     const scalerWarnedAt = scalerWarnedAtOpt || new Map();
+    const scalerCheckedIds = new Set();
 
     const warnScalerIfOver = async (avatarId, label) => {
         const settings = getRoomSettings(roomId);
@@ -132,7 +133,12 @@ export function createRoomChatCommandHandler(opts) {
         const settings = getRoomSettings(roomId);
         if (!settings.auto_scale_check) return;
 
+        for (const id of [...scalerCheckedIds]) {
+            if (!lastUserMap.has(id)) scalerCheckedIds.delete(id);
+        }
         for (const [avatarId, label] of lastUserMap) {
+            if (scalerCheckedIds.has(avatarId)) continue;
+            scalerCheckedIds.add(avatarId);
             await warnScalerIfOver(avatarId, label);
         }
     };

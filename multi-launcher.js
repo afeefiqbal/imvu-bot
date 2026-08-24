@@ -6,6 +6,7 @@ import axios from 'axios';
 import dotenv from 'dotenv';
 import { bulkPost } from './api-queue.js';
 import { backendApiBaseUrl } from './env-app-url.js';
+import { applyBotApiAuth } from './laravel-auth.js';
 import { maybeStartMusicIngressTunnel } from './music/tunnelIngress.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -15,6 +16,7 @@ dotenv.config({ path: path.join(__dirname, '.env') });
 // Fallbacks for common local layouts: embedded Laravel parent, then sibling Laravel app.
 dotenv.config({ path: path.join(__dirname, '..', '.env') });
 dotenv.config({ path: path.join(__dirname, '..', 'imvu-bot-laravel', '.env') });
+applyBotApiAuth();
 
 function envTruthy(key) {
     const v = String(process.env[key] ?? '')
@@ -428,6 +430,8 @@ function parseRooms(roomString) {
 }
 
 const activeBots = new Map();
+const crashStreaks = new Map();
+const launchedNames = new Set();
 
 const LAUNCH_SCRIPT = (process.env.IMVU_LAUNCH_SCRIPT || 'imvu-bot.js').trim();
 const LAUNCH_SCRIPT_BASE = path.basename(LAUNCH_SCRIPT);
@@ -479,6 +483,8 @@ function runBot(botName, roomsArg, launchOpts = {}) {
     const processKey = `${botName}_${roomsArg}`;
     if (activeBots.has(processKey)) return;
     activeBots.set(processKey, true);
+    launchedNames.add(botName);
+    setTimeout(() => crashStreaks.set(botName, 0), 120000);
 
     const proxy = launchOpts.proxy && String(launchOpts.proxy).trim() ? String(launchOpts.proxy).trim() : null;
     const drp = launchOpts.discordRelayPort;
@@ -552,10 +558,13 @@ function runBot(botName, roomsArg, launchOpts = {}) {
             return;
         }
 
-        console.log(`[MULTI-LAUNCHER] ⚠️ Bot ${botName} (${roomsArg}) exited with code ${code}. Restarting in 10s...`);
+        const streak = (crashStreaks.get(botName) || 0) + 1;
+        crashStreaks.set(botName, streak);
+        const delay = Math.min(300000, 10000 * 2 ** Math.min(streak - 1, 5));
+        console.log(`[MULTI-LAUNCHER] ⚠️ Bot ${botName} (${roomsArg}) exited with code ${code}. Restarting in ${Math.round(delay / 1000)}s...`);
         setTimeout(
             () => runBot(botName, roomsArg, { ...launchOpts, rotationCount: 0 }),
-            10000
+            delay
         );
     });
 }
@@ -694,6 +703,23 @@ async function run() {
     }
 
     console.log(`\n[MULTI-LAUNCHER] ✅ All multi-bot room joiner processes have been dispatched!`);
+
+    setInterval(() => {
+        void (async () => {
+            const latest = await fetchAllBots().catch(() => []);
+            for (const bot of latest) {
+                const name = bot.name != null ? String(bot.name).trim() : '';
+                if (!name || launchedNames.has(name)) continue;
+                const rooms = parseRooms(bot.room_ids);
+                console.log(`[MULTI-LAUNCHER] 🚀 New dashboard bot [${name}] — launching`);
+                runBot(name, rooms.slice(0, MAX_ROOMS_PER_BOT).join(','), {
+                    proxy: bot.proxy,
+                    proxySource: 'poll',
+                    discordRelayPort: relayBase + launchedNames.size,
+                });
+            }
+        })();
+    }, pollIntervalMs());
 }
 
 run();

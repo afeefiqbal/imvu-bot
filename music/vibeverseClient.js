@@ -147,6 +147,21 @@ export async function resolveVibeversePlayable(query, opts = {}) {
     const q = String(query || '').trim();
     if (!q) return null;
     const t0 = Date.now();
+    const playTraceId = opts.playTraceId || undefined;
+    const traceHeaders = playTraceId
+        ? { 'x-play-trace-id': playTraceId }
+        : undefined;
+
+    if (playTraceId) {
+        console.log(
+            JSON.stringify({
+                event: 'play_search_start',
+                playTraceId,
+                ts: Date.now(),
+                smart: !!opts.smart,
+            }),
+        );
+    }
 
     const search = await axios.get(`${base}/search`, {
         params: {
@@ -157,8 +172,20 @@ export async function resolveVibeversePlayable(query, opts = {}) {
         },
         timeout: opts.smart ? 18_000 : 12_000,
         validateStatus: () => true,
+        headers: traceHeaders,
     });
     const searchMs = Date.now() - t0;
+    if (playTraceId) {
+        console.log(
+            JSON.stringify({
+                event: 'play_search_end',
+                playTraceId,
+                ts: Date.now(),
+                durationMs: searchMs,
+                http: search.status,
+            }),
+        );
+    }
     if (search.status >= 400 || !search.data) {
         console.warn(`[vibeverse] search HTTP ${search.status}`);
         return null;
@@ -191,9 +218,13 @@ export async function resolveVibeversePlayable(query, opts = {}) {
     let announced = false;
     for (const track of playOrder) {
         const tPlay = Date.now();
-        const playable = await playVibeverseTrack(track, { roomId: opts.roomId });
+        const playable = await playVibeverseTrack(track, {
+            roomId: opts.forQueue ? undefined : opts.roomId,
+            forQueue: opts.forQueue === true,
+            playTraceId,
+        });
         console.log(
-            `[vibeverse] timing search=${searchMs}ms play=${Date.now() - tPlay}ms total=${Date.now() - t0}ms smart=${!!opts.smart} title=${track.title || '?'}`,
+            `[vibeverse] timing search=${searchMs}ms play=${Date.now() - tPlay}ms total=${Date.now() - t0}ms smart=${!!opts.smart} forQueue=${!!opts.forQueue} title=${track.title || '?'}`,
         );
         if (playable?.streamUrl) {
             // Optional mid-hook once stream URL exists (radio apply may still be pending).
@@ -205,7 +236,11 @@ export async function resolveVibeversePlayable(query, opts = {}) {
                     /* ignore */
                 }
             }
-            return playable;
+            return {
+                ...playable,
+                searchMs,
+                apiTotalMs: Date.now() - t0,
+            };
         }
         if (playable?.pending) return playable;
         if (playable?.failed) {
@@ -235,7 +270,9 @@ function cleanPlayFailDetail(raw) {
 }
 
 function vibeverseLiveEnabled() {
-    return /^(1|true|yes|on)$/i.test(String(process.env.MUSIC_VIBEVERSE_LIVE || '').trim());
+    const raw = String(process.env.MUSIC_VIBEVERSE_LIVE ?? '').trim();
+    if (raw) return /^(1|true|yes|on)$/i.test(raw);
+    return Boolean(String(process.env.VIBEVERSE_API_URL || '').trim());
 }
 
 /**
@@ -246,8 +283,9 @@ function vibeverseLiveEnabled() {
  *   artworkUrl?: string,
  *   durationMs?: number,
  * }} track
- * @param {{ waitMs?: number, forceDurable?: boolean, roomId?: string }} [opts]
+ * @param {{ waitMs?: number, forceDurable?: boolean, roomId?: string, forQueue?: boolean, playTraceId?: string }} [opts]
  *   `waitMs: 0` = never poll for PREPARING (autoplay). Default waits up to 90s.
+ *   `forQueue: true` = warm/source only — never start room HLS (no roomId).
  * @returns {Promise<VibeversePlayable | VibeversePending | null>}
  */
 export async function playVibeverseTrack(track, opts = {}) {
@@ -258,7 +296,11 @@ export async function playVibeverseTrack(track, opts = {}) {
             ? Math.max(0, Number(opts.waitMs) || 0)
             : 90_000;
     const live = vibeverseLiveEnabled();
-    const roomId = String(opts.roomId || process.env.MUSIC_ROOM_ID || '').trim();
+    const forQueue = opts.forQueue === true;
+    const playTraceId = opts.playTraceId || undefined;
+    const roomId = forQueue
+        ? ''
+        : String(opts.roomId || process.env.MUSIC_ROOM_ID || '').trim();
 
     const body = {
         trackId: track.id,
@@ -268,21 +310,54 @@ export async function playVibeverseTrack(track, opts = {}) {
         durationMs: track.durationMs,
         source: 'QUEUE',
         preferMp3: true,
-        requireCached: live ? false : true,
-        allowProgressive: live ? true : undefined,
-        delivery: live ? 'hls' : undefined,
-        roomId: live && roomId ? roomId : undefined,
+        // forQueue: never wait on R2 / never start HLS — progressive/source OK.
+        requireCached: forQueue ? false : live ? false : true,
+        allowProgressive: forQueue || live ? true : undefined,
+        // Queue add must not replace the room's live encode — source/progressive only.
+        delivery: forQueue ? 'source' : live ? 'hls' : undefined,
+        roomId: !forQueue && live && roomId ? roomId : undefined,
+        ...(playTraceId ? { playTraceId } : {}),
     };
     if (opts.forceDurable && !live) {
         body.requireCached = true;
         body.preferMp3 = true;
     }
 
+    if (playTraceId) {
+        console.log(
+            JSON.stringify({
+                event: 'play_api_request_start',
+                playTraceId,
+                ts: Date.now(),
+                trackId: track.id,
+                forQueue,
+                delivery: body.delivery || 'source',
+            }),
+        );
+    }
+    const apiT0 = Date.now();
     const playRes = await axios.post(`${base}/play`, body, {
         timeout: live ? 90_000 : 45_000,
         validateStatus: () => true,
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+            'Content-Type': 'application/json',
+            ...(playTraceId ? { 'x-play-trace-id': playTraceId } : {}),
+        },
     });
+    if (playTraceId) {
+        console.log(
+            JSON.stringify({
+                event: 'play_api_response',
+                playTraceId,
+                ts: Date.now(),
+                durationMs: Date.now() - apiT0,
+                http: playRes.status,
+                cached: playRes.data?.cached === true,
+                delivery: playRes.data?.delivery || null,
+                // Do not log streamUrl.
+            }),
+        );
+    }
 
     if (playRes.status >= 400 || !playRes.data) {
         console.warn(`[vibeverse] play HTTP ${playRes.status}:`, playRes.data?.error || playRes.data || '');
@@ -298,6 +373,7 @@ export async function playVibeverseTrack(track, opts = {}) {
 
     const needsWait =
         !live &&
+        !forQueue &&
         (!isPlayableAudioUrl(streamUrl) ||
             isProgressiveExtractorUrl(streamUrl) ||
             status === 'PREPARING' ||
@@ -313,6 +389,18 @@ export async function playVibeverseTrack(track, opts = {}) {
     }
 
     if (!isPlayableAudioUrl(streamUrl)) {
+        // Queue add can proceed with trackId alone — drain path will /play for real.
+        if (forQueue && status !== 'FAILED') {
+            return {
+                trackId,
+                title,
+                artistName: String(resolvedTrack.artistName || track.artistName || ''),
+                artworkUrl: resolvedTrack.artworkUrl || track.artworkUrl,
+                durationMs: Number(resolvedTrack.durationMs || track.durationMs || 0) || 0,
+                streamUrl: '',
+                delivery: 'source',
+            };
+        }
         if (status === 'FAILED') {
             const detail = String(playRes.data.message || playRes.data.error || '').trim();
             console.warn(
@@ -332,8 +420,8 @@ export async function playVibeverseTrack(track, opts = {}) {
     }
 
     // Live HLS from extractor is the playable URL (m3u8). Progressive pipes still blocked
-    // for local Icecast path.
-    if (!live && isProgressiveExtractorUrl(streamUrl)) {
+    // for local Icecast path (unless forQueue — drain / Icecast encode will re-resolve).
+    if (!live && !forQueue && isProgressiveExtractorUrl(streamUrl)) {
         if (waitMs > 0) {
             console.warn(`[vibeverse] no durable stream for ${trackId} (status=${status})`);
         }
@@ -352,6 +440,9 @@ export async function playVibeverseTrack(track, opts = {}) {
         cached: playRes.data.cached === true,
         progressiveReady: playRes.data.progressiveReady === true,
         delivery,
+        playTraceId: playRes.data.playTraceId || playTraceId,
+        playId: playRes.data.playId || undefined,
+        apiPlayMs: Date.now() - apiT0,
     };
 }
 
@@ -368,6 +459,94 @@ export async function refreshVibeverseStream(trackId, hint = {}) {
         artworkUrl: hint.artworkUrl,
         durationMs: hint.durationMs,
     });
+}
+
+function prefetchEnabled() {
+    return /^(1|true|yes|on)$/i.test(String(process.env.MUSIC_PREFETCH || '').trim());
+}
+
+function prefetchRoomsAllowlist() {
+    return new Set(
+        String(process.env.MUSIC_PREFETCH_ROOMS || '')
+            .split(/[,\s]+/)
+            .map((s) => s.trim())
+            .filter(Boolean),
+    );
+}
+
+function youtubeIdFromTrackId(trackId) {
+    const s = String(trackId || '').trim();
+    const m = /^yt[_-]([\w-]{11})$/i.exec(s);
+    if (m) return m[1];
+    if (/^[\w-]{11}$/.test(s)) return s;
+    return null;
+}
+
+const prefetchInFlight = new Set();
+
+/**
+ * Next queued track to warm, or null when peek is missing / same as current.
+ * @param {{ trackId?: string, id?: string } | null | undefined} current
+ * @param {{ trackId?: string, id?: string } | null | undefined} peek
+ */
+export function nextTrackForPrefetch(current, peek) {
+    const nextId = String(peek?.trackId || peek?.id || '').trim();
+    if (!nextId) return null;
+    const curId = String(current?.trackId || current?.id || '').trim();
+    if (curId && nextId === curId) return null;
+    return peek;
+}
+
+/**
+ * Fire-and-forget R2 warm for a queued track. Never starts HLS.
+ * Gated by MUSIC_PREFETCH + MUSIC_PREFETCH_ROOMS.
+ *
+ * @param {{ trackId?: string, id?: string, durationMs?: number, title?: string }} track
+ * @param {{ roomId?: string }} [opts]
+ */
+export function prefetchVibeverseTrack(track, opts = {}) {
+    const base = apiBase();
+    const roomId = String(opts.roomId || process.env.MUSIC_ROOM_ID || '').trim();
+    const trackId = String(track?.trackId || track?.id || '').trim();
+    if (!base || !trackId) return;
+    if (!prefetchEnabled()) return;
+    const allow = prefetchRoomsAllowlist();
+    if (!allow.size || !allow.has(roomId)) return;
+
+    const dedupeKey = `${roomId}:${trackId}`;
+    if (prefetchInFlight.has(dedupeKey)) return;
+    prefetchInFlight.add(dedupeKey);
+
+    const youtubeVideoId = youtubeIdFromTrackId(trackId);
+    const body = {
+        trackId,
+        roomId,
+        ...(youtubeVideoId ? { youtubeVideoId } : {}),
+        ...(track?.durationMs ? { durationMs: Number(track.durationMs) || undefined } : {}),
+    };
+
+    console.log(
+        `[vibeverse] prefetch start room=${roomId} trackId=${trackId}${track?.title ? ` “${track.title}”` : ''}`,
+    );
+
+    void axios
+        .post(`${base}/prefetch`, body, {
+            timeout: 15_000,
+            validateStatus: () => true,
+            headers: { 'Content-Type': 'application/json' },
+        })
+        .then((res) => {
+            const result = res.data?.result || res.status;
+            console.log(
+                `[vibeverse] prefetch ${result} room=${roomId} trackId=${trackId} http=${res.status}`,
+            );
+        })
+        .catch((e) => {
+            console.warn(`[vibeverse] prefetch failed:`, e?.message || e);
+        })
+        .finally(() => {
+            prefetchInFlight.delete(dedupeKey);
+        });
 }
 
 const AUTOPLAY_CATALOG_CATEGORIES = ['english', 'hindi', 'tamil', 'malayalam'];

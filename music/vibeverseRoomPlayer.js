@@ -4,6 +4,8 @@ import { notifyImvuMusicState } from './notifyImvuMusicApi.js';
 import {
     fetchRandomVibeversePlayable,
     playVibeverseTrack,
+    nextTrackForPrefetch,
+    prefetchVibeverseTrack,
     refreshVibeverseStream,
 } from './vibeverseClient.js';
 import { createFfmpegFileToIcecast, createFfmpegHttpToIcecast } from './ffmpegIcecast.js';
@@ -203,16 +205,35 @@ export function createVibeverseRoomPlayer(opts) {
         }
     };
 
+    const autoplayMasterOn = () =>
+        envFlagTrue('MUSIC_AUTOPLAY', true) && roomAllowedForAutoplay(roomId);
+
     const scheduleAutoplayRetry = () => {
         clearAutoplayRetry();
-        if (autoplayOptedOut || !autoplayArmed || paused || radioControl.forbidden) return;
+        if (
+            autoplayOptedOut ||
+            !autoplayArmed ||
+            paused ||
+            radioControl.forbidden ||
+            !autoplayMasterOn()
+        ) {
+            return;
+        }
         const ms = Math.max(
             5000,
             parseInt(String(process.env.MUSIC_AUTOPLAY_RETRY_MS || '15000'), 10) || 15000,
         );
         autoplayRetryTimer = setTimeout(() => {
             autoplayRetryTimer = null;
-            if (autoplayOptedOut || !autoplayArmed || paused || radioControl.forbidden) return;
+            if (
+                autoplayOptedOut ||
+                !autoplayArmed ||
+                paused ||
+                radioControl.forbidden ||
+                !autoplayMasterOn()
+            ) {
+                return;
+            }
             // Soft cutover parks prior encode in outgoingProc — still busy.
             if (botBusyLocally()) return;
             console.log(`[music] autoplay retry (${roomId})`);
@@ -408,9 +429,8 @@ export function createVibeverseRoomPlayer(opts) {
             return false;
         }
         if (!envFlagTrue('MUSIC_AUTOPLAY', true)) {
-            console.warn(
-                `[music] autoplay skip (${roomId}): MUSIC_AUTOPLAY is off — set MUSIC_AUTOPLAY=1 in .env`,
-            );
+            // Master switch off — stop armed/retry loops (e.g. leftover after !play).
+            if (autoplayArmed) disarmAutoplay();
             return false;
         }
         if (autoplayOptedOut) {
@@ -597,6 +617,7 @@ export function createVibeverseRoomPlayer(opts) {
         if (!/^https:\/\//i.test(url)) {
             return { ok: false, reason: 'no-public-url', detail: 'Icecast HTTPS public URL is not configured.' };
         }
+        const playTraceId = opts.playTraceId || track?.playTraceId || undefined;
 
         // Stable /live: if IMVU is already on this URL, skip stop→clear→update→start (~8–10s).
         if (opts.skipIfSame !== false) {
@@ -619,12 +640,38 @@ export function createVibeverseRoomPlayer(opts) {
         }
 
         console.log(`[music] applying live stream URL to room ${roomId}: ${url}`);
+        if (playTraceId) {
+            console.log(
+                JSON.stringify({
+                    event: 'station_url_update_start',
+                    playTraceId,
+                    roomId,
+                    ts: Date.now(),
+                }),
+            );
+        }
+        const cutT0 = Date.now();
         const applied = await applyRoomMediaStreamUrl(page, url, {
             sessionClient,
             roomId,
             stationName: String(track?.title || '').trim(),
             forceRestart: opts.forceRestart === true,
+            playTraceId,
         });
+        if (playTraceId) {
+            console.log(
+                JSON.stringify({
+                    event: 'station_url_update_end',
+                    playTraceId,
+                    roomId,
+                    ts: Date.now(),
+                    durationMs: Date.now() - cutT0,
+                    ok: applied?.ok === true,
+                    cutoverMode: applied?.cutoverMode || null,
+                    cutApiMs: applied?.cutApiMs ?? null,
+                }),
+            );
+        }
         if (!applied.ok) {
             const reason = String(applied.reason || '');
             const detail = String(applied.detail || '');
@@ -645,7 +692,12 @@ export function createVibeverseRoomPlayer(opts) {
             intervalMs: 1000,
             sessionClient,
         }).catch(() => ({ ok: false }));
-        return applied;
+        return {
+            ...applied,
+            cutoverMs: Date.now() - cutT0,
+            cutoverMode: applied.cutoverMode,
+            cutApiMs: applied.cutApiMs,
+        };
     };
 
     const useHlsPath = (track) => {
@@ -760,6 +812,7 @@ export function createVibeverseRoomPlayer(opts) {
         const applied = await applyPublicUrlToRoom(url, track, {
             skipIfSame: false,
             forceRestart: true,
+            playTraceId: track?.playTraceId,
         });
         if (gen !== generation) return { ok: false, reason: 'stale' };
         if (!applied.ok) {
@@ -788,7 +841,13 @@ export function createVibeverseRoomPlayer(opts) {
             notify(null, 'idle');
             void enqueueDrain();
         }, waitMs);
-        return { ok: true, track };
+        return {
+            ok: true,
+            track,
+            cutoverMs: applied.cutoverMs,
+            cutoverMode: applied.cutoverMode,
+            cutApiMs: applied.cutApiMs,
+        };
     };
 
     const playViaHls = async (track, gen, pub) => {
@@ -935,24 +994,35 @@ export function createVibeverseRoomPlayer(opts) {
             playing = false;
             paused = false;
             notify(null, 'idle');
-            scheduleAutoplayRetry();
+            // Only retry idle fill when master autoplay is on; otherwise this spams forever.
+            if (autoplayMasterOn()) scheduleAutoplayRetry();
             return { ok: true, empty: true };
         }
 
-        if (!track.streamUrl && track.trackId) {
+        // Warm B while A resolves / plays. Fire-and-forget — never block A.
+        const next = nextTrackForPrefetch(track, queue.peek());
+        if (next) prefetchVibeverseTrack(next, { roomId });
+
+        // Live mode: always mint fresh HLS with roomId — never reuse queued progressive URLs.
+        const trackId = String(track.trackId || track.id || '').trim();
+        if (trackId && (vibeverseLiveMode() || !track.streamUrl)) {
             const fresh = await playVibeverseTrack(
                 {
-                    id: track.trackId,
+                    id: trackId,
                     title: track.title,
                     artistName: track.artistName,
                     artworkUrl: track.artworkUrl,
                     durationMs: track.durationMs,
                 },
-                { roomId },
+                { roomId, playTraceId: track.playTraceId },
             );
             if (gen !== generation) return { ok: false, reason: 'stale' };
             if (fresh?.ok && fresh.track) Object.assign(track, fresh.track);
             else if (fresh?.streamUrl) Object.assign(track, fresh);
+            if (trackId && !track.trackId) track.trackId = trackId;
+            if (fresh?.playTraceId && !track.playTraceId) {
+                track.playTraceId = fresh.playTraceId;
+            }
         }
 
         if (!track.streamUrl) {
@@ -1266,9 +1336,12 @@ export function createVibeverseRoomPlayer(opts) {
     };
 
     // Start watching room radio; kick first song after idle delay if nothing is on.
-    startIdleWatcher();
-    if (autoplayArmed && !autoplayOptedOut) {
-        scheduleIdleAutoplay('on-mount');
+    // Idle watcher no-ops when MUSIC_AUTOPLAY=0 (checked inside scheduleIdleAutoplay).
+    if (autoplayMasterOn()) {
+        startIdleWatcher();
+        if (autoplayArmed && !autoplayOptedOut) {
+            scheduleIdleAutoplay('on-mount');
+        }
     }
 
     return {
@@ -1302,7 +1375,7 @@ export function createVibeverseRoomPlayer(opts) {
         cutForReplace,
 
         /** Replace whatever is playing/queued with this track and start it now. */
-        async playNow(track) {
+        async playNow(track, opts = {}) {
             clearIdleKick();
             armAutoplay('!play');
             clearEndTimer();
@@ -1311,6 +1384,9 @@ export function createVibeverseRoomPlayer(opts) {
             // Park (don't kill) current encode so listeners keep hearing it while
             // the new track resolves + HLS warms. Cutover happens in playViaHls.
             parkCurrentEncode();
+            if (opts.playTraceId && track && !track.playTraceId) {
+                track.playTraceId = opts.playTraceId;
+            }
             queue.setCurrent(track);
             paused = false;
             console.log(`[music] !play replace — starting “${track?.title || '?'}” (keep current until HLS ready)`);
@@ -1323,6 +1399,11 @@ export function createVibeverseRoomPlayer(opts) {
             const wasIdle =
                 !queue.getCurrent() && !playing && !paused && !ffProc && !queue.peek();
             queue.enqueue(track);
+            // While A plays, warm R2 for the just-queued next track (depth 1).
+            if (!wasIdle && (playing || queue.getCurrent())) {
+                const next = queue.peek() || track;
+                prefetchVibeverseTrack(next, { roomId });
+            }
             if (wasIdle) return enqueueDrain();
             return { ok: true, queued: true };
         },

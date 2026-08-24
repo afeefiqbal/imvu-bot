@@ -1199,11 +1199,14 @@ export async function startUserTracking(page, roomId, options = {}) {
         }, 1500);
     }
 
-    const syncIntervalId = setInterval(() => {
-        if (state.botJoinedChat) {
-            scheduleDashboardSync();
-        }
-    }, 45000);
+    const trackerSyncEnabled = /^(1|true|yes)$/i.test(String(process.env.TRACKER_ROOMS_SYNC || ''));
+    const syncIntervalId = trackerSyncEnabled
+        ? setInterval(() => {
+            if (state.botJoinedChat) {
+                scheduleDashboardSync();
+            }
+        }, 45000)
+        : null;
 
     const cleanupIntervalId = setInterval(() => {
         if (processedJoins.size > 500) processedJoins.clear();
@@ -1224,7 +1227,7 @@ export async function startUserTracking(page, roomId, options = {}) {
             global.discordBridge.off('chat', onDiscordRelayChat);
         }
         if (checkRoomNameInterval) clearInterval(checkRoomNameInterval);
-        clearInterval(syncIntervalId);
+        if (syncIntervalId) clearInterval(syncIntervalId);
         clearInterval(cleanupIntervalId);
         if (dashboardSyncTimer) clearTimeout(dashboardSyncTimer);
         if (countTimer) clearTimeout(countTimer);

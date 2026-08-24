@@ -1124,7 +1124,7 @@ export class ImvuAccountRoomClient extends EventEmitter {
     }
 
     #scheduleForceVisibleRefresh() {
-        const intervalMs = Math.max(0, envInt('IMVU_FORCE_VISIBLE_REFRESH_MS', 30000));
+        const intervalMs = Math.max(0, envInt('IMVU_FORCE_VISIBLE_REFRESH_MS', 180000));
         if (!intervalMs || this.forceVisibleRefreshTimer || !this.visibilityEnabled) return;
         this.forceVisibleRefreshTimer = setInterval(() => {
             if (this.forceVisibleRefreshRunning || this.closedByUser || !this.isOpen) return;
