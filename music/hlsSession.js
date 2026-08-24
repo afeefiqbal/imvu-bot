@@ -210,7 +210,7 @@ export async function startHlsColdSession(opts) {
     }
 
     const playlistPath = path.join(outDir, 'index.m3u8');
-    const defaultWait = 25_000;
+    const defaultWait = /\/stream\//i.test(String(opts.sourceUrl || '')) ? 50_000 : 25_000;
     const waitMs = Math.max(
         4000,
         Number(opts.waitMs) ||
@@ -219,8 +219,8 @@ export async function startHlsColdSession(opts) {
     );
     const ready = await waitForHlsPlaylist(playlistPath, {
         timeoutMs: waitMs,
-        // Need a couple complete segments so players don't hit a partial tail.
-        minSegments: Math.max(2, Number(process.env.MUSIC_HLS_MIN_SEGMENTS) || 2),
+        // One complete segment is enough for first audio; waiting for 2 doubles cold start.
+        minSegments: Math.max(1, Number(process.env.MUSIC_HLS_MIN_SEGMENTS) || 1),
         isStale,
     });
 

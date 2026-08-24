@@ -730,7 +730,7 @@ export function createVibeverseRoomPlayer(opts) {
         const started = Date.now();
         const timeoutMs = Math.max(
             8_000,
-            parseInt(String(process.env.MUSIC_HLS_PRIME_TIMEOUT_MS || '25000'), 10) || 25_000,
+            parseInt(String(process.env.MUSIC_HLS_PRIME_TIMEOUT_MS || '50000'), 10) || 50_000,
         );
         let primeUrl = u;
         try {
@@ -871,7 +871,7 @@ export function createVibeverseRoomPlayer(opts) {
             resolved: track?.progressiveReady === true || track?.cached === true,
             waitMs:
                 Number(process.env.MUSIC_HLS_WAIT_READY_MS) ||
-                (track?.progressiveReady || track?.cached ? 12_000 : 25_000),
+                (track?.progressiveReady || track?.cached ? 12_000 : 50_000),
         });
         if (isStale()) {
             if (session.cleanup) await session.cleanup().catch(() => {});
@@ -1085,12 +1085,13 @@ export function createVibeverseRoomPlayer(opts) {
             let hlsResult = await playViaHls(track, gen, pub);
             if (hlsResult?.ok || hlsResult?.reason === 'stale') return hlsResult;
 
-            // Retry once with a fresh durable URL if the first source failed.
-            if (track.trackId) {
+            // Cold /stream often needs more than one HLS window for yt-dlp. Retry once
+            // with a longer wait — do not wait for R2 (that is the 40–90s gap).
+            if (track.trackId && hlsResult?.reason === 'hls-not-ready') {
                 console.warn(
-                    `[music] HLS failed (${hlsResult?.reason || 'unknown'}) — refreshing durable URL and retrying HLS`,
+                    `[music] HLS not ready (${hlsResult?.reason}) — retrying HLS with longer wait, not R2`,
                 );
-                const durable = await playVibeverseTrack(
+                const retry = await playVibeverseTrack(
                     {
                         id: track.trackId,
                         title: track.title,
@@ -1098,12 +1099,12 @@ export function createVibeverseRoomPlayer(opts) {
                         artworkUrl: track.artworkUrl,
                         durationMs: track.durationMs,
                     },
-                    { forceDurable: true, roomId },
+                    { waitMs: 0, roomId },
                 );
                 if (gen !== generation) return { ok: false, reason: 'stale' };
-                const t = durable?.track || (durable?.streamUrl ? durable : null);
-                if (durable?.ok && t?.streamUrl && !/\/stream\/[\w-]{11}(\?|$)/i.test(String(t.streamUrl))) {
-                    Object.assign(track, t, { delivery: 'hls', cached: true });
+                const t = retry?.streamUrl ? retry : retry?.track;
+                if (t?.streamUrl) {
+                    Object.assign(track, t);
                     hlsResult = await playViaHls(track, gen, pub);
                     if (hlsResult?.ok || hlsResult?.reason === 'stale') return hlsResult;
                 }

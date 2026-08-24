@@ -3,9 +3,9 @@ import axios from 'axios';
 /**
  * Thin VibeVerse client for IMVU room music.
  *
- * Ask VibeVerse → wait until durable cache is READY → return signed URL.
- * Bot then: downloadToTemp → ffmpeg → Icecast → set IMVU room radio.
- * YouTube / extract / queue / progressive cold-play stay in VibeVerse.
+ * Ask VibeVerse for a playable URL (HLS or progressive /stream) and return it.
+ * Do not wait for R2 READY on first play — that is the cold-play time gap.
+ * R2 still fills in the background for the next play.
  */
 
 function apiBase() {
@@ -207,6 +207,8 @@ export async function resolveVibeversePlayable(query, opts = {}) {
     if (playOrder[0]?.ready) {
         console.log(`[vibeverse] top hit READY (cached) — fast path: ${playOrder[0].title || '?'}`);
     }
+    // Start yt-dlp resolve during chat "starting soon" — do not wait for !play /play.
+    if (playOrder[0]) prefetchVibeverseTrack(playOrder[0], { roomId: opts.roomId });
     // Immediate feedback after search (~1–3s) — stream prep can still take 10–30s.
     if (typeof opts.onFound === 'function' && playOrder[0]) {
         try {
@@ -291,11 +293,13 @@ function vibeverseLiveEnabled() {
 export async function playVibeverseTrack(track, opts = {}) {
     const base = apiBase();
     if (!base || !track?.id) return null;
+    const live = vibeverseLiveEnabled();
     const waitMs =
         opts.waitMs != null
             ? Math.max(0, Number(opts.waitMs) || 0)
-            : 90_000;
-    const live = vibeverseLiveEnabled();
+            : live
+              ? 0
+              : 20_000;
     const forQueue = opts.forQueue === true;
     const playTraceId = opts.playTraceId || undefined;
     const roomId = forQueue
@@ -310,9 +314,9 @@ export async function playVibeverseTrack(track, opts = {}) {
         durationMs: track.durationMs,
         source: 'QUEUE',
         preferMp3: true,
-        // forQueue: never wait on R2 / never start HLS — progressive/source OK.
-        requireCached: forQueue ? false : live ? false : true,
-        allowProgressive: forQueue || live ? true : undefined,
+        // Never block first play on R2. Progressive / HLS is enough.
+        requireCached: false,
+        allowProgressive: true,
         // Queue add must not replace the room's live encode — source/progressive only.
         delivery: forQueue ? 'source' : live ? 'hls' : undefined,
         roomId: !forQueue && live && roomId ? roomId : undefined,
@@ -372,11 +376,9 @@ export async function playVibeverseTrack(track, opts = {}) {
     const title = String(resolvedTrack.title || track.title || 'Track');
 
     const needsWait =
-        !live &&
         !forQueue &&
-        (!isPlayableAudioUrl(streamUrl) ||
-            isProgressiveExtractorUrl(streamUrl) ||
-            status === 'PREPARING' ||
+        !isPlayableAudioUrl(streamUrl) &&
+        (status === 'PREPARING' ||
             status === 'DOWNLOADING' ||
             status === 'PENDING');
 
@@ -419,14 +421,7 @@ export async function playVibeverseTrack(track, opts = {}) {
         return { pending: true, trackId, title };
     }
 
-    // Live HLS from extractor is the playable URL (m3u8). Progressive pipes still blocked
-    // for local Icecast path (unless forQueue — drain / Icecast encode will re-resolve).
-    if (!live && !forQueue && isProgressiveExtractorUrl(streamUrl)) {
-        if (waitMs > 0) {
-            console.warn(`[vibeverse] no durable stream for ${trackId} (status=${status})`);
-        }
-        return { pending: true, trackId, title };
-    }
+    // Progressive /stream is a valid first-play URL. R2 warm continues in the background.
 
     console.log(`[music] stream URL for “${title}”: ${streamUrl}`);
 
@@ -462,7 +457,9 @@ export async function refreshVibeverseStream(trackId, hint = {}) {
 }
 
 function prefetchEnabled() {
-    return /^(1|true|yes|on)$/i.test(String(process.env.MUSIC_PREFETCH || '').trim());
+    const raw = String(process.env.MUSIC_PREFETCH ?? '').trim();
+    if (raw) return /^(1|true|yes|on)$/i.test(raw);
+    return Boolean(apiBase());
 }
 
 function prefetchRoomsAllowlist() {
@@ -511,7 +508,7 @@ export function prefetchVibeverseTrack(track, opts = {}) {
     if (!base || !trackId) return;
     if (!prefetchEnabled()) return;
     const allow = prefetchRoomsAllowlist();
-    if (!allow.size || !allow.has(roomId)) return;
+    if (allow.size && roomId && !allow.has(roomId)) return;
 
     const dedupeKey = `${roomId}:${trackId}`;
     if (prefetchInFlight.has(dedupeKey)) return;
@@ -684,7 +681,7 @@ async function waitForVibeverseReady(trackId, timeoutMs = 90_000) {
         await new Promise((r) => setTimeout(r, 1000));
         try {
             const res = await axios.get(`${base}/tracks/${encodeURIComponent(trackId)}/status`, {
-                params: { preferMp3: '1', requireCached: '1' },
+                params: { preferMp3: '1', requireCached: '0' },
                 timeout: 10_000,
                 validateStatus: () => true,
             });
@@ -695,11 +692,7 @@ async function waitForVibeverseReady(trackId, timeoutMs = 90_000) {
                 return null;
             }
             const url = res.data.streamUrl;
-            if (
-                status === 'READY' &&
-                isPlayableAudioUrl(url) &&
-                !isProgressiveExtractorUrl(url)
-            ) {
+            if (isPlayableAudioUrl(url) && (status === 'READY' || status === 'PREPARING')) {
                 return res.data;
             }
         } catch (e) {

@@ -17,21 +17,24 @@ function buildPlayBody(track, opts = {}) {
     return {
         trackId: track.id,
         preferMp3: true,
-        requireCached: forQueue ? false : live ? false : true,
-        allowProgressive: forQueue || live ? true : undefined,
+        requireCached: false,
+        allowProgressive: true,
         delivery: forQueue ? 'source' : live ? 'hls' : undefined,
         roomId: !forQueue && live && roomId ? roomId : undefined,
     };
 }
 
 function prefetchAllowed(roomId, env = process.env) {
-    if (!/^(1|true|yes|on)$/i.test(String(env.MUSIC_PREFETCH || '').trim())) return false;
+    const raw = String(env.MUSIC_PREFETCH ?? '').trim();
+    const on = raw ? /^(1|true|yes|on)$/i.test(raw) : true;
+    if (!on) return false;
     const allow = new Set(
         String(env.MUSIC_PREFETCH_ROOMS || '')
             .split(/[,\s]+/)
             .map((s) => s.trim())
             .filter(Boolean),
     );
+    if (!allow.size) return true;
     return allow.has(String(roomId || '').trim());
 }
 
@@ -100,7 +103,7 @@ describe('playCurrentOrNext peek prewarm', () => {
 });
 
 describe('prefetch gate', () => {
-    it('requires MUSIC_PREFETCH + allowlisted room', () => {
+    it('defaults on; optional room allowlist', () => {
         assert.equal(
             prefetchAllowed('261755692-980', {
                 MUSIC_PREFETCH: '1',
@@ -121,6 +124,13 @@ describe('prefetch gate', () => {
                 MUSIC_PREFETCH_ROOMS: '261755692-980',
             }),
             false,
+        );
+        assert.equal(
+            prefetchAllowed('261755692-980', {
+                MUSIC_PREFETCH: '',
+                MUSIC_PREFETCH_ROOMS: '',
+            }),
+            true,
         );
     });
 });
